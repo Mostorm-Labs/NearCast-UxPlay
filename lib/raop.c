@@ -181,6 +181,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     int response_datalen = 0;
     raop_conn_t *conn = ptr;
     bool hls_request = false;
+    bool http_ctrl_request = false;
+    bool is_pin_endpoint = false;
     logger_log(conn->raop->logger, LOGGER_DEBUG, "conn_request");
     bool logger_debug = (logger_get_level(conn->raop->logger) >= LOGGER_DEBUG);
 
@@ -214,7 +216,22 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
     const char *host = http_request_get_header(request, "Host");
-    hls_request =  (host && !cseq && !client_session_id);
+    if (url) {
+        if (!strncmp(url, "/pin", 4) &&
+            (!url[4] || url[4] == '/' || url[4] == '?')) {
+            is_pin_endpoint = true;
+        } else if (!strncmp(url, "/api/pin", 8) &&
+                   (!url[8] || url[8] == '/' || url[8] == '?')) {
+            is_pin_endpoint = true;
+        }
+    }
+    if (host && !cseq && !client_session_id) {
+        if (is_pin_endpoint) {
+            http_ctrl_request = true;
+        } else {
+            hls_request = true;
+        }
+    }
 
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
         if (cseq) {
@@ -269,9 +286,15 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 }
             }
         } else if (host) {
-            logger_log(conn->raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type HLS", ptr);            
-            httpd_set_connection_type(conn->raop->httpd, ptr, CONNECTION_TYPE_HLS);
-            conn->connection_type = CONNECTION_TYPE_HLS;
+            if (http_ctrl_request) {
+                logger_log(conn->raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type HTTP Control", ptr);
+                httpd_set_connection_type(conn->raop->httpd, ptr, CONNECTION_TYPE_HTTP_CTRL);
+                conn->connection_type = CONNECTION_TYPE_HTTP_CTRL;
+            } else {
+                logger_log(conn->raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type HLS", ptr);            
+                httpd_set_connection_type(conn->raop->httpd, ptr, CONNECTION_TYPE_HLS);
+                conn->connection_type = CONNECTION_TYPE_HLS;
+            }
         } else {
 	  logger_log(conn->raop->logger, LOGGER_WARNING, "connection from unknown connection type");
         }	  
@@ -391,7 +414,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 	}
     } else if (!hls_request && !strcmp(protocol, "HTTP/1.1")) {
         if (!strcmp(method, "POST")) {
-            if (!strcmp(url, "/reverse")) {
+            if (is_pin_endpoint) {
+                handler = &http_handler_pin_control;
+            } else if (!strcmp(url, "/reverse")) {
                 handler = &http_handler_reverse;
             } else if (!strcmp(url, "/play")) {
                 handler = &http_handler_play;
@@ -409,15 +434,19 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 handler = &http_handler_fpsetup2;
             }
         } else if (!strcmp(method, "GET")) {
-            if (!strcmp(url, "/server-info")) {
+            if (is_pin_endpoint) {
+                handler = &http_handler_pin_control;
+            } else if (!strcmp(url, "/server-info")) {
                 handler = &http_handler_server_info;
             } else if (!strcmp(url, "/playback-info")) {
                 handler = &http_handler_playback_info;
             }
         } else if (!strcmp(method, "PUT")) {
-	  if (!strncmp (url, "/setProperty?", strlen("/setProperty?"))) {
+            if (is_pin_endpoint) {
+                handler = &http_handler_pin_control;
+            } else if (!strncmp (url, "/setProperty?", strlen("/setProperty?"))) {
                 handler = &http_handler_set_property;
-	  }
+	    }
         }
     } else if (hls_request) {
         handler = &http_handler_hls;

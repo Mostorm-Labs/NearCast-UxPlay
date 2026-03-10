@@ -137,6 +137,242 @@ http_handler_stop(raop_conn_t *conn, http_request_t *request, http_response_t *r
     conn->raop->callbacks.on_video_stop(conn->raop->callbacks.cls);
 }
 
+static int
+http_pin_parse_digits(const char *digits, unsigned short *pin_out) {
+    if (!digits || !pin_out) {
+        return -1;
+    }
+    unsigned short value = 0;
+    int count = 0;
+    while (digits[count] >= '0' && digits[count] <= '9') {
+        if (count >= 4) {
+            return -1;
+        }
+        value = (unsigned short) (value * 10 + (unsigned short) (digits[count] - '0'));
+        count++;
+    }
+    if (count != 4) {
+        return -1;
+    }
+    *pin_out = value;
+    return 0;
+}
+
+static int
+http_pin_parse_from_query(const char *url, unsigned short *pin_out) {
+    if (!url) {
+        return -1;
+    }
+    const char *query = strchr(url, '?');
+    if (!query) {
+        return -1;
+    }
+    query++;
+    const char *cursor = query;
+    while (*cursor) {
+        while (*cursor == '&') {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+        const char *key_start = cursor;
+        while (*cursor && *cursor != '=' && *cursor != '&') {
+            cursor++;
+        }
+        if (!*cursor || *cursor == '&') {
+            if (*cursor == '&') {
+                continue;
+            }
+            break;
+        }
+        size_t key_len = cursor - key_start;
+        cursor++; /* skip '=' */
+        const char *value_start = cursor;
+        while (*cursor && *cursor != '&') {
+            cursor++;
+        }
+        bool key_match = (key_len == 3 && !strncmp(key_start, "pin", 3)) ||
+                         (key_len == 5 && !strncmp(key_start, "value", 5));
+        if (key_match && !http_pin_parse_digits(value_start, pin_out)) {
+            return 0;
+        }
+        if (*cursor == '&') {
+            cursor++;
+        }
+    }
+    return -1;
+}
+
+static int
+http_pin_parse_from_payload(const char *payload, unsigned short *pin_out) {
+    if (!payload) {
+        return -1;
+    }
+    const char *cursor = payload;
+    while (*cursor) {
+        if (!strncmp(cursor, "pin", 3)) {
+            char prev = (cursor == payload) ? '\0' : *(cursor - 1);
+            if (!((prev >= 'a' && prev <= 'z') || (prev >= 'A' && prev <= 'Z') || prev == '_')) {
+                const char *digits = cursor + 3;
+                while (*digits == ' ' || *digits == '\t' || *digits == '\n' ||
+                       *digits == '\r' || *digits == ':' || *digits == '=' ||
+                       *digits == '"' || *digits == '\'') {
+                    digits++;
+                }
+                if (!http_pin_parse_digits(digits, pin_out)) {
+                    return 0;
+                }
+            }
+        }
+        cursor++;
+    }
+    cursor = payload;
+    while (*cursor) {
+        if (*cursor >= '0' && *cursor <= '9') {
+            if (!http_pin_parse_digits(cursor, pin_out)) {
+                return 0;
+            }
+            while (*cursor >= '0' && *cursor <= '9') {
+                cursor++;
+            }
+            continue;
+        }
+        cursor++;
+    }
+    return -1;
+}
+
+static void
+http_pin_send_error(const char *protocol, http_response_t *response, int code, const char *reason,
+                    const char *message, char **response_data, int *response_datalen) {
+    const char *proto = (protocol ? protocol : "HTTP/1.1");
+    http_response_init(response, proto, code, reason);
+    char body[160];
+    int len = snprintf(body, sizeof(body),
+                       "{\"status\":\"error\",\"message\":\"%s\"}",
+                       (message ? message : "unknown error"));
+    char *payload = malloc(len + 1);
+    if (!payload) {
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+    memcpy(payload, body, len + 1);
+    *response_data = payload;
+    *response_datalen = len;
+    http_response_add_header(response, "Content-Type", "application/json");
+    http_response_add_header(response, "Cache-Control", "no-store");
+    http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+}
+
+static void
+http_pin_send_status(raop_conn_t *conn, const char *status, const char *message, bool expose_pin,
+                     http_response_t *response, char **response_data, int *response_datalen) {
+    unsigned short stored_pin = conn->raop->pin;
+    const char *mode = "disabled";
+    if (conn->raop->use_pin) {
+        mode = (stored_pin > 0 ? "static" : "random");
+    } else if (stored_pin > 0) {
+        mode = "oneshot";
+    }
+    char pin_field[32];
+    if (expose_pin && conn->raop->use_pin && stored_pin) {
+        snprintf(pin_field, sizeof(pin_field), "\"pin\":\"%04u\"", stored_pin % 10000);
+    } else {
+        strncpy(pin_field, "\"pin\":null", sizeof(pin_field));
+    }
+    pin_field[sizeof(pin_field) - 1] = '\0';
+    char body[256];
+    int len = snprintf(body, sizeof(body),
+                       "{\"status\":\"%s\",\"message\":\"%s\",\"usePin\":%s,\"mode\":\"%s\",%s}",
+                       (status ? status : "ok"),
+                       (message ? message : ""),
+                       (conn->raop->use_pin ? "true" : "false"),
+                       mode,
+                       pin_field);
+    char *payload = malloc(len + 1);
+    if (!payload) {
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+    memcpy(payload, body, len + 1);
+    *response_data = payload;
+    *response_datalen = len;
+    http_response_add_header(response, "Content-Type", "application/json");
+    http_response_add_header(response, "Cache-Control", "no-store");
+    http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+}
+
+static void
+http_handler_pin_control(raop_conn_t *conn, http_request_t *request, http_response_t *response,
+                         char **response_data, int *response_datalen) {
+    const char *method = http_request_get_method(request);
+    const char *protocol = http_request_get_protocol(request);
+    if (!method) {
+        http_pin_send_error(protocol, response, 400, "Bad Request", "missing HTTP method",
+                            response_data, response_datalen);
+        return;
+    }
+
+    if (!strcmp(method, "OPTIONS")) {
+        http_response_init(response, protocol ? protocol : "HTTP/1.1", 204, "No Content");
+        http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+        http_response_add_header(response, "Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+        http_response_add_header(response, "Access-Control-Allow-Headers", "Content-Type");
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+
+    if (!strcmp(method, "GET")) {
+        bool reveal_pin = (conn->raop->use_pin && conn->raop->pin);
+        http_pin_send_status(conn, "ok", "pin status", reveal_pin, response, response_data,
+                             response_datalen);
+        return;
+    }
+
+    bool is_update = (!strcmp(method, "POST") || !strcmp(method, "PUT"));
+    if (!is_update) {
+        http_pin_send_error(protocol, response, 405, "Method Not Allowed",
+                            "method not allowed", response_data, response_datalen);
+        http_response_add_header(response, "Allow", "GET, POST, PUT, OPTIONS");
+        return;
+    }
+
+    unsigned short new_pin = 0;
+    int parse_result = http_pin_parse_from_query(http_request_get_url(request), &new_pin);
+    int datalen = 0;
+    const char *request_data = http_request_get_data(request, &datalen);
+    char *payload = NULL;
+    if (parse_result != 0 && request_data && datalen > 0) {
+        payload = calloc(1, datalen + 1);
+        if (payload) {
+            memcpy(payload, request_data, datalen);
+            parse_result = http_pin_parse_from_payload(payload, &new_pin);
+        }
+    }
+    if (payload) {
+        free(payload);
+    }
+    if (parse_result != 0) {
+        http_pin_send_error(protocol, response, 400, "Bad Request",
+                            "pin parameter missing or invalid", response_data, response_datalen);
+        return;
+    }
+
+    conn->raop->pin = (unsigned short) (10000 + new_pin);
+    conn->raop->use_pin = true;
+    char pin_str[6];
+    snprintf(pin_str, sizeof(pin_str), "%04u", new_pin);
+    if (conn->raop->callbacks.display_pin) {
+        conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, pin_str);
+    }
+    logger_log(conn->raop->logger, LOGGER_INFO, "HTTP control updated pin to %s", pin_str);
+    http_pin_send_status(conn, "ok", "pin updated", true, response, response_data, response_datalen);
+}
+
 /* handles PUT /setProperty http requests from Client to Server */
 
 static void

@@ -207,7 +207,8 @@ raop_handler_pairpinstart(raop_conn_t *conn,
                           char **response_data, int *response_datalen) {
     logger_log(conn->raop->logger, LOGGER_INFO, "client sent PAIR-PIN-START request");
     int pin_4;
-    if (conn->raop->pin > 9999) {
+    bool configured_pin = (conn->raop->use_pin && conn->raop->pin > 0);
+    if (configured_pin || conn->raop->pin > 9999) {
         pin_4 = conn->raop->pin % 10000;
     } else {
         pin_4 = random_pin();
@@ -282,7 +283,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
 	plist_get_string_val(req_user_node, &user);
         logger_log(conn->raop->logger, LOGGER_INFO, "pair-setup-pin:  device_id = %s", user);
         snprintf(pin, 6, "%04u", conn->raop->pin % 10000);
-        if (conn->raop->pin < 10000) {
+        if (!conn->raop->use_pin && conn->raop->pin < 10000) {
             conn->raop->pin = 0;
         }
 	int ret = srp_new_user(conn->session, conn->raop->pairing, (const char *) user,
@@ -596,11 +597,18 @@ raop_handler_setup(raop_conn_t *conn,
                 conn->raop->random_pw = NULL;
             }
             if (len == -1 && !conn->raop->random_pw) {
-                // get and store 4 random digits
-                int pin_4  = random_pin();
-                if (pin_4 < 0) {
-                    logger_log(conn->raop->logger, LOGGER_ERR, "Failed to generate random pin");
-                    pin_4 = 1234;
+                int pin_4;
+                if (conn->raop->use_pin && conn->raop->pin > 0) {
+                    pin_4 = conn->raop->pin % 10000;
+                } else {
+                    // get and store 4 random digits
+                    pin_4  = random_pin();
+                    if (pin_4 < 0) {
+                        logger_log(conn->raop->logger, LOGGER_ERR, "Failed to generate random pin");
+                        pin_4 = 1234;
+                    } else {
+                        conn->raop->pin = (unsigned short) (pin_4 % 10000);
+                    }
                 }
 		size_t len = 4;
 		conn->raop->random_pw =  (char *) malloc(len + 1);

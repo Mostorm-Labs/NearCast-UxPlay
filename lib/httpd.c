@@ -34,7 +34,8 @@ static const char *typename[] = {
     [CONNECTION_TYPE_RAOP]    = "RAOP",
     [CONNECTION_TYPE_AIRPLAY] = "AirPlay",
     [CONNECTION_TYPE_PTTH]    = "AirPlay (reversed)",
-    [CONNECTION_TYPE_HLS]     = "HLS"
+    [CONNECTION_TYPE_HLS]     = "HLS",
+    [CONNECTION_TYPE_HTTP_CTRL] = "HTTP Control"
 };
 
 struct http_connection_s {
@@ -638,7 +639,7 @@ httpd_start(httpd_t *httpd, unsigned short *port)
         MUTEX_UNLOCK(httpd->run_mutex);
         return -2;
     }
-    logger_log(httpd->logger, LOGGER_INFO, "Initialized server socket(s)");
+    logger_log(httpd->logger, LOGGER_INFO, "Initialized server socket(s) on port %hu", *port);
 
     /* Set values correctly and create new thread */
     httpd->running = 1;
