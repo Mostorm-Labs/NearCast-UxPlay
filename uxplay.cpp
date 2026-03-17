@@ -137,6 +137,10 @@ static unsigned short display[5] = {0}, tcp[3] = {0}, udp[3] = {0};
 static bool debug_log = DEFAULT_DEBUG_LOG;
 static bool suppress_packet_debug_data = false;
 static int log_level = LOGGER_INFO;
+static int stdout_log_level = LOGGER_INFO;
+static int logfile_log_level = LOGGER_INFO;
+static bool stdout_log_level_set = false;
+static bool logfile_log_level_set = false;
 static std::string log_filename = "";
 static FILE *log_file = NULL;
 static bool bt709_fix = false;
@@ -179,7 +183,6 @@ static bool reset_httpd = false;
 
 static void log(int level, const char* format, ...) {
     va_list vargs;
-    if (level > log_level) return;
     const char *prefix = NULL;
     switch (level) {
     case 0:
@@ -201,12 +204,12 @@ static void log(int level, const char* format, ...) {
     buf[sizeof(buf) - 1] = '\0';
     va_end(vargs);
 
-    if (debug_log || !log_file) {
+    if (level <= stdout_log_level) {
         /* stdout output */
         if (prefix) printf("%s", prefix);
         printf("%s\n", buf);
     }
-    if (log_file) {
+    if (log_file && level <= logfile_log_level) {
         time_t now = time(NULL);
         struct tm *tm_info = localtime(&now);
         char timebuf[20];
@@ -766,6 +769,8 @@ static void print_info (char *name) {
     printf("-d [n]    Enable debug logging; optional: n=1 to skip normal packet data\n");
     printf("-logfile fn Write log output to file \"fn\" (appends); protocol flow is\n");
     printf("          always logged at INFO level; use with -d for full debug output\n");
+    printf("-stdoutlog n Set stdout log level 0-8 (default follows -d)\n");
+    printf("-filelog n  Set logfile log level 0-8 (default follows -d)\n");
     printf("-v        Displays version information\n");
     printf("-h        Displays this help\n");
     printf("-rc fn    Read startup options from file \"fn\" instead of ~/.uxplayrc, etc\n");
@@ -816,6 +821,16 @@ static bool get_value (const char *str, unsigned int *n) {
     if (*end) return false;
     if (*n && (l == 0 || l > *n)) return false;
     *n = (unsigned int) l;
+    return true;
+}
+
+static bool get_log_level_value(const char *str, int *level) {
+    if (strlen(str) == 0 || strlen(str) > 10 || str[0] == '-') return false;
+    char *end;
+    unsigned long l = strtoul(str, &end, 10);
+    if (*end) return false;
+    if (l > LOGGER_DEBUG_DATA) return false;
+    *level = (int) l;
     return true;
 }
 
@@ -1046,6 +1061,24 @@ static void parse_arguments (int argc, char *argv[]) {
                 fprintf(stderr, "option \"-logfile\" requires a filename argument\n");
                 exit(1);
             }
+        } else if (arg == "-stdoutlog") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            int level = LOGGER_INFO;
+            if (!get_log_level_value(argv[++i], &level)) {
+                fprintf(stderr, "invalid \"-stdoutlog %s\"; -stdoutlog n : n=0-8\n", argv[i]);
+                exit(1);
+            }
+            stdout_log_level = level;
+            stdout_log_level_set = true;
+        } else if (arg == "-filelog") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            int level = LOGGER_INFO;
+            if (!get_log_level_value(argv[++i], &level)) {
+                fprintf(stderr, "invalid \"-filelog %s\"; -filelog n : n=0-8\n", argv[i]);
+                exit(1);
+            }
+            logfile_log_level = level;
+            logfile_log_level_set = true;
         } else if (arg == "-d") {
 	    if (i < argc - 1 && *argv[i+1] != '-') {
                 unsigned int n = 1;
@@ -2132,26 +2165,8 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
 }
 
 extern "C" void log_callback (void *cls, int level, const char *msg) {
-    switch (level) {
-        case LOGGER_DEBUG: {
-            LOGD("%s", msg);
-            break;
-        }
-        case LOGGER_WARNING: {
-            LOGW("%s", msg);
-            break;
-        }
-        case LOGGER_INFO: {
-            LOGI("%s", msg);
-            break;
-        }
-        case LOGGER_ERR: {
-            LOGE("%s", msg);
-            break;
-        }
-        default:
-            break;
-    }
+    (void) cls;
+    log(level, "%s", msg);
 }
 
 static int start_raop_server (unsigned short display[5], unsigned short tcp[3], unsigned short udp[3], bool debug_log) {
@@ -2386,6 +2401,14 @@ int main (int argc, char *argv[]) {
     if (debug_log && suppress_packet_debug_data) {
         log_level = LOGGER_DEBUG;
     }
+
+    if (!stdout_log_level_set) {
+        stdout_log_level = log_level;
+    }
+    if (!logfile_log_level_set) {
+        logfile_log_level = (log_filename.empty() ? stdout_log_level : log_level);
+    }
+    log_level = std::max(stdout_log_level, logfile_log_level);
 
     /* open log file if specified */
     if (!log_filename.empty()) {

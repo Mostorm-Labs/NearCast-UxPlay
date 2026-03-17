@@ -180,6 +180,14 @@ UxPlay 1.72: An open\-source AirPlay mirroring (+ audio streaming) server:
 .TP
 \fB\-d [n]\fR    Enable debug logging; optional: n=1 to skip normal packet data.
 .TP
+\fB\-logfile\fI fn\fR Write log output to file "fn" (appends); protocol flow is
+.IP
+   always logged at INFO level; use with -d for full debug output.
+.TP
+\fB\-stdoutlog\fI n\fR Set stdout log level 0-8 (default follows -d); enables stdout.
+.TP
+\fB\-filelog\fI n\fR  Set logfile log level 0-8 (default follows -d).
+.TP
 \fB\-v\fR        Displays version information
 .TP
 \fB\-h\fR        Displays help information
