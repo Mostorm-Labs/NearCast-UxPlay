@@ -137,6 +137,8 @@ static unsigned short display[5] = {0}, tcp[3] = {0}, udp[3] = {0};
 static bool debug_log = DEFAULT_DEBUG_LOG;
 static bool suppress_packet_debug_data = false;
 static int log_level = LOGGER_INFO;
+static std::string log_filename = "";
+static FILE *log_file = NULL;
 static bool bt709_fix = false;
 static bool srgb_fix = DEFAULT_SRGB_FIX;
 static int nohold = 0;
@@ -178,23 +180,41 @@ static bool reset_httpd = false;
 static void log(int level, const char* format, ...) {
     va_list vargs;
     if (level > log_level) return;
+    const char *prefix = NULL;
     switch (level) {
     case 0:
     case 1:
     case 2:
     case 3:
-        printf("*** ERROR: ");
+        prefix = "*** ERROR: ";
         break;
     case 4:
-        printf("*** WARNING: ");
+        prefix = "*** WARNING: ";
         break;
     default:
         break;
     }
+
+    char buf[4096];
     va_start(vargs, format);
-    vprintf(format, vargs);
-    printf("\n");
+    vsnprintf(buf, sizeof(buf) - 1, format, vargs);
+    buf[sizeof(buf) - 1] = '\0';
     va_end(vargs);
+
+    if (debug_log || !log_file) {
+        /* stdout output */
+        if (prefix) printf("%s", prefix);
+        printf("%s\n", buf);
+    }
+    if (log_file) {
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        char timebuf[20];
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+        if (prefix) fprintf(log_file, "%s %s%s\n", timebuf, prefix, buf);
+        else         fprintf(log_file, "%s %s\n", timebuf, buf);
+        fflush(log_file);
+    }
 }
 
 #define LOGD(...) log(LOGGER_DEBUG, __VA_ARGS__)
@@ -744,6 +764,8 @@ static void print_info (char *name) {
     printf("          x increases when audio format changes. If n is given, <= n\n");
     printf("          audio packets are dumped. \"aud\"= unknown format.\n");
     printf("-d [n]    Enable debug logging; optional: n=1 to skip normal packet data\n");
+    printf("-logfile fn Write log output to file \"fn\" (appends); protocol flow is\n");
+    printf("          always logged at INFO level; use with -d for full debug output\n");
     printf("-v        Displays version information\n");
     printf("-h        Displays this help\n");
     printf("-rc fn    Read startup options from file \"fn\" instead of ~/.uxplayrc, etc\n");
@@ -1017,6 +1039,13 @@ static void parse_arguments (int argc, char *argv[]) {
             }
         } else if (arg == "-a") {
             use_audio = false;
+        } else if (arg == "-logfile") {
+            if (i < argc - 1) {
+                log_filename = argv[++i];
+            } else {
+                fprintf(stderr, "option \"-logfile\" requires a filename argument\n");
+                exit(1);
+            }
         } else if (arg == "-d") {
 	    if (i < argc - 1 && *argv[i+1] != '-') {
                 unsigned int n = 1;
@@ -2358,7 +2387,15 @@ int main (int argc, char *argv[]) {
         log_level = LOGGER_DEBUG;
     }
 
-    
+    /* open log file if specified */
+    if (!log_filename.empty()) {
+        log_file = fopen(log_filename.c_str(), "a");
+        if (!log_file) {
+            fprintf(stderr, "*** ERROR: cannot open log file \"%s\"\n", log_filename.c_str());
+        }
+    }
+
+
 #ifdef _WIN32    /*  use utf-8 terminal output; don't buffer stdout in WIN32 when debug_log = false */
     SetConsoleOutputCP(CP_UTF8);
     if (!debug_log) {
@@ -2641,5 +2678,9 @@ int main (int argc, char *argv[]) {
     }
     if (metadata_filename.length()) {
 	remove (metadata_filename.c_str());
+    }
+    if (log_file) {
+        fclose(log_file);
+        log_file = NULL;
     }
 }
