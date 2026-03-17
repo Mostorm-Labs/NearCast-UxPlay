@@ -40,7 +40,13 @@ Start-Process -FilePath (Join-Path (Get-Location) "bonjoursdksetup.exe") -Argume
 pacman -Syu
 ```
 
-更新完成并重启 shell 后，切换到 `MSYS2 MinGW 64-bit`（或 `UCRT64`）shell，安装构建 UxPlay 所需的工具链与运行时：
+更新完成并重启 shell 后，切换到 `MSYS2 MinGW 64-bit`（或 `UCRT64`）shell，先安装基础 MinGW 工具链：
+
+```bash
+pacman -S mingw-w64-x86_64-toolchain
+```
+
+随后安装构建 UxPlay 所需的工具链与运行时：
 
 ```bash
 pacman -S --needed \
