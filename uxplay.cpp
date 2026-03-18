@@ -767,8 +767,8 @@ static void print_info (char *name) {
     printf("          x increases when audio format changes. If n is given, <= n\n");
     printf("          audio packets are dumped. \"aud\"= unknown format.\n");
     printf("-d [n]    Enable debug logging; optional: n=1 to skip normal packet data\n");
-    printf("-logfile fn Write log output to file \"fn\" (appends); protocol flow is\n");
-    printf("          always logged at INFO level; use with -d for full debug output\n");
+    printf("-logfile [fn] Write log output to file \"fn\" (appends); if fn is omitted,\n");
+    printf("          name uses date/time; protocol flow is always logged at INFO level\n");
     printf("-stdoutlog n Set stdout log level 0-8 (default follows -d)\n");
     printf("-filelog n  Set logfile log level 0-8 (default follows -d)\n");
     printf("-v        Displays version information\n");
@@ -785,6 +785,14 @@ static bool option_has_value(const int i, const int argc, std::string option, co
         return false;
      }
     return true;
+}
+
+static std::string generate_log_filename() {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timebuf[32];
+    strftime(timebuf, sizeof(timebuf), "uxplay_%Y%m%d_%H%M%S.log", tm_info);
+    return std::string(timebuf);
 }
 
 static bool get_display_settings (std::string value, unsigned short *w, unsigned short *h, unsigned short *r) {
@@ -1055,11 +1063,10 @@ static void parse_arguments (int argc, char *argv[]) {
         } else if (arg == "-a") {
             use_audio = false;
         } else if (arg == "-logfile") {
-            if (i < argc - 1) {
+            if (i < argc - 1 && argv[i+1][0] != '-') {
                 log_filename = argv[++i];
             } else {
-                fprintf(stderr, "option \"-logfile\" requires a filename argument\n");
-                exit(1);
+                log_filename = generate_log_filename();
             }
         } else if (arg == "-stdoutlog") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
