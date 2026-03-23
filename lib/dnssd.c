@@ -152,6 +152,9 @@ struct dnssd_s {
     uint32_t features2;
 
     unsigned char pin_pw;
+
+    unsigned short raop_port;
+    unsigned short airplay_port;
 };
 
 
@@ -285,6 +288,58 @@ dnssd_destroy(dnssd_t *dnssd)
     }
 }
 
+
+
+static void DNSSD_STDCALL raop_register_reply(
+    DNSServiceRef sdRef,
+    DNSServiceFlags flags,
+    DNSServiceErrorType errorCode,
+    const char *name,
+    const char *regtype,
+    const char *domain,
+    void *context)
+{
+    dnssd_t *dnssd = (dnssd_t *) context;
+    if (errorCode == kDNSServiceErr_NoError) {
+        fprintf(stderr, "dnssd: RAOP service \"%s\" registered successfully\n", name);
+    } else if (errorCode == kDNSServiceErr_NameConflict) {
+        fprintf(stderr, "dnssd: RAOP name conflict, re-registering...\n");
+        dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
+        dnssd->raop_service = NULL;
+        dnssd_register_raop(dnssd, dnssd->raop_port);
+    } else {
+        fprintf(stderr, "dnssd: RAOP registration error %d, re-registering...\n", errorCode);
+        dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
+        dnssd->raop_service = NULL;
+        dnssd_register_raop(dnssd, dnssd->raop_port);
+    }
+}
+
+static void DNSSD_STDCALL airplay_register_reply(
+    DNSServiceRef sdRef,
+    DNSServiceFlags flags,
+    DNSServiceErrorType errorCode,
+    const char *name,
+    const char *regtype,
+    const char *domain,
+    void *context)
+{
+    dnssd_t *dnssd = (dnssd_t *) context;
+    if (errorCode == kDNSServiceErr_NoError) {
+        fprintf(stderr, "dnssd: AirPlay service \"%s\" registered successfully\n", name);
+    } else if (errorCode == kDNSServiceErr_NameConflict) {
+        fprintf(stderr, "dnssd: AirPlay name conflict, re-registering...\n");
+        dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
+        dnssd->airplay_service = NULL;
+        dnssd_register_airplay(dnssd, dnssd->airplay_port);
+    } else {
+        fprintf(stderr, "dnssd: AirPlay registration error %d, re-registering...\n", errorCode);
+        dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
+        dnssd->airplay_service = NULL;
+        dnssd_register_airplay(dnssd, dnssd->airplay_port);
+    }
+}
+
 int
 dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
 {
@@ -293,6 +348,8 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
     char features[22];
 
     assert(dnssd);
+
+    dnssd->raop_port = port;
 
     snprintf(features, sizeof(features), "0x%X,0x%X", dnssd->features1, dnssd->features2);
 
@@ -352,7 +409,7 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
                               htons(port),
                               dnssd->TXTRecordGetLength(&dnssd->raop_record),
                               dnssd->TXTRecordGetBytesPtr(&dnssd->raop_record),
-                              NULL, NULL);
+                              raop_register_reply, dnssd);
 
     return (int) retval;   /* error codes are listed in Apple's dns_sd.h */
 }
@@ -365,6 +422,8 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
     char features[22];
 
     assert(dnssd);
+
+    dnssd->airplay_port = port;
 
     snprintf(features, sizeof(features), "0x%X,0x%X", dnssd->features1, dnssd->features2);
 
@@ -405,7 +464,7 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
                               htons(port),
                               dnssd->TXTRecordGetLength(&dnssd->airplay_record),
                               dnssd->TXTRecordGetBytesPtr(&dnssd->airplay_record),
-                              NULL, NULL);
+                              airplay_register_reply, dnssd);
 
     return (int) retval;   /* error codes are listed in Apple's dns_sd.h */
 }
