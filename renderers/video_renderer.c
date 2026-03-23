@@ -26,6 +26,9 @@
 
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
+#define GST_VIDEO_LATE_RESYNC_NS 200000000ULL
+#define GST_VIDEO_FUTURE_RESYNC_NS 200000000ULL
+#define GST_VIDEO_RESYNC_LEAD_NS 10000000ULL
 #ifdef X_DISPLAY_FIX
 #include <gst/video/navigation.h>
 #include "x_display_fix.h"
@@ -54,6 +57,8 @@ static gboolean hls_seek_enabled;
 static gboolean hls_playing;
 static gboolean hls_buffer_empty;
 static gboolean hls_buffer_full;
+static guint64 debug_video_packet_count = 0;
+static GstClockTime debug_last_pts = GST_CLOCK_TIME_NONE;
 
 
 typedef enum {
@@ -490,6 +495,8 @@ bool waiting_for_x11_window() {
 uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
     GstBuffer *buffer;
     GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
+    guint64 packet_index = ++debug_video_packet_count;
+    gint nals = nal_count ? *nal_count : -1;
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
     if (sync) {
         if (pts >= gst_video_pipeline_base_time) {
@@ -499,6 +506,31 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
             logger_log(logger, LOGGER_DEBUG, "*** invalid ntp_time < gst_video_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
                        ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_video_pipeline_base_time) / SECOND_IN_NSECS);
             return  (uint64_t)  gst_video_pipeline_base_time - pts;
+        }
+        if (renderer && renderer->pipeline && gst_video_pipeline_base_time != GST_CLOCK_TIME_NONE) {
+            GstClock *clock = gst_element_get_clock(renderer->pipeline);
+            if (clock) {
+                GstClockTime now = gst_clock_get_time(clock);
+                gst_object_unref(clock);
+                if (GST_CLOCK_TIME_IS_VALID(now) && now > gst_video_pipeline_base_time) {
+                    GstClockTime running = now - gst_video_pipeline_base_time;
+                    if (running > pts && (running - pts) > GST_VIDEO_LATE_RESYNC_NS) {
+                        GstClockTime old_pts = pts;
+                        GstClockTime late_ns = running - pts;
+                        pts = running + GST_VIDEO_RESYNC_LEAD_NS;
+                        logger_log(logger, LOGGER_WARNING,
+                                   "video resync late packet=%" G_GUINT64_FORMAT " skew=%" G_GUINT64_FORMAT " old_pts=%" G_GUINT64_FORMAT " new_pts=%" G_GUINT64_FORMAT " running=%" G_GUINT64_FORMAT,
+                                   packet_index, (guint64) late_ns, (guint64) old_pts, (guint64) pts, (guint64) running);
+                    } else if (pts > running && (pts - running) > GST_VIDEO_FUTURE_RESYNC_NS) {
+                        GstClockTime old_pts = pts;
+                        GstClockTime future_ns = pts - running;
+                        pts = running + GST_VIDEO_RESYNC_LEAD_NS;
+                        logger_log(logger, LOGGER_WARNING,
+                                   "video resync future packet=%" G_GUINT64_FORMAT " skew=%" G_GUINT64_FORMAT " old_pts=%" G_GUINT64_FORMAT " new_pts=%" G_GUINT64_FORMAT " running=%" G_GUINT64_FORMAT,
+                                   packet_index, (guint64) future_ns, (guint64) old_pts, (guint64) pts, (guint64) running);
+                    }
+                }
+            }
         }
     }
     g_assert(data_len != 0);
@@ -513,6 +545,16 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
             logger_log(logger, LOGGER_INFO, "Begin streaming to GStreamer video pipeline");
             first_packet = false;
         }
+        // if (sync) {
+        //     if (GST_CLOCK_TIME_IS_VALID(debug_last_pts) && pts <= debug_last_pts) {
+        //         logger_log(logger, LOGGER_WARNING,
+        //                    "video push packet=%" G_GUINT64_FORMAT " non-monotonic pts current=%" G_GUINT64_FORMAT
+        //                    " previous=%" G_GUINT64_FORMAT " delta=%" G_GINT64_FORMAT " nsec ntp=%" G_GUINT64_FORMAT,
+        //                    packet_index, (guint64) pts, (guint64) debug_last_pts,
+        //                    (gint64) (pts - debug_last_pts), (guint64) *ntp_time);
+        //     }
+        //     debug_last_pts = pts;
+        // }
         buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
         g_assert(buffer != NULL);
         //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
@@ -520,7 +562,16 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
             GST_BUFFER_PTS(buffer) = pts;
         }
         gst_buffer_fill(buffer, 0, data, *data_len);
-        gst_app_src_push_buffer (GST_APP_SRC(renderer->appsrc), buffer);
+        GstFlowReturn flow_ret = gst_app_src_push_buffer (GST_APP_SRC(renderer->appsrc), buffer);
+        // if (flow_ret != GST_FLOW_OK) {
+        //     logger_log(logger, LOGGER_ERR,
+        //                "video push packet=%" G_GUINT64_FORMAT " failed flow=%s(%d) len=%d nal=%d sync=%d ntp=%" G_GUINT64_FORMAT " pts=%" G_GUINT64_FORMAT,
+        //                packet_index, gst_flow_get_name(flow_ret), flow_ret, *data_len, nals, sync, (guint64) *ntp_time, (guint64) pts);
+        // } else if (logger_debug && (packet_index <= 3 || !(packet_index % 120))) {
+        //     logger_log(logger, LOGGER_DEBUG,
+        //                "video push packet=%" G_GUINT64_FORMAT " ok len=%d nal=%d sync=%d ntp=%" G_GUINT64_FORMAT " pts=%" G_GUINT64_FORMAT " base=%" G_GUINT64_FORMAT,
+        //                packet_index, *data_len, nals, sync, (guint64) *ntp_time, (guint64) pts, (guint64) gst_video_pipeline_base_time);
+        // }
 #ifdef X_DISPLAY_FIX
         if (renderer->gst_window && !(renderer->gst_window->window) && renderer->use_x11) {
             X11_search_attempts++;

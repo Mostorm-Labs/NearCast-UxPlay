@@ -53,7 +53,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/uxplay.exe",
-            "args": ["-pw", "-nofreeze", "-fs", "-hls", "-nohold", "-nh", "-d", "-n", "opensourceTest", "-logfile", "-stdoutlog", "8", "-vsync","200", "-fps", "60"],
+            "args": ["-pw", "-nofreeze", "-fs", "-hls", "-nohold", "-nh", "-d", "-n", "opensourceTest","-vsync", "-logfile", "-stdoutlog", "8"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",
             "environment": [
