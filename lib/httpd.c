@@ -305,9 +305,17 @@ httpd_nohold(httpd_t *httpd) {
 
 void
 httpd_remove_known_connections(httpd_t *httpd) {
+    httpd_remove_known_connections_except(httpd, NULL);
+}
+
+void
+httpd_remove_known_connections_except(httpd_t *httpd, void *user_data) {
     for (int i = 0; i < httpd->max_connections; i++) {
         http_connection_t *connection = &httpd->connections[i];
         if (!connection->connected || connection->type == CONNECTION_TYPE_UNKNOWN) {
+            continue;
+        }
+        if (user_data && connection->user_data == user_data) {
             continue;
         }
         httpd_remove_connection(httpd, connection);

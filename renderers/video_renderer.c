@@ -98,6 +98,8 @@ struct video_renderer_s {
 static video_renderer_t *renderer = NULL;
 static video_renderer_t *renderer_type[NCODECS] = {0};
 static int n_renderers = NCODECS;
+static GMutex renderer_mutex;
+static bool renderers_started = false;
 static char h264[] = "h264";
 static char h265[] = "h265";
 static char hls[] = "hls";
@@ -447,6 +449,8 @@ void video_renderer_resume() {
 }
 
 void video_renderer_start() {
+    g_mutex_lock(&renderer_mutex);
+    renderers_started = false;
     GstState state;
     const gchar *state_name;
     if (hls_video) {
@@ -455,21 +459,29 @@ void video_renderer_start() {
 	gst_element_get_state(renderer->pipeline, &state, NULL, 1000 * GST_MSECOND);
 	state_name= gst_element_state_get_name(state);
 	logger_log(logger, LOGGER_DEBUG, "video renderer_start: state %s", state_name);
+        g_mutex_unlock(&renderer_mutex);
         return;
     } 
   /* when not hls, start both h264 and h265 pipelines; will shut down the "wrong" one when we know the codec */
     for (int i = 0; i < n_renderers; i++) {
         renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);
+        gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 0);
+        if ((renderer && renderer_type[i] == renderer && state == GST_STATE_PLAYING) || state == GST_STATE_PLAYING) {
+            state_name = gst_element_state_get_name(state);
+            logger_log(logger, LOGGER_DEBUG, "video renderer_start: renderer %d already %s", i, state_name);
+            continue;
+        }
         gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_PAUSED);
-	gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
-	state_name= gst_element_state_get_name(state);
-	logger_log(logger, LOGGER_DEBUG, "video renderer_start: renderer %d state %s", i, state_name);
+        gst_element_get_state(renderer_type[i]->pipeline, &state, NULL, 1000 * GST_MSECOND);
+        state_name= gst_element_state_get_name(state);
+        logger_log(logger, LOGGER_DEBUG, "video renderer_start: renderer %d state %s", i, state_name);
     }
-    renderer = NULL;
     first_packet = true;
 #ifdef X_DISPLAY_FIX
     X11_search_attempts = 0;
 #endif
+    renderers_started = true;
+    g_mutex_unlock(&renderer_mutex);
 }
 
 /* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing. 
@@ -493,6 +505,12 @@ bool waiting_for_x11_window() {
 }
 
 uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time) {
+    g_mutex_lock(&renderer_mutex);
+    if (!renderer || !renderer->pipeline || !renderer->appsrc) {
+        g_mutex_unlock(&renderer_mutex);
+        return 0;
+    }
+
     GstBuffer *buffer;
     GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
     guint64 packet_index = ++debug_video_packet_count;
@@ -505,6 +523,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
             // adjust timestamps to be >= gst_video_pipeline_base time
             logger_log(logger, LOGGER_DEBUG, "*** invalid ntp_time < gst_video_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
                        ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_video_pipeline_base_time) / SECOND_IN_NSECS);
+            g_mutex_unlock(&renderer_mutex);
             return  (uint64_t)  gst_video_pipeline_base_time - pts;
         }
         if (renderer && renderer->pipeline && gst_video_pipeline_base_time != GST_CLOCK_TIME_NONE) {
@@ -586,6 +605,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
         }
 #endif
     }
+    g_mutex_unlock(&renderer_mutex);
     return 0;
 }
 
@@ -593,14 +613,19 @@ void video_renderer_flush() {
 }
 
 void video_renderer_stop() {
+    g_mutex_lock(&renderer_mutex);
+    renderers_started = false;
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"video_renderer_stop");
         if (renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+        gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
+        renderer = NULL;
         //gst_element_set_state (renderer->playbin, GST_STATE_NULL);
      }
+    g_mutex_unlock(&renderer_mutex);
 }
 
 static void video_renderer_destroy_instance(video_renderer_t *renderer) {
@@ -636,11 +661,15 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
 }
 
 void video_renderer_destroy() {
+    g_mutex_lock(&renderer_mutex);
+    renderers_started = false;
+    renderer = NULL;
     for (int i = 0; i < n_renderers; i++) {
-        if (renderer_type[i]) {
-            video_renderer_destroy_instance(renderer_type[i]);
-        }
+        video_renderer_t *to_destroy = renderer_type[i];
+        renderer_type[i] = NULL;
+        video_renderer_destroy_instance(to_destroy);
     }
+    g_mutex_unlock(&renderer_mutex);
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {
@@ -901,12 +930,18 @@ gboolean gstreamer_pipeline_bus_callback(GstBus *bus, GstMessage *message, void 
 }
 
 int video_renderer_choose_codec (bool video_is_h265) {
+    g_mutex_lock(&renderer_mutex);
+    if (!renderers_started) {
+        g_mutex_unlock(&renderer_mutex);
+        return -1;
+    }
     video_renderer_t *renderer_used = NULL;
     video_renderer_t *renderer_unused = NULL;
     g_assert(!hls_video);
     if (n_renderers == 1) {
         if (video_is_h265) {
             logger_log(logger, LOGGER_ERR, "video is h265 but the -h265 option was not used");
+            g_mutex_unlock(&renderer_mutex);
             return -1;
 	}
         renderer_used = renderer_type[0];
@@ -915,22 +950,37 @@ int video_renderer_choose_codec (bool video_is_h265) {
         renderer_unused = video_is_h265 ? renderer_type[0] : renderer_type[1];
     }
     if (renderer_used == NULL) { 
+        g_mutex_unlock(&renderer_mutex);
         return -1;
     } else if (renderer_used == renderer) {
+        g_mutex_unlock(&renderer_mutex);
         return 0;
     } else if (renderer) {
+        g_mutex_unlock(&renderer_mutex);
         return -1;
     }
-    renderer = renderer_used;
-    gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
+    gst_element_set_state (renderer_used->pipeline, GST_STATE_PLAYING);
     GstState old_state, new_state;
-    if (gst_element_get_state(renderer->pipeline, &old_state, &new_state, 100 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
-        g_error("video pipeline failed to go into playing state");
-	return -1;
+    if (gst_element_get_state(renderer_used->pipeline, &old_state, &new_state, 500 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
+        logger_log(logger, LOGGER_ERR, "video pipeline failed to go into playing state");
+        logger_log(logger, LOGGER_INFO, "retrying video pipeline state transition");
+        gst_element_set_state(renderer_used->pipeline, GST_STATE_NULL);
+        gst_element_get_state(renderer_used->pipeline, NULL, NULL, 500 * GST_MSECOND);
+        gst_element_set_state(renderer_used->pipeline, GST_STATE_PAUSED);
+        if (gst_element_get_state(renderer_used->pipeline, &old_state, &new_state, 1000 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
+            g_mutex_unlock(&renderer_mutex);
+            return -1;
+        }
+        gst_element_set_state(renderer_used->pipeline, GST_STATE_PLAYING);
+        if (gst_element_get_state(renderer_used->pipeline, &old_state, &new_state, 1000 * GST_MSECOND) == GST_STATE_CHANGE_FAILURE) {
+            g_mutex_unlock(&renderer_mutex);
+            return -1;
+        }
     }
+    renderer = renderer_used;
     logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
                gst_element_state_get_name (old_state),gst_element_state_get_name (new_state));
-    gst_video_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+    gst_video_pipeline_base_time = gst_element_get_base_time(renderer_used->appsrc);
     if (renderer == renderer_type[1]) {
         logger_log(logger, LOGGER_INFO, "*** video format is h265 high definition (HD/4K) video %dx%d", width, height);
     }
@@ -943,6 +993,7 @@ int video_renderer_choose_codec (bool video_is_h265) {
             video_renderer_destroy_instance(renderer_unused);
         }
     }
+    g_mutex_unlock(&renderer_mutex);
     return 0;
 }
 

@@ -106,6 +106,7 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+    bool nohold_disconnect_pending;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -239,11 +240,22 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 char ipaddr[40];
                 utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, ipaddr, (int) (sizeof(ipaddr)));
                 if (httpd_nohold(conn->raop->httpd)) {
-                    logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: switch to new connection request from %s", ipaddr);		  
-                    if (conn->raop->callbacks.video_reset) {
-                        conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
-		    }
-		    httpd_remove_known_connections(conn->raop->httpd);
+                    bool requires_authentication = false;
+                    if (conn->raop->callbacks.passwd) {
+                        int pw_len = 0;
+                        conn->raop->callbacks.passwd(conn->raop->callbacks.cls, &pw_len);
+                        requires_authentication = (pw_len != 0);
+                    }
+                    logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: switch to new connection request from %s", ipaddr);
+                    if (requires_authentication) {
+                        conn->nohold_disconnect_pending = true;
+                        logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: delaying previous connection disconnect until authentication succeeds");
+                    } else {
+                        if (conn->raop->callbacks.video_reset) {
+                            conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
+                        }
+                        httpd_remove_known_connections(conn->raop->httpd);
+                    }
                 } else {
                     logger_log(conn->raop->logger, LOGGER_WARNING, "rejecting new connection request from %s", ipaddr);
                     *response = http_response_create();

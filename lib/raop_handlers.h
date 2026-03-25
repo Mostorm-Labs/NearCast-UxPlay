@@ -680,6 +680,15 @@ raop_handler_setup(raop_conn_t *conn,
                 }
             }
         }
+
+        if (conn->nohold_disconnect_pending && conn->authenticated) {
+            logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: authentication succeeded, disconnecting previous client");
+            if (conn->raop->callbacks.video_reset) {
+                conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
+            }
+            httpd_remove_known_connections_except(conn->raop->httpd, conn);
+            conn->nohold_disconnect_pending = false;
+        }
 	
         char* eiv = NULL;
         uint64_t eiv_len = 0;

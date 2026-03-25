@@ -36,6 +36,7 @@
 #include "byteutils.h"
 #include "mirror_buffer.h"
 #include "stream.h"
+#include "threads.h"
 #include "utils.h"
 #include "plist/plist.h"
 
@@ -579,13 +580,15 @@ raop_rtp_mirror_thread(void *arg)
                            " payload_size %d header %s ts_client = %8.6f",
 			   payload_size, packet_description, (double) ntp_timestamp_remote / SEC);
 
-                if (packet[6] == 0x56 || packet[6] == 0x5e) {
+                bool stream_stopping_packet = (packet[6] == 0x56 || packet[6] == 0x5e);
+                bool stream_resuming_packet = (packet[6] == 0x16 || packet[6] == 0x1e);
+                if (stream_stopping_packet) {
                     logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "This packet indicates video stream is stopping");
                 }
-                if (!video_stream_suspended && (packet[6] == 0x56 || packet[6] == 0x5e)) {
+                if (!video_stream_suspended && stream_stopping_packet) {
                     video_stream_suspended = true;
                     raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
-                } else if (video_stream_suspended && (packet[6] == 0x16 || packet[6] == 0x1e)) {
+                } else if (video_stream_suspended && stream_resuming_packet) {
                     raop_rtp_mirror->callbacks.video_resume(raop_rtp_mirror->callbacks.cls);
                     video_stream_suspended = false;
                 }
@@ -615,6 +618,11 @@ raop_rtp_mirror_thread(void *arg)
                            width_source, height_source, width, height);
 
 		if (payload_size == 0) {
+                    if (stream_stopping_packet) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
+                                   "raop_rtp_mirror: ignore empty codec packet while stream is stopping");
+                        break;
+                    }
                     logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror: received type 0x01 packet with no payload:\n"
                                "this indicates non-h264 video but Airplay features bit 42 (SupportsScreenMultiCodec) is not set\n"
                                "use startup option \"-h265\" to set this bit and support h265 (4K) video");
@@ -631,14 +639,24 @@ raop_rtp_mirror_thread(void *arg)
                 if (!memcmp(payload + 4, hvc1, 4)) {
                     /* hvc1 HECV detected */
                     if (codec == VIDEO_CODEC_UNKNOWN) {
-                        codec = VIDEO_CODEC_H265;
-                        h265_video = true;
-                        if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, codec) < 0) {
+                        bool codec_set_ok = false;
+                        for (int attempt = 1; attempt <= 20; attempt++) {
+                            if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, VIDEO_CODEC_H265) == 0) {
+                                codec_set_ok = true;
+                                break;
+                            }
                             logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "failed to set video codec as H265 ");
-                            /* drop connection */
+                            if (attempt < 20) {
+                                logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "retry setting video codec");
+                                sleepms(120);
+                            }
+                        }
+                        if (!codec_set_ok) {
                             conn_reset = true;
                             break;
                         }
+                        codec = VIDEO_CODEC_H265;
+                        h265_video = true;
                     } else if (codec != VIDEO_CODEC_H265) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "invalid video codec change to H265: codec was set previously");
                         /* drop connection */
@@ -716,14 +734,24 @@ raop_rtp_mirror_thread(void *arg)
                     memcpy(ptr, pps, pps_size);
                 } else {
                     if (codec == VIDEO_CODEC_UNKNOWN) {
-                        codec = VIDEO_CODEC_H264;
-                        h265_video = false;
-                        if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, codec) < 0) {
+                        bool codec_set_ok = false;
+                        for (int attempt = 1; attempt <= 20; attempt++) {
+                            if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, VIDEO_CODEC_H264) == 0) {
+                                codec_set_ok = true;
+                                break;
+                            }
                             logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "failed to set video codec as H264 ");
-                            /* drop connection */
+                            if (attempt < 20) {
+                                logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "retry setting video codec");
+                                sleepms(120);
+                            }
+                        }
+                        if (!codec_set_ok) {
                             conn_reset = true;
                             break;
                         }
+                        codec = VIDEO_CODEC_H264;
+                        h265_video = false;
                     } else if (codec != VIDEO_CODEC_H264) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "invalid codec change to H264: codec was set previously");
                         /* drop connection */
@@ -831,6 +859,9 @@ raop_rtp_mirror_thread(void *arg)
             payload = NULL;
             memset(packet, 0, 128);
             readstart = 0;
+            if (conn_reset) {
+                break;
+            }
             if (unsupported_codec) {
                 break;
             }

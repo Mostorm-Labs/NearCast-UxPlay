@@ -1903,8 +1903,8 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
             remote_clock_offset = local_time - data->ntp_time_remote;
         }
         int count = 0;
-	uint64_t pts_mismatch = 0;
-	do {
+	    uint64_t pts_mismatch = 0;
+	    do {
             data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
             pts_mismatch = video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
             if (pts_mismatch) {
@@ -2665,7 +2665,7 @@ int main (int argc, char *argv[]) {
         }
         if (use_video && (close_window || preserve_connections)) {
             video_renderer_destroy();
-            if (!preserve_connections) {
+            if (!preserve_connections && open_connections == 0) {
                 raop_destroy_airplay_video(raop);
                 url.erase();
                 raop_remove_known_connections(raop);
