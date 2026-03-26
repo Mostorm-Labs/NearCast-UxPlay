@@ -59,6 +59,10 @@ static gboolean hls_buffer_empty;
 static gboolean hls_buffer_full;
 static guint64 debug_video_packet_count = 0;
 static GstClockTime debug_last_pts = GST_CLOCK_TIME_NONE;
+static bool gst_video_pts_rebase_pending = true;
+static bool gst_video_pts_rebase_active = false;
+static GstClockTime gst_video_pts_anchor_in = GST_CLOCK_TIME_NONE;
+static GstClockTime gst_video_pts_anchor_out = GST_CLOCK_TIME_NONE;
 
 
 typedef enum {
@@ -76,6 +80,16 @@ typedef enum {
   //GST_PLAY_FLAG_FORCE_FILTERS = (1 << 11),
   //GST_PLAY_FLAG_FORCE_SW_DECODERS = (1 << 12),
 } GstPlayFlags;
+
+static void video_renderer_reset_sync_state() {
+    gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
+    debug_video_packet_count = 0;
+    debug_last_pts = GST_CLOCK_TIME_NONE;
+    gst_video_pts_rebase_pending = true;
+    gst_video_pts_rebase_active = false;
+    gst_video_pts_anchor_in = GST_CLOCK_TIME_NONE;
+    gst_video_pts_anchor_out = GST_CLOCK_TIME_NONE;
+}
 
 #define NCODECS  2   /* renderers for h264 and h265 */
 
@@ -445,12 +459,17 @@ void video_renderer_resume() {
     logger_log(logger, LOGGER_DEBUG, "video renderer resumed: state %s", state_name);
     if (renderer->appsrc) {
         gst_video_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+        gst_video_pts_rebase_pending = true;
+        gst_video_pts_rebase_active = false;
+        gst_video_pts_anchor_in = GST_CLOCK_TIME_NONE;
+        gst_video_pts_anchor_out = GST_CLOCK_TIME_NONE;
     }
 }
 
 void video_renderer_start() {
     g_mutex_lock(&renderer_mutex);
     renderers_started = false;
+    video_renderer_reset_sync_state();
     GstState state;
     const gchar *state_name;
     if (hls_video) {
@@ -533,10 +552,37 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
                 gst_object_unref(clock);
                 if (GST_CLOCK_TIME_IS_VALID(now) && now > gst_video_pipeline_base_time) {
                     GstClockTime running = now - gst_video_pipeline_base_time;
+                    GstClockTime source_pts = pts;
+                    if (gst_video_pts_rebase_pending) {
+                        gst_video_pts_anchor_in = source_pts;
+                        gst_video_pts_anchor_out = running + GST_VIDEO_RESYNC_LEAD_NS;
+                        gst_video_pts_rebase_pending = false;
+                        gst_video_pts_rebase_active = true;
+                        pts = gst_video_pts_anchor_out;
+                    } else if (gst_video_pts_rebase_active &&
+                               gst_video_pts_anchor_in != GST_CLOCK_TIME_NONE &&
+                               gst_video_pts_anchor_out != GST_CLOCK_TIME_NONE) {
+                        if (source_pts >= gst_video_pts_anchor_in) {
+                            GstClockTime delta = source_pts - gst_video_pts_anchor_in;
+                            if (G_MAXUINT64 - gst_video_pts_anchor_out < delta) {
+                                pts = G_MAXUINT64;
+                            } else {
+                                pts = gst_video_pts_anchor_out + delta;
+                            }
+                        } else {
+                            gst_video_pts_rebase_pending = true;
+                            gst_video_pts_rebase_active = false;
+                            gst_video_pts_anchor_in = GST_CLOCK_TIME_NONE;
+                            gst_video_pts_anchor_out = GST_CLOCK_TIME_NONE;
+                        }
+                    }
                     if (running > pts && (running - pts) > GST_VIDEO_LATE_RESYNC_NS) {
                         GstClockTime old_pts = pts;
                         GstClockTime late_ns = running - pts;
                         pts = running + GST_VIDEO_RESYNC_LEAD_NS;
+                        gst_video_pts_anchor_in = source_pts;
+                        gst_video_pts_anchor_out = pts;
+                        gst_video_pts_rebase_active = true;
                         logger_log(logger, LOGGER_WARNING,
                                    "video resync late packet=%" G_GUINT64_FORMAT " skew=%" G_GUINT64_FORMAT " old_pts=%" G_GUINT64_FORMAT " new_pts=%" G_GUINT64_FORMAT " running=%" G_GUINT64_FORMAT,
                                    packet_index, (guint64) late_ns, (guint64) old_pts, (guint64) pts, (guint64) running);
@@ -544,6 +590,9 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
                         GstClockTime old_pts = pts;
                         GstClockTime future_ns = pts - running;
                         pts = running + GST_VIDEO_RESYNC_LEAD_NS;
+                        gst_video_pts_anchor_in = source_pts;
+                        gst_video_pts_anchor_out = pts;
+                        gst_video_pts_rebase_active = true;
                         logger_log(logger, LOGGER_WARNING,
                                    "video resync future packet=%" G_GUINT64_FORMAT " skew=%" G_GUINT64_FORMAT " old_pts=%" G_GUINT64_FORMAT " new_pts=%" G_GUINT64_FORMAT " running=%" G_GUINT64_FORMAT,
                                    packet_index, (guint64) future_ns, (guint64) old_pts, (guint64) pts, (guint64) running);
@@ -615,13 +664,13 @@ void video_renderer_flush() {
 void video_renderer_stop() {
     g_mutex_lock(&renderer_mutex);
     renderers_started = false;
+    video_renderer_reset_sync_state();
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"video_renderer_stop");
         if (renderer->appsrc) {
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
         }
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
-        gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
         renderer = NULL;
         //gst_element_set_state (renderer->playbin, GST_STATE_NULL);
      }
@@ -663,6 +712,7 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
 void video_renderer_destroy() {
     g_mutex_lock(&renderer_mutex);
     renderers_started = false;
+    video_renderer_reset_sync_state();
     renderer = NULL;
     for (int i = 0; i < n_renderers; i++) {
         video_renderer_t *to_destroy = renderer_type[i];
@@ -981,6 +1031,10 @@ int video_renderer_choose_codec (bool video_is_h265) {
     logger_log(logger, LOGGER_DEBUG, "video_pipeline state change from %s to %s\n",
                gst_element_state_get_name (old_state),gst_element_state_get_name (new_state));
     gst_video_pipeline_base_time = gst_element_get_base_time(renderer_used->appsrc);
+    gst_video_pts_rebase_pending = true;
+    gst_video_pts_rebase_active = false;
+    gst_video_pts_anchor_in = GST_CLOCK_TIME_NONE;
+    gst_video_pts_anchor_out = GST_CLOCK_TIME_NONE;
     if (renderer == renderer_type[1]) {
         logger_log(logger, LOGGER_INFO, "*** video format is h265 high definition (HD/4K) video %dx%d", width, height);
     }
