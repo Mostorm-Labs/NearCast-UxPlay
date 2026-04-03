@@ -1,0 +1,14 @@
+{
+  "name": "electron-gstreamer-sharedtexture-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron 40 sharedTexture demo backed by GStreamer D3D11 textures",
+  "main": "main.js",
+  "scripts": {
+    "build:native": "powershell -ExecutionPolicy Bypass -File .\\scripts\\build-native.ps1",
+    "start": "powershell -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron .\""
+  },
+  "devDependencies": {
+    "electron": "^40.8.0"
+  }
+}

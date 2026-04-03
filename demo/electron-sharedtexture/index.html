@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0"
+    />
+    <title>Electron SharedTexture + GStreamer</title>
+    <style>
+      :root {
+        --bg: #0d1117;
+        --panel: rgba(18, 24, 33, 0.9);
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #4fd1c5;
+        --border: rgba(255, 255, 255, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        font-family: "Segoe UI", "PingFang SC", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(79, 209, 197, 0.2), transparent 34%),
+          radial-gradient(circle at top right, rgba(59, 130, 246, 0.18), transparent 28%),
+          linear-gradient(180deg, #111827 0%, #090b10 100%);
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 300px;
+        gap: 20px;
+        min-height: 100vh;
+        padding: 20px;
+      }
+
+      .stage,
+      .sidebar {
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        background: var(--panel);
+        backdrop-filter: blur(18px);
+      }
+
+      .stage {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        position: relative;
+      }
+
+      #videoCanvas {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+
+      .badge {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        border-radius: 999px;
+        padding: 8px 12px;
+        background: rgba(0, 0, 0, 0.48);
+        color: var(--text);
+        font-size: 12px;
+        letter-spacing: 0.04em;
+      }
+
+      .sidebar {
+        padding: 24px;
+      }
+
+      h1 {
+        margin: 0 0 12px;
+        font-size: 28px;
+        line-height: 1.1;
+      }
+
+      p {
+        margin: 0 0 14px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      dl {
+        display: grid;
+        grid-template-columns: 88px 1fr;
+        gap: 10px 12px;
+        margin: 24px 0 0;
+      }
+
+      dt {
+        color: var(--muted);
+      }
+
+      dd {
+        margin: 0;
+        word-break: break-word;
+      }
+
+      code {
+        font-family: "Cascadia Code", Consolas, monospace;
+        color: var(--accent);
+      }
+
+      @media (max-width: 980px) {
+        .layout {
+          grid-template-columns: 1fr;
+          grid-template-rows: minmax(360px, 60vh) auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="layout">
+      <section class="stage">
+        <canvas id="videoCanvas"></canvas>
+        <div class="badge" id="statusBadge">Waiting for texture</div>
+      </section>
+      <aside class="sidebar">
+        <h1>SharedTexture Demo</h1>
+        <p>GStreamer exports <code>GstD3D11Memory</code> in the native bridge, Electron 40 imports it with <code>sharedTexture.importSharedTexture()</code>, then forwards it to the renderer for drawing.</p>
+        <dl>
+          <dt>Status</dt>
+          <dd id="stateValue">waiting</dd>
+          <dt>Size</dt>
+          <dd id="sizeValue">-</dd>
+          <dt>Frame</dt>
+          <dd id="frameValue">-</dd>
+          <dt>Timestamp</dt>
+          <dd id="timestampValue">-</dd>
+          <dt>Texture ID</dt>
+          <dd id="textureValue">-</dd>
+          <dt>Probe</dt>
+          <dd id="probeValue">-</dd>
+        </dl>
+      </aside>
+    </div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
