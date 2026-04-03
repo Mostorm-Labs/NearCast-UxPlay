@@ -16,13 +16,36 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
+
+constexpr size_t kInvalidPoolIndex = std::numeric_limits<size_t>::max();
+constexpr size_t kFallbackSharedTexturePoolSize = 8;
 
 struct FrameRecord {
   guint64 id;
   GstSample *sample;
-  ID3D11Texture2D *shared_texture;
+  size_t shared_texture_pool_index;
+  size_t shared_texture_slot_index;
+};
+
+struct SharedTexturePoolSlot {
+  ID3D11Texture2D *texture = nullptr;
+  HANDLE shared_handle = nullptr;
+  bool in_use = false;
+};
+
+struct SharedTexturePool {
+  ID3D11Device *device = nullptr;
+  D3D11_TEXTURE2D_DESC desc = {};
+  std::vector<SharedTexturePoolSlot> slots;
+};
+
+enum class SharedHandleStatus {
+  kSuccess,
+  kDropFrame,
+  kFailure,
 };
 
 template <typename T>
@@ -37,6 +60,28 @@ std::string FormatHRESULT(HRESULT hr) {
   std::ostringstream stream;
   stream << "0x" << std::hex << std::uppercase << static_cast<unsigned long>(hr);
   return stream.str();
+}
+
+void CloseHandleIfValid(HANDLE &handle) {
+  if (handle) {
+    CloseHandle(handle);
+    handle = nullptr;
+  }
+}
+
+void ReleaseSharedTexturePoolSlot(SharedTexturePoolSlot &slot) {
+  SafeRelease(slot.texture);
+  CloseHandleIfValid(slot.shared_handle);
+  slot.in_use = false;
+}
+
+void ReleaseSharedTexturePool(SharedTexturePool &pool) {
+  for (auto &slot : pool.slots) {
+    ReleaseSharedTexturePoolSlot(slot);
+  }
+  pool.slots.clear();
+  SafeRelease(pool.device);
+  pool.desc = {};
 }
 
 void EmitMapProbe(GstBuffer *buffer) {
@@ -248,9 +293,13 @@ class BridgeApp {
       std::lock_guard<std::mutex> lock(frame_mutex_);
       for (auto &entry : frames_) {
         gst_sample_unref(entry.second.sample);
-        SafeRelease(entry.second.shared_texture);
       }
       frames_.clear();
+
+      for (auto &pool : shared_texture_pools_) {
+        ReleaseSharedTexturePool(pool);
+      }
+      shared_texture_pools_.clear();
     }
 
     if (bus_) {
@@ -319,13 +368,21 @@ class BridgeApp {
     }
 
     HANDLE local_handle = nullptr;
-    ID3D11Texture2D *shared_texture = nullptr;
+    bool close_local_handle = true;
+    size_t shared_texture_pool_index = kInvalidPoolIndex;
+    size_t shared_texture_slot_index = kInvalidPoolIndex;
     if (!gst_d3d11_memory_get_nt_handle(d3d11_memory, &local_handle) || !local_handle) {
-      if (!CreateShareableTextureHandle(d3d11_memory, buffer, caps, desc, &local_handle,
-                                        &shared_texture) ||
-          !local_handle) {
+      const SharedHandleStatus status =
+          CreateShareableTextureHandle(d3d11_memory, buffer, caps, desc, &local_handle,
+                                       &close_local_handle, &shared_texture_pool_index,
+                                       &shared_texture_slot_index);
+      if (status == SharedHandleStatus::kDropFrame) {
         gst_sample_unref(sample);
-        SafeRelease(shared_texture);
+        return GST_FLOW_OK;
+      }
+
+      if (status != SharedHandleStatus::kSuccess || !local_handle) {
+        gst_sample_unref(sample);
         EmitError("failed to export NT handle from GstD3D11Memory or bridge-owned copy");
         return GST_FLOW_ERROR;
       }
@@ -335,11 +392,13 @@ class BridgeApp {
     BOOL duplicated =
         DuplicateHandle(GetCurrentProcess(), local_handle, electron_process_, &remote_handle, 0, FALSE,
                         DUPLICATE_SAME_ACCESS);
-    CloseHandle(local_handle);
+    if (close_local_handle) {
+      CloseHandle(local_handle);
+    }
 
     if (!duplicated || !remote_handle) {
       gst_sample_unref(sample);
-      SafeRelease(shared_texture);
+      ReleaseSharedTextureSlot(shared_texture_pool_index, shared_texture_slot_index);
       EmitError("DuplicateHandle into Electron process failed");
       return GST_FLOW_ERROR;
     }
@@ -347,7 +406,8 @@ class BridgeApp {
     guint64 frame_id = next_frame_id_.fetch_add(1, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
-      frames_.emplace(frame_id, FrameRecord{frame_id, sample, shared_texture});
+      frames_.emplace(frame_id, FrameRecord{frame_id, sample, shared_texture_pool_index,
+                                            shared_texture_slot_index});
     }
 
     GstClockTime pts = GST_BUFFER_PTS(buffer);
@@ -404,7 +464,8 @@ class BridgeApp {
 
   void ReleaseFrame(guint64 frame_id) {
     GstSample *sample = nullptr;
-    ID3D11Texture2D *shared_texture = nullptr;
+    size_t shared_texture_pool_index = kInvalidPoolIndex;
+    size_t shared_texture_slot_index = kInvalidPoolIndex;
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
       auto it = frames_.find(frame_id);
@@ -412,49 +473,29 @@ class BridgeApp {
         return;
       }
       sample = it->second.sample;
-      shared_texture = it->second.shared_texture;
+      shared_texture_pool_index = it->second.shared_texture_pool_index;
+      shared_texture_slot_index = it->second.shared_texture_slot_index;
       frames_.erase(it);
     }
 
     if (sample) {
       gst_sample_unref(sample);
     }
-    SafeRelease(shared_texture);
+    ReleaseSharedTextureSlot(shared_texture_pool_index, shared_texture_slot_index);
   }
 
   void EmitError(const std::string &message) const {
     std::cerr << "ERROR\t" << message << std::endl;
   }
 
-  bool CreateShareableTextureHandle(GstD3D11Memory *memory, GstBuffer *buffer, GstCaps *caps,
-                                    const D3D11_TEXTURE2D_DESC &source_desc, HANDLE *shared_handle,
-                                    ID3D11Texture2D **shared_texture_out) const {
-    if (!shared_handle || !shared_texture_out) {
-      return false;
-    }
+  bool DescsMatch(const D3D11_TEXTURE2D_DESC &left, const D3D11_TEXTURE2D_DESC &right) const {
+    return left.Width == right.Width && left.Height == right.Height &&
+           left.Format == right.Format;
+  }
 
-    *shared_handle = nullptr;
-    *shared_texture_out = nullptr;
-
-    ID3D11Resource *source_resource = gst_d3d11_memory_get_resource_handle(memory);
-    if (!source_resource) {
-      EmitError("GstD3D11Memory did not expose an ID3D11Resource");
-      return false;
-    }
-
-    ID3D11Texture2D *source_texture = nullptr;
-    HRESULT hr = source_resource->QueryInterface(IID_ID3D11Texture2D,
-                                                 reinterpret_cast<void **>(&source_texture));
-    if (FAILED(hr) || !source_texture) {
-      EmitError("failed to query ID3D11Texture2D from GstD3D11Memory: " + FormatHRESULT(hr));
-      return false;
-    }
-
-    ID3D11Device *device = nullptr;
-    source_texture->GetDevice(&device);
-    if (!device) {
-      SafeRelease(source_texture);
-      EmitError("failed to get ID3D11Device from source texture");
+  bool InitializeSharedTexturePool(ID3D11Device *device, const D3D11_TEXTURE2D_DESC &source_desc,
+                                   SharedTexturePool *pool) {
+    if (!device || !pool) {
       return false;
     }
 
@@ -472,49 +513,203 @@ class BridgeApp {
     shared_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED |
                             D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 
-    ID3D11Texture2D *shared_texture = nullptr;
-    hr = device->CreateTexture2D(&shared_desc, nullptr, &shared_texture);
-    if (FAILED(hr) || !shared_texture) {
-      SafeRelease(device);
-      SafeRelease(source_texture);
+    SharedTexturePool created_pool;
+    device->AddRef();
+    created_pool.device = device;
+    created_pool.desc = shared_desc;
+    created_pool.slots.resize(kFallbackSharedTexturePoolSize);
+
+    for (size_t slot_index = 0; slot_index < created_pool.slots.size(); ++slot_index) {
+      SharedTexturePoolSlot &slot = created_pool.slots[slot_index];
+      HRESULT hr = device->CreateTexture2D(&shared_desc, nullptr, &slot.texture);
+      if (FAILED(hr) || !slot.texture) {
+        std::ostringstream message;
+        message << "failed to create pooled shared texture: " << FormatHRESULT(hr)
+                << " format=" << static_cast<unsigned>(shared_desc.Format)
+                << " bind=0x" << std::hex << shared_desc.BindFlags
+                << " misc=0x" << shared_desc.MiscFlags
+                << " size=" << std::dec << shared_desc.Width << "x" << shared_desc.Height
+                << " slot=" << slot_index;
+        EmitError(message.str());
+        ReleaseSharedTexturePool(created_pool);
+        return false;
+      }
+
+      IDXGIResource1 *dxgi_resource = nullptr;
+      hr = slot.texture->QueryInterface(IID_IDXGIResource1,
+                                        reinterpret_cast<void **>(&dxgi_resource));
+      if (FAILED(hr) || !dxgi_resource) {
+        EmitError("failed to query IDXGIResource1 from pooled shared texture: " +
+                  FormatHRESULT(hr));
+        ReleaseSharedTexturePool(created_pool);
+        return false;
+      }
+
+      hr = dxgi_resource->CreateSharedHandle(nullptr,
+                                             DXGI_SHARED_RESOURCE_READ |
+                                                 DXGI_SHARED_RESOURCE_WRITE,
+                                             nullptr, &slot.shared_handle);
+      SafeRelease(dxgi_resource);
+      if (FAILED(hr) || !slot.shared_handle) {
+        EmitError("failed to create NT handle for pooled shared texture: " +
+                  FormatHRESULT(hr));
+        ReleaseSharedTexturePool(created_pool);
+        return false;
+      }
+    }
+
+    *pool = std::move(created_pool);
+    return true;
+  }
+
+  SharedHandleStatus AcquireSharedTextureSlot(ID3D11Device *device,
+                                              const D3D11_TEXTURE2D_DESC &source_desc,
+                                              size_t *pool_index_out, size_t *slot_index_out,
+                                              HANDLE *shared_handle_out,
+                                              ID3D11Texture2D **shared_texture_out) {
+    if (!device || !pool_index_out || !slot_index_out || !shared_handle_out ||
+        !shared_texture_out) {
+      return SharedHandleStatus::kFailure;
+    }
+
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+
+    size_t pool_index = kInvalidPoolIndex;
+    for (size_t i = 0; i < shared_texture_pools_.size(); ++i) {
+      const SharedTexturePool &pool = shared_texture_pools_[i];
+      if (pool.device == device && DescsMatch(pool.desc, source_desc)) {
+        pool_index = i;
+        break;
+      }
+    }
+
+    if (pool_index == kInvalidPoolIndex) {
+      shared_texture_pools_.emplace_back();
+      pool_index = shared_texture_pools_.size() - 1;
+      if (!InitializeSharedTexturePool(device, source_desc, &shared_texture_pools_[pool_index])) {
+        shared_texture_pools_.pop_back();
+        return SharedHandleStatus::kFailure;
+      }
+    }
+
+    SharedTexturePool &pool = shared_texture_pools_[pool_index];
+    for (size_t slot_index = 0; slot_index < pool.slots.size(); ++slot_index) {
+      SharedTexturePoolSlot &slot = pool.slots[slot_index];
+      if (slot.in_use) {
+        continue;
+      }
+
+      slot.in_use = true;
+      *pool_index_out = pool_index;
+      *slot_index_out = slot_index;
+      *shared_handle_out = slot.shared_handle;
+      *shared_texture_out = slot.texture;
+      return SharedHandleStatus::kSuccess;
+    }
+
+    const unsigned dropped = dropped_pool_frames_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (dropped <= 5 || dropped % 60 == 0) {
       std::ostringstream message;
-      message << "failed to create bridge-owned shared texture: " << FormatHRESULT(hr)
-              << " format=" << static_cast<unsigned>(shared_desc.Format)
-              << " bind=0x" << std::hex << shared_desc.BindFlags
-              << " misc=0x" << shared_desc.MiscFlags
-              << " size=" << std::dec << shared_desc.Width << "x" << shared_desc.Height;
+      message << "dropping frame because pooled shared textures are all in use"
+              << " poolSize=" << pool.slots.size()
+              << " dropped=" << dropped;
       EmitError(message.str());
-      return false;
+    }
+    return SharedHandleStatus::kDropFrame;
+  }
+
+  void ReleaseSharedTextureSlot(size_t pool_index, size_t slot_index) {
+    if (pool_index == kInvalidPoolIndex || slot_index == kInvalidPoolIndex) {
+      return;
+    }
+
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    if (pool_index >= shared_texture_pools_.size()) {
+      return;
+    }
+
+    SharedTexturePool &pool = shared_texture_pools_[pool_index];
+    if (slot_index >= pool.slots.size()) {
+      return;
+    }
+
+    pool.slots[slot_index].in_use = false;
+  }
+
+  SharedHandleStatus CreateShareableTextureHandle(
+      GstD3D11Memory *memory, GstBuffer *buffer, GstCaps *caps,
+      const D3D11_TEXTURE2D_DESC &source_desc, HANDLE *shared_handle,
+      bool *close_shared_handle, size_t *shared_texture_pool_index_out,
+      size_t *shared_texture_slot_index_out) {
+    if (!shared_handle || !close_shared_handle || !shared_texture_pool_index_out ||
+        !shared_texture_slot_index_out) {
+      return SharedHandleStatus::kFailure;
+    }
+
+    *shared_handle = nullptr;
+    *close_shared_handle = true;
+    *shared_texture_pool_index_out = kInvalidPoolIndex;
+    *shared_texture_slot_index_out = kInvalidPoolIndex;
+
+    ID3D11Resource *source_resource = gst_d3d11_memory_get_resource_handle(memory);
+    if (!source_resource) {
+      EmitError("GstD3D11Memory did not expose an ID3D11Resource");
+      return SharedHandleStatus::kFailure;
+    }
+
+    ID3D11Texture2D *source_texture = nullptr;
+    HRESULT hr = source_resource->QueryInterface(IID_ID3D11Texture2D,
+                                                 reinterpret_cast<void **>(&source_texture));
+    if (FAILED(hr) || !source_texture) {
+      EmitError("failed to query ID3D11Texture2D from GstD3D11Memory: " + FormatHRESULT(hr));
+      return SharedHandleStatus::kFailure;
+    }
+
+    ID3D11Device *device = nullptr;
+    source_texture->GetDevice(&device);
+    if (!device) {
+      SafeRelease(source_texture);
+      EmitError("failed to get ID3D11Device from source texture");
+      return SharedHandleStatus::kFailure;
     }
 
     ID3D11DeviceContext *context = nullptr;
     device->GetImmediateContext(&context);
     if (!context) {
-      SafeRelease(shared_texture);
       SafeRelease(device);
       SafeRelease(source_texture);
       EmitError("failed to get ID3D11DeviceContext for bridge-owned shared texture");
-      return false;
+      return SharedHandleStatus::kFailure;
     }
 
     GstVideoInfo video_info = {};
     if (!gst_video_info_from_caps(&video_info, caps)) {
       SafeRelease(context);
-      SafeRelease(shared_texture);
       SafeRelease(device);
       SafeRelease(source_texture);
       EmitError("failed to parse video info from caps for shared texture upload");
-      return false;
+      return SharedHandleStatus::kFailure;
     }
 
     GstVideoFrame video_frame;
     if (!gst_video_frame_map(&video_frame, &video_info, buffer, GST_MAP_READ)) {
       SafeRelease(context);
-      SafeRelease(shared_texture);
       SafeRelease(device);
       SafeRelease(source_texture);
       EmitError("failed to map GstBuffer for shared texture upload");
-      return false;
+      return SharedHandleStatus::kFailure;
+    }
+
+    ID3D11Texture2D *shared_texture = nullptr;
+    const SharedHandleStatus acquire_status =
+        AcquireSharedTextureSlot(device, source_desc, shared_texture_pool_index_out,
+                                 shared_texture_slot_index_out, shared_handle, &shared_texture);
+    if (acquire_status != SharedHandleStatus::kSuccess) {
+      gst_video_frame_unmap(&video_frame);
+      SafeRelease(context);
+      SafeRelease(device);
+      SafeRelease(source_texture);
+      return acquire_status;
     }
 
     context->UpdateSubresource(shared_texture, 0, nullptr, GST_VIDEO_FRAME_PLANE_DATA(&video_frame, 0),
@@ -530,37 +725,11 @@ class BridgeApp {
       EmitTextureProbe(device, shared_texture, "SHARED_PROBE");
     }
 
-    IDXGIResource1 *dxgi_resource = nullptr;
-    hr = shared_texture->QueryInterface(IID_IDXGIResource1,
-                                        reinterpret_cast<void **>(&dxgi_resource));
-    if (FAILED(hr) || !dxgi_resource) {
-      SafeRelease(context);
-      SafeRelease(shared_texture);
-      SafeRelease(device);
-      SafeRelease(source_texture);
-      EmitError("failed to query IDXGIResource1 from bridge-owned shared texture: " +
-                FormatHRESULT(hr));
-      return false;
-    }
-
-    hr = dxgi_resource->CreateSharedHandle(nullptr,
-                                           DXGI_SHARED_RESOURCE_READ |
-                                               DXGI_SHARED_RESOURCE_WRITE,
-                                           nullptr, shared_handle);
-    SafeRelease(dxgi_resource);
     SafeRelease(context);
     SafeRelease(device);
     SafeRelease(source_texture);
-
-    if (FAILED(hr) || !*shared_handle) {
-      SafeRelease(shared_texture);
-      EmitError("failed to create NT handle for bridge-owned shared texture: " +
-                FormatHRESULT(hr));
-      return false;
-    }
-
-    *shared_texture_out = shared_texture;
-    return true;
+    *close_shared_handle = false;
+    return SharedHandleStatus::kSuccess;
   }
 
   DWORD electron_pid_;
@@ -571,7 +740,9 @@ class BridgeApp {
   GstBus *bus_ = nullptr;
   std::mutex frame_mutex_;
   std::unordered_map<guint64, FrameRecord> frames_;
+  std::vector<SharedTexturePool> shared_texture_pools_;
   std::atomic<guint64> next_frame_id_{1};
+  std::atomic<unsigned> dropped_pool_frames_{0};
   std::atomic<int> source_probe_frames_{5};
   mutable std::atomic<int> shared_probe_frames_{5};
   std::atomic<bool> stopping_{false};
