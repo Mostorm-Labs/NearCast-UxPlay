@@ -4,6 +4,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const readline = require('node:readline');
 
+// 启用调试模式
+if (process.env.NODE_ENV === 'development') {
+  app.commandLine.appendSwitch('remote-debugging-port', '9222');
+  app.commandLine.appendSwitch('inspect', '5858');
+}
+
 const bridgeExecutable = path.join(
   __dirname,
   'native',
