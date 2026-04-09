@@ -38,10 +38,18 @@ pkg_check_modules(GST REQUIRED    gstreamer-1.0>=1.4
                                   gstreamer-app-1.0>=1.4
 )
 
+if (WIN32)
+  pkg_check_modules(GST_D3D11 QUIET gstreamer-d3d11-1.0>=1.22)
+  if (GST_D3D11_FOUND)
+    add_definitions(-DUXPLAY_HAS_SHARED_TEXTURE_BRIDGE)
+  endif()
+endif()
+
 add_library( renderers
              STATIC
              audio_renderer.c
-	     video_renderer.c )
+	     video_renderer.c
+             shared_texture_bridge.cpp )
 
 target_link_libraries ( renderers PUBLIC airplay )
 
@@ -66,6 +74,9 @@ if ( APPLE AND NOT GST_MACOS )
 endif()
 
 target_include_directories ( renderers PUBLIC ${GST_INCLUDE_DIRS} )
+if (GST_D3D11_FOUND)
+  target_include_directories(renderers PUBLIC ${GST_D3D11_INCLUDE_DIRS})
+endif()
 
 if( GST_LIBRARY_DIRS MATCHES "/Library/FrameWorks/GStreamer.framework/lib" )
   set( GST_LIBRARY_DIRS "/Library/FrameWorks/GStreamer.framework/Libraries")
@@ -81,5 +92,16 @@ else()
   target_link_libraries( renderers PUBLIC ${GST_LINK_LIBRARIES} )
 endif()
 
+if (GST_D3D11_FOUND)
+  if( CMAKE_VERSION VERSION_LESS "3.12" )
+    target_link_libraries(renderers PUBLIC ${GST_D3D11_LIBRARIES})
+  else()
+    target_link_libraries(renderers PUBLIC ${GST_D3D11_LINK_LIBRARIES})
+  endif()
+endif()
+
+if (WIN32 AND GST_D3D11_FOUND)
+  target_link_libraries(renderers PUBLIC d3d11 dxgi)
+endif()
 
 

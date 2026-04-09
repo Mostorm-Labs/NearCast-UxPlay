@@ -10,23 +10,20 @@ if (process.env.NODE_ENV === 'development') {
   app.commandLine.appendSwitch('inspect', '5858');
 }
 
-const bridgeExecutable = path.join(
-  __dirname,
-  'native',
-  'build',
-  'gst_texture_bridge.exe',
-);
-
-const defaultPipeline =
-  process.env.GST_SHARED_TEXTURE_PIPELINE ||
-  'videotestsrc is-live=true pattern=smpte ! ' +
-    'video/x-raw,format=BGRA,width=1280,height=720,framerate=30/1 ! ' +
-    'queue max-size-buffers=2 leaky=downstream ! ' +
-    'd3d11upload ! ' +
-    'video/x-raw(memory:D3D11Memory),format=BGRA ! ' +
-    'appsink name=sink sync=false';
+const repoRoot = path.resolve(__dirname, '..', '..');
+const uxplayExecutable =
+  process.env.UXPLAY_EXE || path.join(repoRoot, 'build', 'uxplay.exe');
+const uxplayWorkdir = path.dirname(uxplayExecutable);
+const uxplayServerName =
+  process.env.UXPLAY_SERVER_NAME || 'UxPlay SharedTexture';
 const msysRoot = process.env.MSYS64_ROOT || 'D:\\msys64';
 const gstreamerBin = path.join(msysRoot, 'mingw64', 'bin');
+const gstreamerPluginPath =
+  process.env.GST_PLUGIN_PATH || path.join(uxplayWorkdir, 'lib', 'gstreamer-1.0');
+const traceSharedTexture =
+  process.env.UXPLAY_TRACE_SHARED_TEXTURE === '1' ||
+  process.env.UXPLAY_TRACE_SHARED_TEXTURE === 'true';
+const sendTimeoutMs = Number.parseInt(process.env.UXPLAY_SEND_TIMEOUT_MS || '1200', 10) || 0;
 
 let win;
 let bridge;
@@ -34,9 +31,34 @@ let bridgeReader;
 let bridgeReady = false;
 let frameSending = false;
 let pendingFrame = null;
+let framesReceived = 0;
+let framesQueued = 0;
+let framesSent = 0;
+let frameReleases = 0;
+let importFailures = 0;
+let sendFailures = 0;
+let sendTimeouts = 0;
 
 if (!app || !BrowserWindow || !sharedTexture) {
   throw new Error('Electron sharedTexture API is unavailable. Use Electron 40+ and ensure ELECTRON_RUN_AS_NODE is not set.');
+}
+
+function splitCommandLineArgs(text) {
+  if (!text) {
+    return [];
+  }
+
+  const parts = text.match(/"[^"]*"|'[^']*'|[^\s]+/g) || [];
+  return parts.map((part) => {
+    if (
+      (part.startsWith('"') && part.endsWith('"')) ||
+      (part.startsWith("'") && part.endsWith("'"))
+    ) {
+      return part.slice(1, -1);
+    }
+
+    return part;
+  });
 }
 
 function createWindow() {
@@ -74,25 +96,104 @@ function handleToBuffer(handleHex) {
   return buffer;
 }
 
-function releasePendingFrame(frame) {
+function traceSharedTextureStats(reason) {
+  if (!traceSharedTexture) {
+    return;
+  }
+
+  console.log(
+    `[shared-texture:${reason}] received=${framesReceived} queued=${framesQueued} ` +
+      `sent=${framesSent} released=${frameReleases} importFailures=${importFailures} ` +
+      `sendFailures=${sendFailures} sendTimeouts=${sendTimeouts} ` +
+      `pending=${pendingFrame ? pendingFrame.frameId : 'none'} ` +
+      `sending=${frameSending}`,
+  );
+}
+
+function notifyBridgeRelease(frameId) {
+  if (!bridge || !bridge.stdin.writable) {
+    return;
+  }
+  bridge.stdin.write(`RELEASE\t${frameId}\n`);
+}
+
+function releasePendingFrame(frame, options = {}) {
   if (!frame) {
     return;
   }
+
+  const { notifyRelease = false } = options;
 
   try {
     frame.importedSharedTexture.release();
   } catch {
     // Ignore double release during shutdown.
   }
+
+  // For frames dropped before sendSharedTexture(), proactively release the slot
+  // in UxPlay instead of waiting on allReferencesReleased callback semantics.
+  if (notifyRelease) {
+    notifyBridgeRelease(frame.frameId);
+  }
 }
 
 function queueFrame(frame) {
   if (pendingFrame) {
-    releasePendingFrame(pendingFrame);
+    releasePendingFrame(pendingFrame, { notifyRelease: true });
   }
 
   pendingFrame = frame;
+  framesQueued += 1;
+  if (traceSharedTexture && (framesQueued <= 5 || framesQueued % 30 === 0)) {
+    traceSharedTextureStats(`queue-${frame.frameId}`);
+  }
   void flushFrameQueue();
+}
+
+async function sendFrameToRenderer(frame) {
+  const sendPromise = sharedTexture.sendSharedTexture(
+    {
+      frame: win.webContents.mainFrame,
+      importedSharedTexture: frame.importedSharedTexture,
+    },
+    {
+      width: frame.width,
+      height: frame.height,
+      timestampUs: frame.timestampUs,
+      frameId: frame.frameId,
+    },
+  );
+
+  if (sendTimeoutMs <= 0) {
+    await sendPromise;
+    return;
+  }
+
+  let timedOut = false;
+  let timeoutHandle;
+
+  try {
+    await Promise.race([
+      sendPromise,
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(`sendSharedTexture timed out after ${sendTimeoutMs}ms`));
+        }, sendTimeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    if (timedOut) {
+      sendTimeouts += 1;
+      // The send promise may settle later; absorb it to avoid unhandled rejections.
+      sendPromise.catch(() => {});
+    }
+    throw error;
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
 }
 
 async function flushFrameQueue() {
@@ -105,24 +206,21 @@ async function flushFrameQueue() {
   while (pendingFrame && win && !win.isDestroyed()) {
     const frame = pendingFrame;
     pendingFrame = null;
+    let sentToRenderer = false;
 
     try {
-      await sharedTexture.sendSharedTexture(
-        {
-          frame: win.webContents.mainFrame,
-          importedSharedTexture: frame.importedSharedTexture,
-        },
-        {
-          width: frame.width,
-          height: frame.height,
-          timestampUs: frame.timestampUs,
-          frameId: frame.frameId,
-        },
-      );
+      await sendFrameToRenderer(frame);
+      sentToRenderer = true;
+      framesSent += 1;
+      if (traceSharedTexture && (framesSent <= 5 || framesSent % 30 === 0)) {
+        traceSharedTextureStats(`sent-${frame.frameId}`);
+      }
     } catch (error) {
+      sendFailures += 1;
       console.error('sendSharedTexture failed:', error);
+      traceSharedTextureStats(`send-failed-${frame.frameId}`);
     } finally {
-      releasePendingFrame(frame);
+      releasePendingFrame(frame, { notifyRelease: !sentToRenderer });
     }
   }
 
@@ -130,20 +228,36 @@ async function flushFrameQueue() {
 }
 
 function startBridge() {
-  if (!fs.existsSync(bridgeExecutable)) {
-    throw new Error(`Native bridge not found: ${bridgeExecutable}. Run npm run build:native first.`);
+  if (!fs.existsSync(uxplayExecutable)) {
+    throw new Error(
+      `UxPlay executable not found: ${uxplayExecutable}. Build UxPlay first or set UXPLAY_EXE.`,
+    );
   }
+
+  const extraArgs = splitCommandLineArgs(process.env.UXPLAY_ARGS || '');
+  const childArgs = [
+    '-n',
+    uxplayServerName,
+    '-stpid',
+    String(process.pid),
+    '-stdoutlog',
+    '0',
+    '-d',
+    '-logfile',
+    ...extraArgs,
+  ];
 
   const childEnv = {
     ...process.env,
-    PATH: `${gstreamerBin};${process.env.PATH || ''}`,
+    GST_PLUGIN_PATH: gstreamerPluginPath,
+    PATH: `${uxplayWorkdir};${gstreamerBin};${process.env.PATH || ''}`,
   };
 
   bridge = spawn(
-    bridgeExecutable,
-    ['--electron-pid', String(process.pid), '--pipeline', defaultPipeline],
+    uxplayExecutable,
+    childArgs,
     {
-      cwd: __dirname,
+      cwd: uxplayWorkdir,
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -151,11 +265,11 @@ function startBridge() {
   );
 
   bridge.on('error', (error) => {
-    console.error('Failed to launch bridge:', error);
+    console.error('Failed to launch UxPlay:', error);
   });
 
   bridge.on('exit', (code, signal) => {
-    console.error(`Bridge exited code=${code} signal=${signal}`);
+    console.error(`UxPlay exited code=${code} signal=${signal}`);
     bridge = null;
     bridgeReady = false;
   });
@@ -172,12 +286,14 @@ function startBridge() {
 
     if (line === 'READY') {
       bridgeReady = true;
+      console.log(`UxPlay shared texture export is ready. AirPlay server name: ${uxplayServerName}`);
       void flushFrameQueue();
       return;
     }
 
     const [type, ...rest] = line.split('\t');
     if (type !== 'FRAME' || rest.length < 5) {
+      console.log(`[uxplay] ${line}`);
       return;
     }
 
@@ -186,6 +302,10 @@ function startBridge() {
     const width = Number(widthText);
     const height = Number(heightText);
     const timestampUs = Number(timestampText);
+    framesReceived += 1;
+    if (traceSharedTexture && (framesReceived <= 5 || framesReceived % 30 === 0)) {
+      traceSharedTextureStats(`recv-${frameId}`);
+    }
 
     let importedSharedTexture;
     try {
@@ -200,16 +320,18 @@ function startBridge() {
           },
         },
         allReferencesReleased: () => {
-          if (bridge && bridge.stdin.writable) {
-            bridge.stdin.write(`RELEASE\t${frameId}\n`);
+          frameReleases += 1;
+          notifyBridgeRelease(frameId);
+          if (traceSharedTexture && (frameReleases <= 5 || frameReleases % 30 === 0)) {
+            traceSharedTextureStats(`release-${frameId}`);
           }
         },
       });
     } catch (error) {
+      importFailures += 1;
       console.error('importSharedTexture failed:', error);
-      if (bridge && bridge.stdin.writable) {
-        bridge.stdin.write(`RELEASE\t${frameId}\n`);
-      }
+      notifyBridgeRelease(frameId);
+      traceSharedTextureStats(`import-failed-${frameId}`);
       return;
     }
 
@@ -229,6 +351,11 @@ function startBridge() {
 
 app.whenReady().then(() => {
   createWindow();
+  if (sendTimeoutMs > 0) {
+    console.log(`sendSharedTexture watchdog timeout: ${sendTimeoutMs}ms`);
+  } else {
+    console.log('sendSharedTexture watchdog disabled');
+  }
 
   win.webContents.once('did-finish-load', () => {
     startBridge();
@@ -244,6 +371,6 @@ app.on('before-quit', () => {
     bridge.stdin.write('STOP\n');
   }
 
-  releasePendingFrame(pendingFrame);
+  releasePendingFrame(pendingFrame, { notifyRelease: true });
   pendingFrame = null;
 });

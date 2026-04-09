@@ -49,7 +49,8 @@ typedef struct video_renderer_s video_renderer_t;
 
 void video_renderer_init (logger_t *logger, const char *server_name, videoflip_t videoflip[2], const char *parser,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options,
-                          bool initial_fullscreen, bool video_sync, bool h265_support, guint playbin_version,  const char *uri);
+                          bool initial_fullscreen, bool video_sync, bool h265_support, guint playbin_version,
+                          const char *uri, uint32_t shared_texture_target_pid);
 void video_renderer_start ();
 void video_renderer_stop ();
 void video_renderer_pause ();
@@ -72,4 +73,3 @@ unsigned int video_reset_callback(void *loop);
 #endif
 
 #endif //VIDEO_RENDERER_H
-

@@ -169,6 +169,7 @@ static double db_high = 0.0;
 static bool taper_volume = false;
 static double initial_volume = 0.0;
 static bool h265_support = false;
+static uint32_t shared_texture_target_pid = 0;
 static int n_renderers = 0;
 static bool hls_support = false;
 static std::string url = "";
@@ -727,6 +728,10 @@ static void print_info (char *name) {
     printf("          some choices: ximagesink,xvimagesink,vaapisink,glimagesink,\n");
     printf("          gtksink,waylandsink,osxvideosink,kmssink,d3d11videosink etc.\n");
     printf("-vs 0     Streamed audio only, with no video display window\n");
+#ifdef _WIN32
+    printf("-stpid n  Export decoded video frames as shared D3D11 textures to pid n\n");
+    printf("          FRAME records are written to stdout; local video window is disabled\n");
+#endif
     printf("-v4l2     Use Video4Linux2 for GPU hardware h264 decoding\n");
     printf("-bt709    Sometimes needed for Raspberry Pi models using Video4Linux2 \n");
     printf("-srgb     Display \"Full range\" [0-255] color, not \"Limited Range\"[16-235]\n");
@@ -1127,6 +1132,14 @@ static void parse_arguments (int argc, char *argv[]) {
                 videosink_options = videosink.substr(pos);
 	        videosink.erase(pos);
             }
+        } else if (arg == "-stpid") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            unsigned int value = 0;
+            if (!get_value(argv[++i], &value) || value == 0) {
+                fprintf(stderr, "invalid \"-stpid %s\"; -stpid n requires a non-zero process id\n", argv[i]);
+                exit(1);
+            }
+            shared_texture_target_pid = value;
         } else if (arg == "-as") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
             audiosink.erase();
@@ -2461,6 +2474,7 @@ int main (int argc, char *argv[]) {
     }
 #endif
 
+    bool shared_texture_export_only = (shared_texture_target_pid != 0);
 #ifdef _WIN32
     /* because of issues in videosink dvd312videosink (segfault when resolution changes
      with certain Nvdia graphics cards) make the default videosink d3d11videosink, and
@@ -2484,7 +2498,7 @@ int main (int argc, char *argv[]) {
         display[3] = 1; /* set fps to 1 frame per sec when no video will be shown */
     }
 
-    if (fullscreen && use_video) {
+    if (fullscreen && use_video && !shared_texture_export_only) {
         if (videosink == "waylandsink" || videosink == "vaapisink") {
             videosink_options.append(" fullscreen=true");
 	} else if (videosink == "kmssink") {
@@ -2492,7 +2506,7 @@ int main (int argc, char *argv[]) {
 	}
     }
 
-    if (videosink == "d3d11videosink"  && videosink_options.empty() && use_video) {
+    if (videosink == "d3d11videosink"  && videosink_options.empty() && use_video && !shared_texture_export_only) {
         if (fullscreen) {
             videosink_options.append(" fullscreen-toggle-mode=GST_D3D11_WINDOW_FULLSCREEN_TOGGLE_MODE_PROPERTY fullscreen=TRUE");
         } else {
@@ -2501,7 +2515,12 @@ int main (int argc, char *argv[]) {
         }
     }
 
-    if (videosink == "d3d12videosink"  && videosink_options.empty() && use_video) {
+    if (shared_texture_target_pid != 0) {
+        LOGI("shared texture export target pid=%u", shared_texture_target_pid);
+        LOGI("shared texture export is running in export-only mode");
+    }
+
+    if (videosink == "d3d12videosink"  && videosink_options.empty() && use_video && !shared_texture_export_only) {
         if (fullscreen) {
             videosink_options.append("fullscreen=TRUE");
         } else {
@@ -2589,7 +2608,8 @@ int main (int argc, char *argv[]) {
     if (use_video) {
         video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
                             video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                            videosink_options.c_str(), fullscreen, video_sync, h265_support, playbin_version, NULL);
+                            videosink_options.c_str(), fullscreen, video_sync, h265_support, playbin_version,
+                            NULL, shared_texture_target_pid);
         video_renderer_start();
 #ifdef __OpenBSD__
     } else {
@@ -2673,7 +2693,8 @@ int main (int argc, char *argv[]) {
 	    const char *uri = (url.empty() ? NULL : url.c_str());
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
                                 video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, h265_support, playbin_version, uri);
+                                videosink_options.c_str(), fullscreen, video_sync, h265_support, playbin_version,
+                                uri, shared_texture_target_pid);
             video_renderer_start();
         }
         if (reset_httpd) {

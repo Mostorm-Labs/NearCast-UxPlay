@@ -372,6 +372,7 @@ class BridgeApp {
     size_t shared_texture_pool_index = kInvalidPoolIndex;
     size_t shared_texture_slot_index = kInvalidPoolIndex;
     if (!gst_d3d11_memory_get_nt_handle(d3d11_memory, &local_handle) || !local_handle) {
+      EmitInfo("Direct NT handle acquisition failed, attempting to copy via CreateShareableTextureHandle");
       const SharedHandleStatus status =
           CreateShareableTextureHandle(d3d11_memory, buffer, caps, desc, &local_handle,
                                        &close_local_handle, &shared_texture_pool_index,
@@ -386,6 +387,9 @@ class BridgeApp {
         EmitError("failed to export NT handle from GstD3D11Memory or bridge-owned copy");
         return GST_FLOW_ERROR;
       }
+      EmitInfo("Successfully acquired handle via CreateShareableTextureHandle copy");
+    } else {
+      EmitInfo("Successfully acquired NT handle directly from GstD3D11Memory");
     }
 
     HANDLE remote_handle = nullptr;
@@ -485,7 +489,16 @@ class BridgeApp {
   }
 
   void EmitError(const std::string &message) const {
-    std::cerr << "ERROR\t" << message << std::endl;
+    std::cerr << "ERROR: " << message << std::endl;
+  }
+
+  // Only emit info logs once at the beginning to avoid flooding the terminal
+  void EmitInfo(const std::string &message) const {
+    static bool first_time = true;
+    if (first_time) {
+      std::cerr << "INFO: " << message << std::endl;
+      first_time = false;
+    }
   }
 
   bool DescsMatch(const D3D11_TEXTURE2D_DESC &left, const D3D11_TEXTURE2D_DESC &right) const {

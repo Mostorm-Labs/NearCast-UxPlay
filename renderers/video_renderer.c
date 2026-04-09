@@ -22,7 +22,9 @@
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
 #include "video_renderer.h"
+#include "shared_texture_bridge.h"
 
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
@@ -95,6 +97,7 @@ static void video_renderer_reset_sync_state() {
 
 struct video_renderer_s {
     GstElement *appsrc, *pipeline;
+    GstAppSink *shared_texture_sink;
     GstBus *bus;
     const char *codec;
     bool autovideo;
@@ -114,9 +117,22 @@ static video_renderer_t *renderer_type[NCODECS] = {0};
 static int n_renderers = NCODECS;
 static GMutex renderer_mutex;
 static bool renderers_started = false;
+static shared_texture_bridge_t *shared_texture_bridge = NULL;
 static char h264[] = "h264";
 static char h265[] = "h265";
 static char hls[] = "hls";
+
+static GstFlowReturn on_shared_texture_sample(GstAppSink *sink, gpointer user_data) {
+    (void) user_data;
+    if (!shared_texture_bridge) {
+        GstSample *sample = gst_app_sink_pull_sample(sink);
+        if (sample) {
+            gst_sample_unref(sample);
+        }
+        return GST_FLOW_OK;
+    }
+    return shared_texture_bridge_on_new_sample(shared_texture_bridge, sink);
+}
 
 static void append_videoflip (GString *launch, const videoflip_t *flip, const videoflip_t *rot) {
     /* videoflip image transform */
@@ -240,10 +256,16 @@ GstElement *make_video_sink(const char *videosink, const char *videosink_options
 
 void  video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
-                          bool initial_fullscreen, bool video_sync, bool h265_support, guint playbin_version, const char *uri) {
+                          bool initial_fullscreen, bool video_sync, bool h265_support, guint playbin_version,
+                          const char *uri, uint32_t shared_texture_target_pid) {
     GError *error = NULL;
     GstCaps *caps = NULL;
+    bool shared_texture_export_only = false;
     hls_video = (uri != NULL);
+    if (shared_texture_bridge) {
+        shared_texture_bridge_destroy(shared_texture_bridge);
+        shared_texture_bridge = NULL;
+    }
     /* videosink choices that are auto */
     auto_videosink = (strstr(videosink, "autovideosink") || strstr(videosink, "fpsdisplaysink"));
 
@@ -276,6 +298,22 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
     } else {
         n_renderers = h265_support ? 2 : 1;
     }
+
+    if (shared_texture_target_pid != 0) {
+        if (hls_video) {
+            logger_log(logger, LOGGER_WARNING, "shared texture export is only supported for mirror-mode video pipelines");
+        } else {
+            shared_texture_bridge = shared_texture_bridge_create(logger, shared_texture_target_pid);
+            if (shared_texture_bridge) {
+                shared_texture_export_only = true;
+                logger_log(logger, LOGGER_INFO, "shared texture export enabled for target pid=%" G_GUINT32_FORMAT,
+                           shared_texture_target_pid);
+                logger_log(logger, LOGGER_INFO,
+                           "shared texture export is running in export-only mode; local videosink display is disabled");
+            }
+        }
+    }
+
     g_assert (n_renderers <= NCODECS);
     for (int i = 0; i < n_renderers; i++) {
         g_assert (i < 2);
@@ -339,13 +377,21 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
             append_videoflip(launch, &videoflip[0], &videoflip[1]);
             g_string_append(launch, converter);
             g_string_append(launch, " ! ");
-            g_string_append(launch, "videoscale ! ");
-            g_string_append(launch, videosink);
-            g_string_append(launch, " name=");
-            g_string_append(launch, videosink);
-            g_string_append(launch, "_");
-            g_string_append(launch, renderer_type[i]->codec);
-            g_string_append(launch, videosink_options);
+            if (shared_texture_export_only) {
+                g_string_append(launch, "d3d11convert ! ");
+                g_string_append(launch, "video/x-raw(memory:D3D11Memory),format=BGRA ! ");
+                g_string_append(launch, "appsink name=shared_texture_sink_");
+                g_string_append(launch, renderer_type[i]->codec);
+                g_string_append(launch, " max-buffers=1 drop=true");
+            } else {
+                g_string_append(launch, "videoscale ! ");
+                g_string_append(launch, videosink);
+                g_string_append(launch, " name=");
+                g_string_append(launch, videosink);
+                g_string_append(launch, "_");
+                g_string_append(launch, renderer_type[i]->codec);
+                g_string_append(launch, videosink_options);
+            }
             if (video_sync) {
                 g_string_append(launch, " sync=true");
                 sync = true;
@@ -387,6 +433,27 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
             gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
             renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "video_source");
             g_assert(renderer_type[i]->appsrc);
+            renderer_type[i]->shared_texture_sink = NULL;
+
+            if (shared_texture_bridge) {
+                gchar *shared_texture_sink_name =
+                    g_strdup_printf("shared_texture_sink_%s", renderer_type[i]->codec);
+                GstElement *shared_texture_sink_element =
+                    gst_bin_get_by_name(GST_BIN(renderer_type[i]->pipeline), shared_texture_sink_name);
+                if (!shared_texture_sink_element || !GST_IS_APP_SINK(shared_texture_sink_element)) {
+                    logger_log(logger, LOGGER_ERR,
+                               "video_renderer_init: failed to find shared texture appsink \"%s\"",
+                               shared_texture_sink_name);
+                } else {
+                    renderer_type[i]->shared_texture_sink = GST_APP_SINK(shared_texture_sink_element);
+                    gst_app_sink_set_emit_signals(renderer_type[i]->shared_texture_sink, TRUE);
+                    gst_app_sink_set_drop(renderer_type[i]->shared_texture_sink, TRUE);
+                    gst_app_sink_set_max_buffers(renderer_type[i]->shared_texture_sink, 1);
+                    g_signal_connect(renderer_type[i]->shared_texture_sink, "new-sample",
+                                     G_CALLBACK(on_shared_texture_sample), renderer_type[i]);
+                }
+                g_free(shared_texture_sink_name);
+            }
 
             g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
             g_string_free(launch, TRUE);
@@ -394,7 +461,8 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
 	    gst_object_unref(clock);
         }	
 #ifdef X_DISPLAY_FIX
-        use_x11 = (strstr(videosink, "xvimagesink") || strstr(videosink, "ximagesink") || auto_videosink);
+        use_x11 = (!shared_texture_export_only) &&
+                  (strstr(videosink, "xvimagesink") || strstr(videosink, "ximagesink") || auto_videosink);
         fullscreen = initial_fullscreen;
         renderer_type[i]->server_name = server_name;
         renderer_type[i]->gst_window = NULL;
@@ -697,6 +765,10 @@ static void video_renderer_destroy_instance(video_renderer_t *renderer) {
 	if (renderer->appsrc) {
             gst_object_unref (renderer->appsrc);
         }
+        if (renderer->shared_texture_sink) {
+            gst_object_unref(renderer->shared_texture_sink);
+            renderer->shared_texture_sink = NULL;
+        }
         gst_object_unref (renderer->pipeline);
 #ifdef X_DISPLAY_FIX
         if (renderer->gst_window) {
@@ -718,6 +790,10 @@ void video_renderer_destroy() {
         video_renderer_t *to_destroy = renderer_type[i];
         renderer_type[i] = NULL;
         video_renderer_destroy_instance(to_destroy);
+    }
+    if (shared_texture_bridge) {
+        shared_texture_bridge_destroy(shared_texture_bridge);
+        shared_texture_bridge = NULL;
     }
     g_mutex_unlock(&renderer_mutex);
 }

@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0"
     />
-    <title>Electron SharedTexture + GStreamer</title>
+    <title>Electron SharedTexture + UxPlay</title>
     <style>
       :root {
         --bg: #0d1117;
@@ -127,7 +127,7 @@
       </section>
       <aside class="sidebar">
         <h1>SharedTexture Demo</h1>
-        <p>GStreamer exports <code>GstD3D11Memory</code> in the native bridge, Electron 40 imports it with <code>sharedTexture.importSharedTexture()</code>, then forwards it to the renderer for drawing.</p>
+        <p>UxPlay exports decoded video as shared D3D11 textures, Electron 40 imports them with <code>sharedTexture.importSharedTexture()</code>, then forwards them to the renderer for drawing.</p>
         <dl>
           <dt>Status</dt>
           <dd id="stateValue">waiting</dd>
