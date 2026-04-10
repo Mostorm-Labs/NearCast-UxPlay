@@ -375,8 +375,7 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
             g_string_append(launch, decoder);
             g_string_append(launch, " ! ");
             append_videoflip(launch, &videoflip[0], &videoflip[1]);
-            g_string_append(launch, converter);
-            g_string_append(launch, " ! ");
+            
             if (shared_texture_export_only) {
                 g_string_append(launch, "d3d11convert ! ");
                 g_string_append(launch, "video/x-raw(memory:D3D11Memory),format=BGRA ! ");
@@ -384,6 +383,8 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
                 g_string_append(launch, renderer_type[i]->codec);
                 g_string_append(launch, " max-buffers=1 drop=true");
             } else {
+                g_string_append(launch, converter);
+                g_string_append(launch, " ! ");
                 g_string_append(launch, "videoscale ! ");
                 g_string_append(launch, videosink);
                 g_string_append(launch, " name=");
