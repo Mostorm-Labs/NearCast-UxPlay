@@ -18,6 +18,7 @@
 
 #include "airplay_video.h"
 #include "fcup_request.h"
+#include <ctype.h>
 
 static void
 http_handler_server_info(raop_conn_t *conn, http_request_t *request, http_response_t *response,
@@ -371,6 +372,273 @@ http_handler_pin_control(raop_conn_t *conn, http_request_t *request, http_respon
     }
     logger_log(conn->raop->logger, LOGGER_INFO, "HTTP control updated pin to %s", pin_str);
     http_pin_send_status(conn, "ok", "pin updated", true, response, response_data, response_datalen);
+}
+
+static int
+http_audio_parse_bool_token(const char *value, bool *enabled_out) {
+    if (!value || !enabled_out) {
+        return -1;
+    }
+    while (*value == ' ' || *value == '\t' || *value == '\n' || *value == '\r' ||
+           *value == ':' || *value == '=' || *value == '"' || *value == '\'') {
+        value++;
+    }
+    char token[16];
+    int len = 0;
+    while (value[len]) {
+        unsigned char ch = (unsigned char) value[len];
+        if (isalnum(ch) || ch == '_' || ch == '-') {
+            if (len >= (int) sizeof(token) - 1) {
+                return -1;
+            }
+            token[len] = (char) tolower(ch);
+            len++;
+            continue;
+        }
+        break;
+    }
+    if (len == 0) {
+        return -1;
+    }
+    token[len] = '\0';
+    if (!strcmp(token, "1") || !strcmp(token, "true") || !strcmp(token, "on") ||
+        !strcmp(token, "yes") || !strcmp(token, "enable") || !strcmp(token, "enabled")) {
+        *enabled_out = true;
+        return 0;
+    }
+    if (!strcmp(token, "0") || !strcmp(token, "false") || !strcmp(token, "off") ||
+        !strcmp(token, "no") || !strcmp(token, "disable") || !strcmp(token, "disabled")) {
+        *enabled_out = false;
+        return 0;
+    }
+    return -1;
+}
+
+static int
+http_audio_parse_from_query(const char *url, bool *enabled_out) {
+    if (!url || !enabled_out) {
+        return -1;
+    }
+    const char *query = strchr(url, '?');
+    if (!query) {
+        return -1;
+    }
+    query++;
+    const char *cursor = query;
+    while (*cursor) {
+        while (*cursor == '&') {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+        const char *key_start = cursor;
+        while (*cursor && *cursor != '=' && *cursor != '&') {
+            cursor++;
+        }
+        if (!*cursor || *cursor == '&') {
+            if (*cursor == '&') {
+                continue;
+            }
+            break;
+        }
+        size_t key_len = cursor - key_start;
+        cursor++; /* skip '=' */
+        const char *value_start = cursor;
+        while (*cursor && *cursor != '&') {
+            cursor++;
+        }
+        bool key_match = (key_len == 5 && !strncmp(key_start, "audio", 5)) ||
+                         (key_len == 7 && !strncmp(key_start, "enabled", 7)) ||
+                         (key_len == 5 && !strncmp(key_start, "value", 5)) ||
+                         (key_len == 5 && !strncmp(key_start, "state", 5)) ||
+                         (key_len == 2 && !strncmp(key_start, "on", 2));
+        if (key_match && !http_audio_parse_bool_token(value_start, enabled_out)) {
+            return 0;
+        }
+        if (*cursor == '&') {
+            cursor++;
+        }
+    }
+    return -1;
+}
+
+static int
+http_audio_parse_from_payload_key(const char *payload, const char *key, bool *enabled_out) {
+    if (!payload || !key || !enabled_out) {
+        return -1;
+    }
+    size_t key_len = strlen(key);
+    const char *cursor = payload;
+    while ((cursor = strstr(cursor, key)) != NULL) {
+        char prev = (cursor == payload) ? '\0' : *(cursor - 1);
+        if (isalnum((unsigned char) prev) || prev == '_') {
+            cursor += key_len;
+            continue;
+        }
+        const char *value_start = cursor + key_len;
+        while (*value_start == ' ' || *value_start == '\t' || *value_start == '\n' ||
+               *value_start == '\r' || *value_start == ':' || *value_start == '=' ||
+               *value_start == '"' || *value_start == '\'') {
+            value_start++;
+        }
+        if (!http_audio_parse_bool_token(value_start, enabled_out)) {
+            return 0;
+        }
+        cursor += key_len;
+    }
+    return -1;
+}
+
+static int
+http_audio_parse_from_payload(const char *payload, bool *enabled_out) {
+    if (!payload || !enabled_out) {
+        return -1;
+    }
+    const char *keys[] = {"enabled", "audio", "state", "value", "on"};
+    int key_count = (int) (sizeof(keys) / sizeof(keys[0]));
+    for (int i = 0; i < key_count; i++) {
+        if (!http_audio_parse_from_payload_key(payload, keys[i], enabled_out)) {
+            return 0;
+        }
+    }
+    const char *cursor = payload;
+    while (*cursor) {
+        unsigned char ch = (unsigned char) *cursor;
+        char prev = (cursor == payload) ? '\0' : *(cursor - 1);
+        bool token_start = (cursor == payload) || !(isalnum((unsigned char) prev) || prev == '_');
+        if (token_start && (isalpha(ch) || ch == '0' || ch == '1')) {
+            if (!http_audio_parse_bool_token(cursor, enabled_out)) {
+                return 0;
+            }
+        }
+        cursor++;
+    }
+    return -1;
+}
+
+static bool
+http_mirror_audio_get_enabled(raop_conn_t *conn) {
+    bool enabled = conn->raop->mirror_audio_enabled;
+    if (conn->raop->callbacks.mirror_audio_get_enabled) {
+        enabled = conn->raop->callbacks.mirror_audio_get_enabled(conn->raop->callbacks.cls);
+    }
+    return enabled;
+}
+
+static void
+http_audio_send_error(const char *protocol, http_response_t *response, int code, const char *reason,
+                      const char *message, char **response_data, int *response_datalen) {
+    const char *proto = (protocol ? protocol : "HTTP/1.1");
+    http_response_init(response, proto, code, reason);
+    char body[180];
+    int len = snprintf(body, sizeof(body),
+                       "{\"status\":\"error\",\"message\":\"%s\"}",
+                       (message ? message : "unknown error"));
+    char *payload = malloc(len + 1);
+    if (!payload) {
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+    memcpy(payload, body, len + 1);
+    *response_data = payload;
+    *response_datalen = len;
+    http_response_add_header(response, "Content-Type", "application/json");
+    http_response_add_header(response, "Cache-Control", "no-store");
+    http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+}
+
+static void
+http_audio_send_status(raop_conn_t *conn, const char *status, const char *message,
+                       http_response_t *response, char **response_data, int *response_datalen) {
+    bool enabled = http_mirror_audio_get_enabled(conn);
+    char body[220];
+    int len = snprintf(body, sizeof(body),
+                       "{\"status\":\"%s\",\"message\":\"%s\",\"mirrorAudio\":%s}",
+                       (status ? status : "ok"),
+                       (message ? message : ""),
+                       (enabled ? "true" : "false"));
+    char *payload = malloc(len + 1);
+    if (!payload) {
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+    memcpy(payload, body, len + 1);
+    *response_data = payload;
+    *response_datalen = len;
+    http_response_add_header(response, "Content-Type", "application/json");
+    http_response_add_header(response, "Cache-Control", "no-store");
+    http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+}
+
+static void
+http_handler_mirror_audio_control(raop_conn_t *conn, http_request_t *request, http_response_t *response,
+                                  char **response_data, int *response_datalen) {
+    const char *method = http_request_get_method(request);
+    const char *protocol = http_request_get_protocol(request);
+    if (!method) {
+        http_audio_send_error(protocol, response, 400, "Bad Request", "missing HTTP method",
+                              response_data, response_datalen);
+        return;
+    }
+
+    if (!strcmp(method, "OPTIONS")) {
+        http_response_init(response, protocol ? protocol : "HTTP/1.1", 204, "No Content");
+        http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+        http_response_add_header(response, "Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+        http_response_add_header(response, "Access-Control-Allow-Headers", "Content-Type");
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+
+    if (!strcmp(method, "GET")) {
+        http_audio_send_status(conn, "ok", "mirror audio status", response, response_data,
+                               response_datalen);
+        return;
+    }
+
+    bool is_update = (!strcmp(method, "POST") || !strcmp(method, "PUT"));
+    if (!is_update) {
+        http_audio_send_error(protocol, response, 405, "Method Not Allowed",
+                              "method not allowed", response_data, response_datalen);
+        http_response_add_header(response, "Allow", "GET, POST, PUT, OPTIONS");
+        return;
+    }
+
+    bool enabled = false;
+    int parse_result = http_audio_parse_from_query(http_request_get_url(request), &enabled);
+    int datalen = 0;
+    const char *request_data = http_request_get_data(request, &datalen);
+    char *payload = NULL;
+    if (parse_result != 0 && request_data && datalen > 0) {
+        payload = calloc(1, datalen + 1);
+        if (payload) {
+            memcpy(payload, request_data, datalen);
+            parse_result = http_audio_parse_from_payload(payload, &enabled);
+        }
+    }
+    if (payload) {
+        free(payload);
+    }
+    if (parse_result != 0) {
+        http_audio_send_error(protocol, response, 400, "Bad Request",
+                              "mirror audio parameter missing or invalid", response_data, response_datalen);
+        return;
+    }
+
+    conn->raop->mirror_audio_enabled = enabled;
+    if (conn->raop->callbacks.mirror_audio_set_enabled) {
+        conn->raop->callbacks.mirror_audio_set_enabled(conn->raop->callbacks.cls, enabled);
+    }
+    bool applied = http_mirror_audio_get_enabled(conn);
+    logger_log(conn->raop->logger, LOGGER_INFO, "HTTP control mirror audio set to %s",
+               (applied ? "on" : "off"));
+    http_audio_send_status(conn, "ok",
+                           (applied ? "mirror audio enabled" : "mirror audio disabled"),
+                           response, response_data, response_datalen);
 }
 
 /* handles PUT /setProperty http requests from Client to Server */

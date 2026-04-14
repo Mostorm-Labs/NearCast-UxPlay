@@ -64,6 +64,7 @@ struct raop_s {
     uint8_t clientFPSdata;
 
     int audio_delay_micros;
+    bool mirror_audio_enabled;
 
      /* for temporary storage of pin during pair-pin start */
     unsigned short pin;
@@ -184,6 +185,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     bool hls_request = false;
     bool http_ctrl_request = false;
     bool is_pin_endpoint = false;
+    bool is_audio_endpoint = false;
     logger_log(conn->raop->logger, LOGGER_DEBUG, "conn_request");
     bool logger_debug = (logger_get_level(conn->raop->logger) >= LOGGER_DEBUG);
 
@@ -214,11 +216,18 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                (!url[8] || url[8] == '/' || url[8] == '?')) {
         is_pin_endpoint = true;
     }
+    if (!strncmp(url, "/audio", 6) &&
+        (!url[6] || url[6] == '/' || url[6] == '?')) {
+        is_audio_endpoint = true;
+    } else if (!strncmp(url, "/api/audio", 10) &&
+               (!url[10] || url[10] == '/' || url[10] == '?')) {
+        is_audio_endpoint = true;
+    }
 
 /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/
     const char *cseq = http_request_get_header(request, "CSeq");
     const char *protocol = http_request_get_protocol(request);
-    if (!cseq && !conn->raop->hls_support && !is_pin_endpoint) {
+    if (!cseq && !conn->raop->hls_support && !is_pin_endpoint && !is_audio_endpoint) {
         logger_log(conn->raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
         return;
     }
@@ -226,7 +235,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
     const char *host = http_request_get_header(request, "Host");
     if (host && !cseq && !client_session_id) {
-        if (is_pin_endpoint) {
+        if (is_pin_endpoint || is_audio_endpoint) {
             http_ctrl_request = true;
         } else {
             hls_request = true;
@@ -427,6 +436,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         if (!strcmp(method, "POST")) {
             if (is_pin_endpoint) {
                 handler = &http_handler_pin_control;
+            } else if (is_audio_endpoint) {
+                handler = &http_handler_mirror_audio_control;
             } else if (!strcmp(url, "/reverse")) {
                 handler = &http_handler_reverse;
             } else if (!strcmp(url, "/play")) {
@@ -447,6 +458,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         } else if (!strcmp(method, "GET")) {
             if (is_pin_endpoint) {
                 handler = &http_handler_pin_control;
+            } else if (is_audio_endpoint) {
+                handler = &http_handler_mirror_audio_control;
             } else if (!strcmp(url, "/server-info")) {
                 handler = &http_handler_server_info;
             } else if (!strcmp(url, "/playback-info")) {
@@ -455,9 +468,17 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         } else if (!strcmp(method, "PUT")) {
             if (is_pin_endpoint) {
                 handler = &http_handler_pin_control;
+            } else if (is_audio_endpoint) {
+                handler = &http_handler_mirror_audio_control;
             } else if (!strncmp (url, "/setProperty?", strlen("/setProperty?"))) {
                 handler = &http_handler_set_property;
 	    }
+        } else if (!strcmp(method, "OPTIONS")) {
+            if (is_pin_endpoint) {
+                handler = &http_handler_pin_control;
+            } else if (is_audio_endpoint) {
+                handler = &http_handler_mirror_audio_control;
+            }
         }
     } else if (hls_request) {
         handler = &http_handler_hls;
@@ -623,6 +644,7 @@ raop_init(raop_callbacks_t *callbacks) {
     /* initialise stored pin */
     raop->pin = 0;
     raop->use_pin = false;
+    raop->mirror_audio_enabled = true;
 
     /* initialize switch for display of client's streaming data records */    
     raop->clientFPSdata = 0;

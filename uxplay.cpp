@@ -103,6 +103,7 @@ static unsigned char compression_type = 0;
 static std::string audiosink = "autoaudiosink";
 static int  audiodelay = -1;
 static bool use_audio = true;
+static bool audio_renderer_initialized = false;
 #if __APPLE__
 static bool new_window_closing_behavior = false;
 #else
@@ -1819,7 +1820,8 @@ extern "C" void conn_destroy (void *cls) {
     LOGD("Open connections: %i", open_connections);
     if (open_connections == 0) {
         remote_clock_offset = 0;
-        if (use_audio) {
+        compression_type = 0;
+        if (audio_renderer_initialized) {
             audio_renderer_stop();
         }
         if (dacpfile.length()) {
@@ -1958,6 +1960,29 @@ extern "C" double audio_set_client_volume(void *cls) {
     return initial_volume;
 }
 
+extern "C" bool mirror_audio_get_enabled(void *cls) {
+    return use_audio;
+}
+
+extern "C" void mirror_audio_set_enabled(void *cls, bool enabled) {
+    if (enabled == use_audio) {
+        return;
+    }
+    if (enabled && !audio_renderer_initialized) {
+        LOGW("HTTP control requested mirror-audio enable, but audio renderer is unavailable");
+        return;
+    }
+    if (!enabled && audio_renderer_initialized) {
+        audio_renderer_flush();
+    }
+    use_audio = enabled;
+    if (enabled && audio_renderer_initialized && compression_type && open_connections > 0) {
+        unsigned char ct = compression_type;
+        audio_renderer_start(&ct);
+    }
+    LOGI("HTTP control mirror audio %s", (use_audio ? "enabled" : "disabled"));
+}
+
 extern "C" void audio_set_volume (void *cls, float volume) {
     double db, db_flat, frac, gst_volume;
     if (!use_audio) {
@@ -2005,6 +2030,7 @@ extern "C" void audio_set_volume (void *cls, float volume) {
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
     unsigned char type;
+    compression_type = *ct;
     LOGI("ct=%d spf=%d usingScreen=%d isMedia=%d  audioFormat=0x%lx",*ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
     switch (*ct) {
     case 2:
@@ -2206,6 +2232,8 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.audio_set_client_volume = audio_set_client_volume;
     raop_cbs.audio_set_volume = audio_set_volume;
     raop_cbs.audio_get_format = audio_get_format;
+    raop_cbs.mirror_audio_get_enabled = mirror_audio_get_enabled;
+    raop_cbs.mirror_audio_set_enabled = mirror_audio_set_enabled;
     raop_cbs.video_report_size = video_report_size;
     raop_cbs.audio_set_metadata = audio_set_metadata;
     raop_cbs.audio_set_coverart = audio_set_coverart;
@@ -2602,7 +2630,9 @@ int main (int argc, char *argv[]) {
 
     if (use_audio) {
       audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);
+      audio_renderer_initialized = true;
     } else {
+        audio_renderer_initialized = false;
         LOGI("audio_disabled");
     }
     if (use_video) {
@@ -2680,7 +2710,7 @@ int main (int argc, char *argv[]) {
         if (reset_httpd) {
             raop_stop_httpd(raop);
         }
-        if (use_audio) {
+        if (audio_renderer_initialized) {
             audio_renderer_stop();
         }
         if (use_video && (close_window || preserve_connections)) {
@@ -2709,7 +2739,7 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
     }
     cleanup:
-    if (use_audio) {
+    if (audio_renderer_initialized) {
         audio_renderer_destroy();
     }
     if (use_video)  {

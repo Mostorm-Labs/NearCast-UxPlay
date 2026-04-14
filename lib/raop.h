@@ -85,6 +85,8 @@ struct raop_callbacks_s {
     void  (*audio_remote_control_id)(void *cls, const char *dacp_id, const char *active_remote_header);
     void  (*audio_set_progress)(void *cls, unsigned int start, unsigned int curr, unsigned int end);
     void  (*audio_get_format)(void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat);
+    bool  (*mirror_audio_get_enabled)(void *cls);
+    void  (*mirror_audio_set_enabled)(void *cls, bool enabled);
     void  (*video_report_size)(void *cls, float *width_source, float *height_source, float *width, float *height);
     void  (*report_client_request) (void *cls, char *deviceid, char *model, char *name, bool *admit);
     void  (*display_pin) (void *cls, char * pin);
