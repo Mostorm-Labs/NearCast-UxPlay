@@ -42,6 +42,7 @@ let currentPin = null;
 let pinUpdateInFlight = false;
 let mirrorAudioEnabled = null;
 let mirrorAudioUpdateInFlight = false;
+let stopUpdateInFlight = false;
 let mirrorSessionActive = false;
 let mirrorSessionIdleTimer = null;
 let frameSending = false;
@@ -88,6 +89,7 @@ function broadcastControlStatus() {
     mirrorAudioEnabled,
     muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
     audioUpdating: mirrorAudioUpdateInFlight,
+    stopUpdating: stopUpdateInFlight,
   });
 }
 
@@ -507,6 +509,94 @@ function requestUxplayAudioStatus(port) {
   });
 }
 
+function requestUxplayStop(port) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/api/stop',
+        method: 'POST',
+        timeout: uxplayControlTimeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        let totalLength = 0;
+        res.on('data', (chunk) => {
+          totalLength += chunk.length;
+          if (totalLength > 16384) {
+            req.destroy(
+              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
+                httpStatus: 502,
+              }),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8').trim();
+          let json = null;
+          if (text) {
+            try {
+              json = JSON.parse(text);
+            } catch {
+              json = null;
+            }
+          }
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({
+              statusCode: res.statusCode,
+              body: json || { message: text || 'casting stopped' },
+            });
+            return;
+          }
+
+          const errorMessage =
+            json?.message ||
+            text ||
+            `UxPlay stop request failed with HTTP ${res.statusCode || 'unknown'}.`;
+          reject(
+            createControlError('UPSTREAM_REJECTED', errorMessage, {
+              httpStatus: 502,
+              details: {
+                upstreamStatusCode: res.statusCode || 0,
+              },
+            }),
+          );
+        });
+      },
+    );
+
+    req.on('timeout', () => {
+      req.destroy(
+        createControlError('UPSTREAM_TIMEOUT', 'UxPlay stop request timed out.', {
+          httpStatus: 504,
+        }),
+      );
+    });
+    req.on('error', (error) => {
+      if (
+        error?.code === 'UPSTREAM_TIMEOUT' ||
+        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
+        error?.code === 'UPSTREAM_REJECTED'
+      ) {
+        reject(error);
+        return;
+      }
+      reject(
+        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
+          httpStatus: 502,
+          details: {
+            cause: error?.message || 'connection error',
+          },
+        }),
+      );
+    });
+    req.end();
+  });
+}
+
 function persistEncryptedPin(pin, port) {
   if (!safeStorage.isEncryptionAvailable()) {
     throw createControlError(
@@ -692,6 +782,31 @@ async function handleSetMutedRequest(event, payload) {
   };
 }
 
+async function handleStopCastingRequest(event, payload) {
+  ensureTrustedSender(event);
+  ensureControlToken(payload?.token);
+  if (stopUpdateInFlight) {
+    throw createControlError('STOP_UPDATE_BUSY', 'Stop casting request already in progress.', {
+      httpStatus: 409,
+    });
+  }
+
+  stopUpdateInFlight = true;
+  broadcastControlStatus();
+  try {
+    ensureControlPortReady();
+    const upstream = await requestUxplayStop(uxplayHttpPort);
+    return {
+      ok: true,
+      port: uxplayHttpPort,
+      result: upstream.body,
+    };
+  } finally {
+    stopUpdateInFlight = false;
+    broadcastControlStatus();
+  }
+}
+
 function setupIpcHandlers() {
   ipcMain.handle('uxplay-control:get-session', (event) => {
     try {
@@ -706,6 +821,7 @@ function setupIpcHandlers() {
         mirrorAudioEnabled,
         muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
         audioUpdating: mirrorAudioUpdateInFlight,
+        stopUpdating: stopUpdateInFlight,
       };
     } catch (error) {
       return {
@@ -740,6 +856,17 @@ function setupIpcHandlers() {
   ipcMain.handle('uxplay-control:set-muted', async (event, payload) => {
     try {
       return await handleSetMutedRequest(event, payload);
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
+
+  ipcMain.handle('uxplay-control:stop-casting', async (event, payload) => {
+    try {
+      return await handleStopCastingRequest(event, payload);
     } catch (error) {
       return {
         ok: false,
@@ -966,6 +1093,7 @@ function startBridge() {
     pinUpdateInFlight = false;
     mirrorAudioEnabled = null;
     mirrorAudioUpdateInFlight = false;
+    stopUpdateInFlight = false;
     mirrorSessionActive = false;
     if (mirrorSessionIdleTimer) {
       clearTimeout(mirrorSessionIdleTimer);

@@ -107,20 +107,23 @@
       }
 
       .pin-panel,
-      .audio-panel {
+      .audio-panel,
+      .stop-panel {
         margin-top: 24px;
         padding-top: 18px;
         border-top: 1px solid var(--border);
       }
 
       .pin-panel h2,
-      .audio-panel h2 {
+      .audio-panel h2,
+      .stop-panel h2 {
         margin: 0 0 8px;
         font-size: 18px;
       }
 
       .pin-panel p,
-      .audio-panel p {
+      .audio-panel p,
+      .stop-panel p {
         margin: 0 0 10px;
       }
 
@@ -168,7 +171,8 @@
       }
 
       .pin-feedback,
-      .audio-feedback {
+      .audio-feedback,
+      .stop-feedback {
         margin-top: 10px;
         min-height: 20px;
         font-size: 13px;
@@ -176,12 +180,14 @@
       }
 
       .pin-feedback[data-tone="error"],
-      .audio-feedback[data-tone="error"] {
+      .audio-feedback[data-tone="error"],
+      .stop-feedback[data-tone="error"] {
         color: #f87171;
       }
 
       .pin-feedback[data-tone="success"],
-      .audio-feedback[data-tone="success"] {
+      .audio-feedback[data-tone="success"],
+      .stop-feedback[data-tone="success"] {
         color: #34d399;
       }
 
@@ -253,6 +259,12 @@
           </div>
           <button id="muteToggleButton" class="pin-button" type="button">Mute</button>
           <div id="muteFeedback" class="audio-feedback" data-tone="muted">Waiting for control session...</div>
+        </section>
+        <section class="stop-panel">
+          <h2>Stop Casting</h2>
+          <p>Stop current mirroring session through the UxPlay HTTP control endpoint <code>POST /api/stop</code>.</p>
+          <button id="stopCastButton" class="pin-button" type="button">Stop Casting</button>
+          <div id="stopFeedback" class="stop-feedback" data-tone="muted">Waiting for control session...</div>
         </section>
       </aside>
     </div>

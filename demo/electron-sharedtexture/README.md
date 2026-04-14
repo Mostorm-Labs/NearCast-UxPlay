@@ -64,3 +64,9 @@ npm start
 - At startup, when UxPlay control port is discovered, the demo requests `GET /api/audio` to sync the current mirror-audio state.
 - The main process returns `mirrorAudioEnabled`, `muted`, and `audioUpdating` in `uxplay-control:get-session` / status push so renderer state stays authoritative.
 - `uxplay-control:set-muted` uses the same trusted-renderer + control-token gate as PIN APIs.
+
+## Stop Casting API Integration
+
+- The sidebar provides a `Stop Casting` button that calls `POST /api/stop`.
+- The main process exposes `uxplay-control:stop-casting` and reuses the trusted-renderer + per-session control token checks used by PIN/audio controls.
+- `uxplay-control:get-session` / status push now include `stopUpdating` so renderer button state and feedback remain authoritative.
