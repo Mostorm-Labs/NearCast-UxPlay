@@ -106,22 +106,26 @@
         word-break: break-word;
       }
 
-      .pin-panel {
+      .pin-panel,
+      .audio-panel {
         margin-top: 24px;
         padding-top: 18px;
         border-top: 1px solid var(--border);
       }
 
-      .pin-panel h2 {
+      .pin-panel h2,
+      .audio-panel h2 {
         margin: 0 0 8px;
         font-size: 18px;
       }
 
-      .pin-panel p {
+      .pin-panel p,
+      .audio-panel p {
         margin: 0 0 10px;
       }
 
-      .pin-meta {
+      .pin-meta,
+      .audio-meta {
         display: flex;
         justify-content: space-between;
         align-items: center;
@@ -163,18 +167,21 @@
         cursor: not-allowed;
       }
 
-      .pin-feedback {
+      .pin-feedback,
+      .audio-feedback {
         margin-top: 10px;
         min-height: 20px;
         font-size: 13px;
         color: var(--muted);
       }
 
-      .pin-feedback[data-tone="error"] {
+      .pin-feedback[data-tone="error"],
+      .audio-feedback[data-tone="error"] {
         color: #f87171;
       }
 
-      .pin-feedback[data-tone="success"] {
+      .pin-feedback[data-tone="success"],
+      .audio-feedback[data-tone="success"] {
         color: #34d399;
       }
 
@@ -236,6 +243,16 @@
             <button id="pinSubmitButton" class="pin-button" type="submit">Randomize PIN</button>
           </form>
           <div id="pinFeedback" class="pin-feedback" data-tone="muted">Waiting for control session...</div>
+        </section>
+        <section class="audio-panel">
+          <h2>Audio Mute Control</h2>
+          <p>Toggle mirror audio mute state through <code>/api/audio</code> exposed by UxPlay HTTP control.</p>
+          <div class="audio-meta">
+            <span>Current State</span>
+            <strong id="muteStateValue">Unknown</strong>
+          </div>
+          <button id="muteToggleButton" class="pin-button" type="button">Mute</button>
+          <div id="muteFeedback" class="audio-feedback" data-tone="muted">Waiting for control session...</div>
         </section>
       </aside>
     </div>

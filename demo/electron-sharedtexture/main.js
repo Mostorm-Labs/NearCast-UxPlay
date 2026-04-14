@@ -40,6 +40,8 @@ let uxplayHttpPort = null;
 let uxplayStderrBuffer = '';
 let currentPin = null;
 let pinUpdateInFlight = false;
+let mirrorAudioEnabled = null;
+let mirrorAudioUpdateInFlight = false;
 let mirrorSessionActive = false;
 let mirrorSessionIdleTimer = null;
 let frameSending = false;
@@ -83,6 +85,9 @@ function broadcastControlStatus() {
     port: uxplayHttpPort,
     pin: currentPin,
     rotating: pinUpdateInFlight,
+    mirrorAudioEnabled,
+    muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
+    audioUpdating: mirrorAudioUpdateInFlight,
   });
 }
 
@@ -121,6 +126,7 @@ function updateHttpPortFromLogLine(line) {
     if (changed) {
       broadcastControlStatus();
       void triggerAutoPinRotationOnPortReady();
+      void refreshMirrorAudioStateFromUxPlay('port-ready');
     }
   }
 }
@@ -145,6 +151,31 @@ function normalizePinInput(rawPin) {
     );
   }
   return pin;
+}
+
+function extractMirrorAudioEnabled(responseBody) {
+  if (responseBody && typeof responseBody === 'object' && typeof responseBody.mirrorAudio === 'boolean') {
+    return responseBody.mirrorAudio;
+  }
+  return null;
+}
+
+function normalizeMutedInput(rawMuted) {
+  if (typeof rawMuted === 'boolean') {
+    return rawMuted;
+  }
+  if (typeof rawMuted === 'string') {
+    const normalized = rawMuted.trim().toLowerCase();
+    if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') {
+      return true;
+    }
+    if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') {
+      return false;
+    }
+  }
+  throw createControlError('INVALID_MUTED_VALUE', 'Muted must be a boolean value.', {
+    httpStatus: 400,
+  });
 }
 
 function generateRandomPin(excludePin = null) {
@@ -294,6 +325,188 @@ function requestUxplayPinUpdate(port, pin) {
   });
 }
 
+function requestUxplayAudioUpdate(port, enabled) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ enabled });
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/api/audio',
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: uxplayControlTimeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        let totalLength = 0;
+        res.on('data', (chunk) => {
+          totalLength += chunk.length;
+          if (totalLength > 16384) {
+            req.destroy(
+              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
+                httpStatus: 502,
+              }),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8').trim();
+          let json = null;
+          if (text) {
+            try {
+              json = JSON.parse(text);
+            } catch {
+              json = null;
+            }
+          }
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({
+              statusCode: res.statusCode,
+              body: json || { message: text || 'mirror audio updated' },
+            });
+            return;
+          }
+
+          const errorMessage =
+            json?.message ||
+            text ||
+            `UxPlay mirror audio update failed with HTTP ${res.statusCode || 'unknown'}.`;
+          reject(
+            createControlError('UPSTREAM_REJECTED', errorMessage, {
+              httpStatus: 502,
+              details: {
+                upstreamStatusCode: res.statusCode || 0,
+              },
+            }),
+          );
+        });
+      },
+    );
+
+    req.on('timeout', () => {
+      req.destroy(
+        createControlError('UPSTREAM_TIMEOUT', 'UxPlay mirror audio update request timed out.', {
+          httpStatus: 504,
+        }),
+      );
+    });
+    req.on('error', (error) => {
+      if (
+        error?.code === 'UPSTREAM_TIMEOUT' ||
+        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
+        error?.code === 'UPSTREAM_REJECTED'
+      ) {
+        reject(error);
+        return;
+      }
+      reject(
+        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
+          httpStatus: 502,
+          details: {
+            cause: error?.message || 'connection error',
+          },
+        }),
+      );
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+function requestUxplayAudioStatus(port) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/api/audio',
+        method: 'GET',
+        timeout: uxplayControlTimeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        let totalLength = 0;
+        res.on('data', (chunk) => {
+          totalLength += chunk.length;
+          if (totalLength > 16384) {
+            req.destroy(
+              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
+                httpStatus: 502,
+              }),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8').trim();
+          let json = null;
+          if (text) {
+            try {
+              json = JSON.parse(text);
+            } catch {
+              json = null;
+            }
+          }
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({
+              statusCode: res.statusCode,
+              body: json || { message: text || 'mirror audio status' },
+            });
+            return;
+          }
+
+          const errorMessage =
+            json?.message ||
+            text ||
+            `UxPlay mirror audio status failed with HTTP ${res.statusCode || 'unknown'}.`;
+          reject(
+            createControlError('UPSTREAM_REJECTED', errorMessage, {
+              httpStatus: 502,
+              details: {
+                upstreamStatusCode: res.statusCode || 0,
+              },
+            }),
+          );
+        });
+      },
+    );
+
+    req.on('timeout', () => {
+      req.destroy(
+        createControlError('UPSTREAM_TIMEOUT', 'UxPlay mirror audio status request timed out.', {
+          httpStatus: 504,
+        }),
+      );
+    });
+    req.on('error', (error) => {
+      if (
+        error?.code === 'UPSTREAM_TIMEOUT' ||
+        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
+        error?.code === 'UPSTREAM_REJECTED'
+      ) {
+        reject(error);
+        return;
+      }
+      reject(
+        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
+          httpStatus: 502,
+          details: {
+            cause: error?.message || 'connection error',
+          },
+        }),
+      );
+    });
+    req.end();
+  });
+}
+
 function persistEncryptedPin(pin, port) {
   if (!safeStorage.isEncryptionAvailable()) {
     throw createControlError(
@@ -347,6 +560,46 @@ async function applyPinUpdate(pin) {
     pin,
     result: upstream.body,
   };
+}
+
+async function refreshMirrorAudioStateFromUxPlay(trigger = 'manual') {
+  try {
+    ensureControlPortReady();
+    const upstream = await requestUxplayAudioStatus(uxplayHttpPort);
+    const enabled = extractMirrorAudioEnabled(upstream.body);
+    if (typeof enabled === 'boolean') {
+      mirrorAudioEnabled = enabled;
+      broadcastControlStatus();
+    }
+  } catch (error) {
+    console.error(`[audio-control] failed to refresh mirror audio state (${trigger}): ${error?.message || 'unknown error'}`);
+  }
+}
+
+async function applyMirrorAudioEnabled(enabled) {
+  if (mirrorAudioUpdateInFlight) {
+    throw createControlError('AUDIO_UPDATE_BUSY', 'Mirror audio update already in progress.', {
+      httpStatus: 409,
+    });
+  }
+  mirrorAudioUpdateInFlight = true;
+  broadcastControlStatus();
+  try {
+    ensureControlPortReady();
+    const upstream = await requestUxplayAudioUpdate(uxplayHttpPort, enabled);
+    const applied = extractMirrorAudioEnabled(upstream.body);
+    mirrorAudioEnabled = typeof applied === 'boolean' ? applied : enabled;
+    broadcastControlStatus();
+    return {
+      port: uxplayHttpPort,
+      mirrorAudioEnabled,
+      muted: !mirrorAudioEnabled,
+      result: upstream.body,
+    };
+  } finally {
+    mirrorAudioUpdateInFlight = false;
+    broadcastControlStatus();
+  }
 }
 
 async function rotatePinRandom(trigger = 'manual') {
@@ -428,6 +681,17 @@ async function handleRotatePinRequest(event, payload) {
   };
 }
 
+async function handleSetMutedRequest(event, payload) {
+  ensureTrustedSender(event);
+  ensureControlToken(payload?.token);
+  const muted = normalizeMutedInput(payload?.muted);
+  const updated = await applyMirrorAudioEnabled(!muted);
+  return {
+    ok: true,
+    ...updated,
+  };
+}
+
 function setupIpcHandlers() {
   ipcMain.handle('uxplay-control:get-session', (event) => {
     try {
@@ -439,6 +703,9 @@ function setupIpcHandlers() {
         ready: bridgeReady,
         pin: currentPin,
         rotating: pinUpdateInFlight,
+        mirrorAudioEnabled,
+        muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
+        audioUpdating: mirrorAudioUpdateInFlight,
       };
     } catch (error) {
       return {
@@ -462,6 +729,17 @@ function setupIpcHandlers() {
   ipcMain.handle('uxplay-control:rotate-pin', async (event, payload) => {
     try {
       return await handleRotatePinRequest(event, payload);
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
+
+  ipcMain.handle('uxplay-control:set-muted', async (event, payload) => {
+    try {
+      return await handleSetMutedRequest(event, payload);
     } catch (error) {
       return {
         ok: false,
@@ -686,6 +964,8 @@ function startBridge() {
     uxplayHttpPort = null;
     uxplayStderrBuffer = '';
     pinUpdateInFlight = false;
+    mirrorAudioEnabled = null;
+    mirrorAudioUpdateInFlight = false;
     mirrorSessionActive = false;
     if (mirrorSessionIdleTimer) {
       clearTimeout(mirrorSessionIdleTimer);

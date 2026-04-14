@@ -20,9 +20,21 @@ const pinForm = document.getElementById('pinForm');
 const pinInput = document.getElementById('pinInput');
 const pinSubmitButton = document.getElementById('pinSubmitButton');
 const pinFeedback = document.getElementById('pinFeedback');
+const muteStateValue = document.getElementById('muteStateValue');
+const muteToggleButton = document.getElementById('muteToggleButton');
+const muteFeedback = document.getElementById('muteFeedback');
 const context = canvas.getContext('2d', { alpha: false });
-if (!pinPortValue || !pinForm || !pinInput || !pinSubmitButton || !pinFeedback) {
-  throw new Error('PIN control UI elements are missing.');
+if (
+  !pinPortValue ||
+  !pinForm ||
+  !pinInput ||
+  !pinSubmitButton ||
+  !pinFeedback ||
+  !muteStateValue ||
+  !muteToggleButton ||
+  !muteFeedback
+) {
+  throw new Error('Control UI elements are missing.');
 }
 const query =
   typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
@@ -32,6 +44,7 @@ let probeFramesRemaining = enableProbe ? 5 : 0;
 let drawInFlight = false;
 let pendingPacket = null;
 let controlSessionToken = null;
+let currentMuted = null;
 
 function setPinFeedback(message, tone = 'muted') {
   pinFeedback.textContent = message;
@@ -42,6 +55,15 @@ function setPinControlEnabled(enabled) {
   pinSubmitButton.disabled = !enabled;
 }
 
+function setMuteFeedback(message, tone = 'muted') {
+  muteFeedback.textContent = message;
+  muteFeedback.dataset.tone = tone;
+}
+
+function setMuteControlEnabled(enabled) {
+  muteToggleButton.disabled = !enabled;
+}
+
 function updatePortDisplay(port) {
   pinPortValue.textContent = Number.isInteger(port) && port > 0 ? String(port) : '-';
 }
@@ -50,45 +72,76 @@ function updatePinDisplay(pin) {
   pinInput.value = typeof pin === 'string' && /^\d{4}$/.test(pin) ? pin : '----';
 }
 
+function updateMuteDisplay(muted) {
+  currentMuted = typeof muted === 'boolean' ? muted : null;
+  if (currentMuted === true) {
+    muteStateValue.textContent = 'Muted';
+    muteToggleButton.textContent = 'Unmute';
+    return;
+  }
+  if (currentMuted === false) {
+    muteStateValue.textContent = 'Unmuted';
+    muteToggleButton.textContent = 'Mute';
+    return;
+  }
+  muteStateValue.textContent = 'Unknown';
+  muteToggleButton.textContent = 'Mute';
+}
+
 function applyControlStatus(status) {
   const port = Number.isInteger(status?.port) ? status.port : null;
   const pin = typeof status?.pin === 'string' ? status.pin : null;
   const rotating = status?.rotating === true;
+  const audioUpdating = status?.audioUpdating === true;
+  const muted = typeof status?.muted === 'boolean'
+    ? status.muted
+    : (typeof status?.mirrorAudioEnabled === 'boolean' ? !status.mirrorAudioEnabled : null);
   const hasPort = Boolean(port && port > 0);
 
   updatePortDisplay(port);
   updatePinDisplay(pin);
+  updateMuteDisplay(muted);
   setPinControlEnabled(hasPort && !rotating);
+  setMuteControlEnabled(hasPort && !audioUpdating);
 
   if (!hasPort) {
     setPinFeedback('UxPlay started, waiting for control port...', 'muted');
-    return;
-  }
-  if (rotating) {
+  } else if (rotating) {
     setPinFeedback('Updating random PIN...', 'muted');
-    return;
-  }
-  if (pin) {
+  } else if (pin) {
     setPinFeedback(`Current PIN: ${pin}`, 'muted');
-    return;
+  } else {
+    setPinFeedback('Waiting for first mirroring session to generate PIN...', 'muted');
   }
-  setPinFeedback('Waiting for first mirroring session to generate PIN...', 'muted');
+
+  if (!hasPort) {
+    setMuteFeedback('UxPlay started, waiting for control port...', 'muted');
+  } else if (audioUpdating) {
+    setMuteFeedback('Applying audio mute setting...', 'muted');
+  } else if (typeof muted === 'boolean') {
+    setMuteFeedback(`Audio is currently ${muted ? 'muted' : 'unmuted'}.`, 'muted');
+  } else {
+    setMuteFeedback('Waiting for audio status from /api/audio...', 'muted');
+  }
 }
 
 async function initializePinControl() {
   setPinControlEnabled(false);
+  setMuteControlEnabled(false);
   updatePinDisplay(null);
+  updateMuteDisplay(null);
   try {
     const session = await ipcRenderer.invoke('uxplay-control:get-session');
     if (!session?.ok) {
       setPinFeedback(`PIN control unavailable: ${session?.error?.message || 'unknown error'}`, 'error');
+      setMuteFeedback(`Audio control unavailable: ${session?.error?.message || 'unknown error'}`, 'error');
       return;
     }
     controlSessionToken = session.token;
     applyControlStatus(session);
-    setPinControlEnabled(true);
   } catch (error) {
     setPinFeedback(`PIN control init failed: ${error.message}`, 'error');
+    setMuteFeedback(`Audio control init failed: ${error.message}`, 'error');
   }
 }
 
@@ -145,6 +198,64 @@ async function submitPinUpdate(event) {
       }
     } catch {
       setPinControlEnabled(true);
+    }
+  }
+}
+
+async function submitMuteToggle() {
+  try {
+    const latestSession = await ipcRenderer.invoke('uxplay-control:get-session');
+    if (latestSession?.ok) {
+      controlSessionToken = latestSession.token;
+      applyControlStatus(latestSession);
+    }
+  } catch {
+    // Keep last known session token and status.
+  }
+
+  if (!controlSessionToken) {
+    setMuteFeedback('Control session is not initialized.', 'error');
+    return;
+  }
+  if (pinPortValue.textContent === '-') {
+    setMuteFeedback('Control port is unavailable.', 'error');
+    return;
+  }
+
+  const targetMuted = currentMuted === null ? true : !currentMuted;
+  setMuteControlEnabled(false);
+  setMuteFeedback(`${targetMuted ? 'Muting' : 'Unmuting'} mirror audio...`, 'muted');
+  try {
+    const response = await ipcRenderer.invoke('uxplay-control:set-muted', {
+      token: controlSessionToken,
+      muted: targetMuted,
+    });
+
+    if (!response?.ok) {
+      setMuteFeedback(
+        `Audio update failed [${response?.error?.code || 'UNKNOWN'}]: ${response?.error?.message || 'unknown error'}`,
+        'error',
+      );
+      return;
+    }
+
+    updateMuteDisplay(response?.muted);
+    setMuteFeedback(
+      `${response?.muted ? 'Muted' : 'Unmuted'} successfully. ${response?.result?.message || 'UxPlay accepted the change.'}`,
+      'success',
+    );
+  } catch (error) {
+    setMuteFeedback(`Audio update request failed: ${error.message}`, 'error');
+  } finally {
+    try {
+      const latestSession = await ipcRenderer.invoke('uxplay-control:get-session');
+      if (latestSession?.ok) {
+        applyControlStatus(latestSession);
+      } else {
+        setMuteControlEnabled(true);
+      }
+    } catch {
+      setMuteControlEnabled(true);
     }
   }
 }
@@ -306,6 +417,9 @@ ipcRenderer.on('uxplay-control:status', onControlStatus);
 
 pinForm.addEventListener('submit', (event) => {
   void submitPinUpdate(event);
+});
+muteToggleButton.addEventListener('click', () => {
+  void submitMuteToggle();
 });
 void initializePinControl();
 

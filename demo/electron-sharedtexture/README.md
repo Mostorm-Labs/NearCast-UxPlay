@@ -57,3 +57,10 @@ npm start
 - On successful update, the PIN is persisted in encrypted form via Electron `safeStorage` into `app.getPath('userData')/uxplay-pin-state.json`.
 - Control request timeout can be tuned with `UXPLAY_CONTROL_TIMEOUT_MS` (default `3000` ms).
 - Mirror session idle detection timeout can be tuned with `UXPLAY_MIRROR_IDLE_MS` (default `3000` ms).
+
+## Mirror Audio Mute API Integration
+
+- The sidebar provides a `Mute` / `Unmute` toggle that calls `PUT /api/audio` with `{"enabled": false|true}`.
+- At startup, when UxPlay control port is discovered, the demo requests `GET /api/audio` to sync the current mirror-audio state.
+- The main process returns `mirrorAudioEnabled`, `muted`, and `audioUpdating` in `uxplay-control:get-session` / status push so renderer state stays authoritative.
+- `uxplay-control:set-muted` uses the same trusted-renderer + control-token gate as PIN APIs.
