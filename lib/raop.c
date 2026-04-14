@@ -207,25 +207,24 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         return;
     }
 
+    if (!strncmp(url, "/pin", 4) &&
+        (!url[4] || url[4] == '/' || url[4] == '?')) {
+        is_pin_endpoint = true;
+    } else if (!strncmp(url, "/api/pin", 8) &&
+               (!url[8] || url[8] == '/' || url[8] == '?')) {
+        is_pin_endpoint = true;
+    }
+
 /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/
     const char *cseq = http_request_get_header(request, "CSeq");
     const char *protocol = http_request_get_protocol(request);
-    if (!cseq && !conn->raop->hls_support) {
+    if (!cseq && !conn->raop->hls_support && !is_pin_endpoint) {
         logger_log(conn->raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
         return;
     }
 
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
     const char *host = http_request_get_header(request, "Host");
-    if (url) {
-        if (!strncmp(url, "/pin", 4) &&
-            (!url[4] || url[4] == '/' || url[4] == '?')) {
-            is_pin_endpoint = true;
-        } else if (!strncmp(url, "/api/pin", 8) &&
-                   (!url[8] || url[8] == '/' || url[8] == '?')) {
-            is_pin_endpoint = true;
-        }
-    }
     if (host && !cseq && !client_session_id) {
         if (is_pin_endpoint) {
             http_ctrl_request = true;

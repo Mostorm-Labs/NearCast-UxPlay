@@ -47,3 +47,13 @@ npm start
 - In `-stpid` mode, UxPlay runs export-only video output for stability; the local UxPlay video window is intentionally disabled.
 - `READY` and `FRAME\t...` records are read from UxPlay stdout. `allReferencesReleased` sends `RELEASE\t<frameId>` back to UxPlay stdin.
 - If `GstD3D11Memory` cannot expose a shareable NT handle directly, UxPlay falls back to copying into a bridge-owned shareable texture before exporting it.
+
+## PIN Control API Integration
+
+- The sidebar shows the current PIN in a read-only field; clicking `Randomize PIN` generates and applies a new random 4-digit PIN.
+- On each successful mirroring session start (first received shared-texture frame), the demo automatically rotates to a new random PIN via `PUT /api/pin`.
+- The demo parses UxPlay logs for `Initialized server socket(s) on port <port>` (from `lib/httpd.c`) to discover the control port automatically.
+- Main process enforces permission checks (trusted renderer + per-session control token) and returns structured error codes for permission, network, upstream, and state failures.
+- On successful update, the PIN is persisted in encrypted form via Electron `safeStorage` into `app.getPath('userData')/uxplay-pin-state.json`.
+- Control request timeout can be tuned with `UXPLAY_CONTROL_TIMEOUT_MS` (default `3000` ms).
+- Mirror session idle detection timeout can be tuned with `UXPLAY_MIRROR_IDLE_MS` (default `3000` ms).

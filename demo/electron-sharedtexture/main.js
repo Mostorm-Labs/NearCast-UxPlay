@@ -1,6 +1,8 @@
-const { app, BrowserWindow, sharedTexture } = require('electron');
+const { app, BrowserWindow, ipcMain, safeStorage, sharedTexture } = require('electron');
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
 const readline = require('node:readline');
 
@@ -24,11 +26,22 @@ const traceSharedTexture =
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === '1' ||
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === 'true';
 const sendTimeoutMs = Number.parseInt(process.env.UXPLAY_SEND_TIMEOUT_MS || '1200', 10) || 0;
+const uxplayControlTimeoutMs = Number.parseInt(process.env.UXPLAY_CONTROL_TIMEOUT_MS || '3000', 10) || 3000;
+const mirrorSessionIdleMs = Number.parseInt(process.env.UXPLAY_MIRROR_IDLE_MS || '3000', 10) || 3000;
+const uxplayPinStoreFileName = 'uxplay-pin-state.json';
+const controlSessionToken = crypto.randomBytes(24).toString('hex');
+const serverPortLogPattern = /Initialized server socket\(s\) on port (\d{1,5})/;
 
 let win;
 let bridge;
 let bridgeReader;
 let bridgeReady = false;
+let uxplayHttpPort = null;
+let uxplayStderrBuffer = '';
+let currentPin = null;
+let pinUpdateInFlight = false;
+let mirrorSessionActive = false;
+let mirrorSessionIdleTimer = null;
 let frameSending = false;
 let pendingFrame = null;
 let framesReceived = 0;
@@ -58,6 +71,403 @@ function splitCommandLineArgs(text) {
     }
 
     return part;
+  });
+}
+
+function broadcastControlStatus() {
+  if (!win || win.isDestroyed()) {
+    return;
+  }
+  win.webContents.send('uxplay-control:status', {
+    ready: bridgeReady,
+    port: uxplayHttpPort,
+    pin: currentPin,
+    rotating: pinUpdateInFlight,
+  });
+}
+
+function createControlError(code, message, extras = {}) {
+  const error = new Error(message);
+  error.code = code;
+  Object.assign(error, extras);
+  return error;
+}
+
+function getPinStorePath() {
+  return path.join(app.getPath('userData'), uxplayPinStoreFileName);
+}
+
+function formatControlError(error) {
+  return {
+    code: error?.code || 'INTERNAL_ERROR',
+    message: error?.message || 'unknown error',
+    httpStatus: Number.isInteger(error?.httpStatus) ? error.httpStatus : 500,
+    details: error?.details && typeof error.details === 'object' ? error.details : undefined,
+  };
+}
+
+function updateHttpPortFromLogLine(line) {
+  if (!line) {
+    return;
+  }
+  const match = serverPortLogPattern.exec(line);
+  if (!match) {
+    return;
+  }
+  const parsedPort = Number.parseInt(match[1], 10);
+  if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
+    const changed = uxplayHttpPort !== parsedPort;
+    uxplayHttpPort = parsedPort;
+    if (changed) {
+      broadcastControlStatus();
+      void triggerAutoPinRotationOnPortReady();
+    }
+  }
+}
+
+function consumeUxplayStderrChunk(chunk) {
+  const text = chunk.toString('utf8');
+  uxplayStderrBuffer += text;
+  const lines = uxplayStderrBuffer.split(/\r?\n/);
+  uxplayStderrBuffer = lines.pop() || '';
+  for (const line of lines) {
+    updateHttpPortFromLogLine(line);
+  }
+}
+
+function normalizePinInput(rawPin) {
+  const pin = typeof rawPin === 'number' ? String(rawPin) : String(rawPin || '').trim();
+  if (!/^\d{4}$/.test(pin)) {
+    throw createControlError(
+      'INVALID_PIN',
+      'PIN must be exactly 4 numeric digits.',
+      { httpStatus: 400 },
+    );
+  }
+  return pin;
+}
+
+function generateRandomPin(excludePin = null) {
+  for (let attempt = 0; attempt < 6; ++attempt) {
+    const candidate = String(crypto.randomInt(0, 10000)).padStart(4, '0');
+    if (!excludePin || candidate !== excludePin) {
+      return candidate;
+    }
+  }
+  return String(crypto.randomInt(0, 10000)).padStart(4, '0');
+}
+
+function ensureControlPortReady() {
+  if (!Number.isInteger(uxplayHttpPort) || uxplayHttpPort <= 0 || uxplayHttpPort > 65535) {
+    throw createControlError('HTTP_PORT_UNAVAILABLE', 'UxPlay HTTP control port is not ready yet.', {
+      httpStatus: 503,
+    });
+  }
+}
+
+function shouldRetryAutoPinUpdate(error) {
+  return (
+    error?.code === 'HTTP_PORT_UNAVAILABLE' ||
+    error?.code === 'UPSTREAM_TIMEOUT' ||
+    error?.code === 'UPSTREAM_UNREACHABLE' ||
+    error?.code === 'UPSTREAM_REJECTED'
+  );
+}
+
+function touchMirrorSessionActivity() {
+  if (mirrorSessionIdleTimer) {
+    clearTimeout(mirrorSessionIdleTimer);
+  }
+  mirrorSessionIdleTimer = setTimeout(() => {
+    mirrorSessionActive = false;
+  }, mirrorSessionIdleMs);
+}
+
+function ensureTrustedSender(event) {
+  if (!win || win.isDestroyed() || !event?.sender || !event?.senderFrame) {
+    throw createControlError('FORBIDDEN', 'Unauthorized caller.', { httpStatus: 403 });
+  }
+  const currentWindowUrl = win.webContents.getURL();
+  const senderUrl = event.senderFrame.url || '';
+  if (event.sender.id !== win.webContents.id || !senderUrl.startsWith('file://') || senderUrl !== currentWindowUrl) {
+    throw createControlError('FORBIDDEN', 'Caller does not have pin control permission.', { httpStatus: 403 });
+  }
+}
+
+function ensureControlToken(token) {
+  if (typeof token !== 'string' || token.length < 16 || token !== controlSessionToken) {
+    throw createControlError('FORBIDDEN', 'Invalid control token.', { httpStatus: 403 });
+  }
+}
+
+function requestUxplayPinUpdate(port, pin) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ pin });
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/api/pin',
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: uxplayControlTimeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        let totalLength = 0;
+        res.on('data', (chunk) => {
+          totalLength += chunk.length;
+          if (totalLength > 16384) {
+            req.destroy(
+              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
+                httpStatus: 502,
+              }),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8').trim();
+          let json = null;
+          if (text) {
+            try {
+              json = JSON.parse(text);
+            } catch {
+              json = null;
+            }
+          }
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({
+              statusCode: res.statusCode,
+              body: json || { message: text || 'pin updated' },
+            });
+            return;
+          }
+
+          const errorMessage =
+            json?.message ||
+            text ||
+            `UxPlay pin update failed with HTTP ${res.statusCode || 'unknown'}.`;
+          reject(
+            createControlError('UPSTREAM_REJECTED', errorMessage, {
+              httpStatus: 502,
+              details: {
+                upstreamStatusCode: res.statusCode || 0,
+              },
+            }),
+          );
+        });
+      },
+    );
+
+    req.on('timeout', () => {
+      req.destroy(
+        createControlError('UPSTREAM_TIMEOUT', 'UxPlay pin update request timed out.', {
+          httpStatus: 504,
+        }),
+      );
+    });
+    req.on('error', (error) => {
+      if (
+        error?.code === 'UPSTREAM_TIMEOUT' ||
+        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
+        error?.code === 'UPSTREAM_REJECTED'
+      ) {
+        reject(error);
+        return;
+      }
+      reject(
+        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
+          httpStatus: 502,
+          details: {
+            cause: error?.message || 'connection error',
+          },
+        }),
+      );
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+function persistEncryptedPin(pin, port) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw createControlError(
+      'ENCRYPTION_UNAVAILABLE',
+      'OS secure encryption is unavailable; PIN cannot be persisted safely.',
+      { httpStatus: 500 },
+    );
+  }
+  const encryptedPin = safeStorage.encryptString(pin);
+  const state = {
+    version: 1,
+    encryptedBy: 'electron.safeStorage',
+    updatedAt: new Date().toISOString(),
+    httpPort: port,
+    ciphertext: encryptedPin.toString('base64'),
+  };
+  fs.writeFileSync(getPinStorePath(), `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+}
+
+function restorePersistedPin() {
+  const pinStorePath = getPinStorePath();
+  if (!fs.existsSync(pinStorePath)) {
+    return;
+  }
+  if (!safeStorage.isEncryptionAvailable()) {
+    return;
+  }
+  try {
+    const raw = fs.readFileSync(pinStorePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.ciphertext !== 'string' || !parsed.ciphertext.length) {
+      return;
+    }
+    const decrypted = safeStorage.decryptString(Buffer.from(parsed.ciphertext, 'base64'));
+    if (/^\d{4}$/.test(decrypted)) {
+      currentPin = decrypted;
+    }
+  } catch (error) {
+    console.warn(`Failed to restore persisted pin state: ${error.message}`);
+  }
+}
+
+async function applyPinUpdate(pin) {
+  ensureControlPortReady();
+  const upstream = await requestUxplayPinUpdate(uxplayHttpPort, pin);
+  persistEncryptedPin(pin, uxplayHttpPort);
+  currentPin = pin;
+  broadcastControlStatus();
+  return {
+    port: uxplayHttpPort,
+    pin,
+    result: upstream.body,
+  };
+}
+
+async function rotatePinRandom(trigger = 'manual') {
+  if (pinUpdateInFlight) {
+    throw createControlError('PIN_UPDATE_BUSY', 'PIN update already in progress.', {
+      httpStatus: 409,
+    });
+  }
+  pinUpdateInFlight = true;
+  broadcastControlStatus();
+  try {
+    const pin = generateRandomPin(currentPin);
+    const updated = await applyPinUpdate(pin);
+    return {
+      ...updated,
+      trigger,
+    };
+  } finally {
+    pinUpdateInFlight = false;
+    broadcastControlStatus();
+  }
+}
+
+async function triggerAutoPinRotationOnMirrorStart() {
+  if (mirrorSessionActive) {
+    return;
+  }
+  mirrorSessionActive = true;
+  try {
+    const updated = await rotatePinRandom('auto');
+    console.log(`[pin-control] auto rotated pin to ${updated.pin} on mirror session start`);
+  } catch (error) {
+    console.error(`[pin-control] auto pin rotation failed: ${error?.message || 'unknown error'}`);
+    if (shouldRetryAutoPinUpdate(error)) {
+      mirrorSessionActive = false;
+    }
+  }
+}
+
+async function triggerAutoPinRotationOnPortReady() {
+  try {
+    const updated = await rotatePinRandom('auto-port-ready');
+    mirrorSessionActive = true;
+    touchMirrorSessionActivity();
+    console.log(`[pin-control] auto rotated pin to ${updated.pin} when control port became available`);
+  } catch (error) {
+    console.error(`[pin-control] auto pin rotation on control port failed: ${error?.message || 'unknown error'}`);
+  }
+}
+
+async function handleSetPinRequest(event, payload) {
+  ensureTrustedSender(event);
+  ensureControlToken(payload?.token);
+
+  if (typeof payload?.pin === 'string' && payload.pin.trim()) {
+    const manualPin = normalizePinInput(payload.pin);
+    const updated = await applyPinUpdate(manualPin);
+    return {
+      ok: true,
+      ...updated,
+      trigger: 'manual-set',
+    };
+  }
+
+  const updated = await rotatePinRandom('manual-random');
+  return {
+    ok: true,
+    ...updated,
+  };
+}
+
+async function handleRotatePinRequest(event, payload) {
+  ensureTrustedSender(event);
+  ensureControlToken(payload?.token);
+  const updated = await rotatePinRandom('manual-random');
+  return {
+    ok: true,
+    ...updated,
+  };
+}
+
+function setupIpcHandlers() {
+  ipcMain.handle('uxplay-control:get-session', (event) => {
+    try {
+      ensureTrustedSender(event);
+      return {
+        ok: true,
+        token: controlSessionToken,
+        port: uxplayHttpPort,
+        ready: bridgeReady,
+        pin: currentPin,
+        rotating: pinUpdateInFlight,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
+
+  ipcMain.handle('uxplay-control:set-pin', async (event, payload) => {
+    try {
+      return await handleSetPinRequest(event, payload);
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
+
+  ipcMain.handle('uxplay-control:rotate-pin', async (event, payload) => {
+    try {
+      return await handleRotatePinRequest(event, payload);
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
   });
 }
 
@@ -240,9 +650,10 @@ function startBridge() {
     uxplayServerName,
     '-stpid',
     String(process.pid),
-    '-stdoutlog',
-    '0',
-    '-d',
+    // '-stdoutlog',
+    // '7',
+    // '-d',
+    '-pw',
     '-logfile',
     ...extraArgs,
   ];
@@ -272,6 +683,15 @@ function startBridge() {
     console.error(`UxPlay exited code=${code} signal=${signal}`);
     bridge = null;
     bridgeReady = false;
+    uxplayHttpPort = null;
+    uxplayStderrBuffer = '';
+    pinUpdateInFlight = false;
+    mirrorSessionActive = false;
+    if (mirrorSessionIdleTimer) {
+      clearTimeout(mirrorSessionIdleTimer);
+      mirrorSessionIdleTimer = null;
+    }
+    broadcastControlStatus();
   });
 
   bridgeReader = readline.createInterface({
@@ -286,6 +706,7 @@ function startBridge() {
 
     if (line === 'READY') {
       bridgeReady = true;
+      broadcastControlStatus();
       console.log(`UxPlay shared texture export is ready. AirPlay server name: ${uxplayServerName}`);
       void flushFrameQueue();
       return;
@@ -293,6 +714,7 @@ function startBridge() {
 
     const [type, ...rest] = line.split('\t');
     if (type !== 'FRAME' || rest.length < 5) {
+      updateHttpPortFromLogLine(line);
       console.log(`[uxplay] ${line}`);
       return;
     }
@@ -303,6 +725,8 @@ function startBridge() {
     const height = Number(heightText);
     const timestampUs = Number(timestampText);
     framesReceived += 1;
+    touchMirrorSessionActivity();
+    void triggerAutoPinRotationOnMirrorStart();
     if (traceSharedTexture && (framesReceived <= 5 || framesReceived % 30 === 0)) {
       traceSharedTextureStats(`recv-${frameId}`);
     }
@@ -345,12 +769,16 @@ function startBridge() {
   });
 
   bridge.stderr.on('data', (chunk) => {
+    consumeUxplayStderrChunk(chunk);
     process.stderr.write(chunk);
   });
 }
 
 app.whenReady().then(() => {
+  restorePersistedPin();
+  setupIpcHandlers();
   createWindow();
+  broadcastControlStatus();
   if (sendTimeoutMs > 0) {
     console.log(`sendSharedTexture watchdog timeout: ${sendTimeoutMs}ms`);
   } else {
@@ -369,6 +797,10 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   if (bridge && bridge.stdin.writable) {
     bridge.stdin.write('STOP\n');
+  }
+  if (mirrorSessionIdleTimer) {
+    clearTimeout(mirrorSessionIdleTimer);
+    mirrorSessionIdleTimer = null;
   }
 
   releasePendingFrame(pendingFrame, { notifyRelease: true });

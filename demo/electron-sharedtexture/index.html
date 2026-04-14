@@ -106,6 +106,78 @@
         word-break: break-word;
       }
 
+      .pin-panel {
+        margin-top: 24px;
+        padding-top: 18px;
+        border-top: 1px solid var(--border);
+      }
+
+      .pin-panel h2 {
+        margin: 0 0 8px;
+        font-size: 18px;
+      }
+
+      .pin-panel p {
+        margin: 0 0 10px;
+      }
+
+      .pin-meta {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin: 0 0 12px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .pin-form {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 10px;
+        align-items: center;
+      }
+
+      .pin-input {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: rgba(13, 17, 23, 0.7);
+        color: var(--text);
+        padding: 10px 12px;
+        font-family: "Cascadia Code", Consolas, monospace;
+        letter-spacing: 0.08em;
+      }
+
+      .pin-button {
+        border: 1px solid rgba(79, 209, 197, 0.5);
+        border-radius: 10px;
+        background: rgba(79, 209, 197, 0.15);
+        color: var(--text);
+        padding: 10px 14px;
+        cursor: pointer;
+      }
+
+      .pin-button:disabled,
+      .pin-input:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .pin-feedback {
+        margin-top: 10px;
+        min-height: 20px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .pin-feedback[data-tone="error"] {
+        color: #f87171;
+      }
+
+      .pin-feedback[data-tone="success"] {
+        color: #34d399;
+      }
+
       code {
         font-family: "Cascadia Code", Consolas, monospace;
         color: var(--accent);
@@ -137,11 +209,34 @@
           <dd id="frameValue">-</dd>
           <dt>Timestamp</dt>
           <dd id="timestampValue">-</dd>
+          <!--
           <dt>Texture ID</dt>
           <dd id="textureValue">-</dd>
+          -->
           <dt>Probe</dt>
           <dd id="probeValue">-</dd>
         </dl>
+        <section class="pin-panel">
+          <h2>PIN Control</h2>
+          <p>Each successful mirroring session auto-generates a new random 4-digit PIN via <code>/api/pin</code>.</p>
+          <div class="pin-meta">
+            <span>HTTP Port</span>
+            <strong id="pinPortValue">-</strong>
+          </div>
+          <form class="pin-form" id="pinForm">
+            <input
+              id="pinInput"
+              class="pin-input"
+              type="text"
+              inputmode="numeric"
+              maxlength="4"
+              value="----"
+              readonly
+            />
+            <button id="pinSubmitButton" class="pin-button" type="submit">Randomize PIN</button>
+          </form>
+          <div id="pinFeedback" class="pin-feedback" data-tone="muted">Waiting for control session...</div>
+        </section>
       </aside>
     </div>
     <script src="./renderer.js"></script>

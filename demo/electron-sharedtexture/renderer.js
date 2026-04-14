@@ -1,7 +1,10 @@
-const { sharedTexture } = require('electron');
+const { ipcRenderer, sharedTexture } = require('electron');
 
 if (!sharedTexture) {
   throw new Error('sharedTexture is unavailable in this renderer.');
+}
+if (!ipcRenderer) {
+  throw new Error('ipcRenderer is unavailable in this renderer.');
 }
 
 const canvas = document.getElementById('videoCanvas');
@@ -12,7 +15,15 @@ const frameValue = document.getElementById('frameValue');
 const timestampValue = document.getElementById('timestampValue');
 const textureValue = document.getElementById('textureValue');
 const probeValue = document.getElementById('probeValue');
+const pinPortValue = document.getElementById('pinPortValue');
+const pinForm = document.getElementById('pinForm');
+const pinInput = document.getElementById('pinInput');
+const pinSubmitButton = document.getElementById('pinSubmitButton');
+const pinFeedback = document.getElementById('pinFeedback');
 const context = canvas.getContext('2d', { alpha: false });
+if (!pinPortValue || !pinForm || !pinInput || !pinSubmitButton || !pinFeedback) {
+  throw new Error('PIN control UI elements are missing.');
+}
 const query =
   typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
 const enableProbe = query.get('probe') === '1';
@@ -20,6 +31,123 @@ const renderTimeoutMs = Number.parseInt(query.get('renderTimeoutMs') || '250', 1
 let probeFramesRemaining = enableProbe ? 5 : 0;
 let drawInFlight = false;
 let pendingPacket = null;
+let controlSessionToken = null;
+
+function setPinFeedback(message, tone = 'muted') {
+  pinFeedback.textContent = message;
+  pinFeedback.dataset.tone = tone;
+}
+
+function setPinControlEnabled(enabled) {
+  pinSubmitButton.disabled = !enabled;
+}
+
+function updatePortDisplay(port) {
+  pinPortValue.textContent = Number.isInteger(port) && port > 0 ? String(port) : '-';
+}
+
+function updatePinDisplay(pin) {
+  pinInput.value = typeof pin === 'string' && /^\d{4}$/.test(pin) ? pin : '----';
+}
+
+function applyControlStatus(status) {
+  const port = Number.isInteger(status?.port) ? status.port : null;
+  const pin = typeof status?.pin === 'string' ? status.pin : null;
+  const rotating = status?.rotating === true;
+  const hasPort = Boolean(port && port > 0);
+
+  updatePortDisplay(port);
+  updatePinDisplay(pin);
+  setPinControlEnabled(hasPort && !rotating);
+
+  if (!hasPort) {
+    setPinFeedback('UxPlay started, waiting for control port...', 'muted');
+    return;
+  }
+  if (rotating) {
+    setPinFeedback('Updating random PIN...', 'muted');
+    return;
+  }
+  if (pin) {
+    setPinFeedback(`Current PIN: ${pin}`, 'muted');
+    return;
+  }
+  setPinFeedback('Waiting for first mirroring session to generate PIN...', 'muted');
+}
+
+async function initializePinControl() {
+  setPinControlEnabled(false);
+  updatePinDisplay(null);
+  try {
+    const session = await ipcRenderer.invoke('uxplay-control:get-session');
+    if (!session?.ok) {
+      setPinFeedback(`PIN control unavailable: ${session?.error?.message || 'unknown error'}`, 'error');
+      return;
+    }
+    controlSessionToken = session.token;
+    applyControlStatus(session);
+    setPinControlEnabled(true);
+  } catch (error) {
+    setPinFeedback(`PIN control init failed: ${error.message}`, 'error');
+  }
+}
+
+async function submitPinUpdate(event) {
+  event.preventDefault();
+  try {
+    const latestSession = await ipcRenderer.invoke('uxplay-control:get-session');
+    if (latestSession?.ok) {
+      controlSessionToken = latestSession.token;
+      applyControlStatus(latestSession);
+    }
+  } catch {
+    // Keep last known session token and port.
+  }
+
+  if (!controlSessionToken) {
+    setPinFeedback('Control session is not initialized.', 'error');
+    return;
+  }
+  if (pinPortValue.textContent === '-') {
+    setPinFeedback('Control port is unavailable.', 'error');
+    return;
+  }
+
+  setPinControlEnabled(false);
+  setPinFeedback('Updating random PIN...', 'muted');
+  try {
+    const response = await ipcRenderer.invoke('uxplay-control:rotate-pin', {
+      token: controlSessionToken,
+    });
+
+    if (!response?.ok) {
+      setPinFeedback(
+        `PIN update failed [${response?.error?.code || 'UNKNOWN'}]: ${response?.error?.message || 'unknown error'}`,
+        'error',
+      );
+      return;
+    }
+
+    applyControlStatus(response);
+    setPinFeedback(
+      `PIN updated to ${response?.pin}. ${response?.result?.message || 'UxPlay accepted the change.'}`,
+      'success',
+    );
+  } catch (error) {
+    setPinFeedback(`PIN update request failed: ${error.message}`, 'error');
+  } finally {
+    try {
+      const latestSession = await ipcRenderer.invoke('uxplay-control:get-session');
+      if (latestSession?.ok) {
+        applyControlStatus(latestSession);
+      } else {
+        setPinControlEnabled(true);
+      }
+    } catch {
+      setPinControlEnabled(true);
+    }
+  }
+}
 
 function resizeCanvas(width, height) {
   if (canvas.width === width && canvas.height === height) {
@@ -140,7 +268,9 @@ async function drainFrameQueue() {
       sizeValue.textContent = `${info.width} x ${info.height}`;
       frameValue.textContent = String(info.frameId ?? '-');
       timestampValue.textContent = `${info.timestampUs ?? '-'} us`;
-      textureValue.textContent = importedSharedTexture.textureId;
+      if (textureValue) {
+        textureValue.textContent = importedSharedTexture.textureId;
+      }
       if (probeValue.textContent === '-') {
         probeValue.textContent = enableProbe ? `fmt=${frame.format || 'unknown'}` : 'disabled';
       }
@@ -169,7 +299,18 @@ sharedTexture.setSharedTextureReceiver(({ importedSharedTexture }, info) => {
   void drainFrameQueue();
 });
 
+const onControlStatus = (_event, status) => {
+  applyControlStatus(status);
+};
+ipcRenderer.on('uxplay-control:status', onControlStatus);
+
+pinForm.addEventListener('submit', (event) => {
+  void submitPinUpdate(event);
+});
+void initializePinControl();
+
 window.addEventListener('beforeunload', () => {
+  ipcRenderer.removeListener('uxplay-control:status', onControlStatus);
   releasePacket(pendingPacket);
   pendingPacket = null;
 });
