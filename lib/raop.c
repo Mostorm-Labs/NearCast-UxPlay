@@ -186,6 +186,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     bool http_ctrl_request = false;
     bool is_pin_endpoint = false;
     bool is_audio_endpoint = false;
+    bool is_stop_endpoint = false;
     logger_log(conn->raop->logger, LOGGER_DEBUG, "conn_request");
     bool logger_debug = (logger_get_level(conn->raop->logger) >= LOGGER_DEBUG);
 
@@ -223,11 +224,19 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                (!url[10] || url[10] == '/' || url[10] == '?')) {
         is_audio_endpoint = true;
     }
+    if (!strncmp(url, "/stop", 5) &&
+        (!url[5] || url[5] == '/' || url[5] == '?')) {
+        is_stop_endpoint = true;
+    } else if (!strncmp(url, "/api/stop", 9) &&
+               (!url[9] || url[9] == '/' || url[9] == '?')) {
+        is_stop_endpoint = true;
+    }
 
 /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/
     const char *cseq = http_request_get_header(request, "CSeq");
     const char *protocol = http_request_get_protocol(request);
-    if (!cseq && !conn->raop->hls_support && !is_pin_endpoint && !is_audio_endpoint) {
+    if (!cseq && !conn->raop->hls_support && !is_pin_endpoint && !is_audio_endpoint &&
+        !is_stop_endpoint) {
         logger_log(conn->raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
         return;
     }
@@ -235,7 +244,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
     const char *host = http_request_get_header(request, "Host");
     if (host && !cseq && !client_session_id) {
-        if (is_pin_endpoint || is_audio_endpoint) {
+        if (is_pin_endpoint || is_audio_endpoint || is_stop_endpoint) {
             http_ctrl_request = true;
         } else {
             hls_request = true;
@@ -438,6 +447,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 handler = &http_handler_pin_control;
             } else if (is_audio_endpoint) {
                 handler = &http_handler_mirror_audio_control;
+            } else if (is_stop_endpoint && http_ctrl_request) {
+                handler = &http_handler_stop_control;
             } else if (!strcmp(url, "/reverse")) {
                 handler = &http_handler_reverse;
             } else if (!strcmp(url, "/play")) {
@@ -460,6 +471,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 handler = &http_handler_pin_control;
             } else if (is_audio_endpoint) {
                 handler = &http_handler_mirror_audio_control;
+            } else if (is_stop_endpoint && http_ctrl_request) {
+                handler = &http_handler_stop_control;
             } else if (!strcmp(url, "/server-info")) {
                 handler = &http_handler_server_info;
             } else if (!strcmp(url, "/playback-info")) {
@@ -470,6 +483,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 handler = &http_handler_pin_control;
             } else if (is_audio_endpoint) {
                 handler = &http_handler_mirror_audio_control;
+            } else if (is_stop_endpoint && http_ctrl_request) {
+                handler = &http_handler_stop_control;
             } else if (!strncmp (url, "/setProperty?", strlen("/setProperty?"))) {
                 handler = &http_handler_set_property;
 	    }
@@ -478,6 +493,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 handler = &http_handler_pin_control;
             } else if (is_audio_endpoint) {
                 handler = &http_handler_mirror_audio_control;
+            } else if (is_stop_endpoint && http_ctrl_request) {
+                handler = &http_handler_stop_control;
             }
         }
     } else if (hls_request) {

@@ -138,6 +138,93 @@ http_handler_stop(raop_conn_t *conn, http_request_t *request, http_response_t *r
     conn->raop->callbacks.on_video_stop(conn->raop->callbacks.cls);
 }
 
+static void
+http_stop_send_error(const char *protocol, http_response_t *response, int code, const char *reason,
+                     const char *message, char **response_data, int *response_datalen) {
+    const char *proto = (protocol ? protocol : "HTTP/1.1");
+    http_response_init(response, proto, code, reason);
+    char body[180];
+    int len = snprintf(body, sizeof(body),
+                       "{\"status\":\"error\",\"message\":\"%s\"}",
+                       (message ? message : "unknown error"));
+    char *payload = malloc(len + 1);
+    if (!payload) {
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+    memcpy(payload, body, len + 1);
+    *response_data = payload;
+    *response_datalen = len;
+    http_response_add_header(response, "Content-Type", "application/json");
+    http_response_add_header(response, "Cache-Control", "no-store");
+    http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+}
+
+static void
+http_stop_send_status(const char *protocol, const char *status, const char *message,
+                      http_response_t *response, char **response_data, int *response_datalen) {
+    const char *proto = (protocol ? protocol : "HTTP/1.1");
+    http_response_init(response, proto, 200, "OK");
+    char body[220];
+    int len = snprintf(body, sizeof(body),
+                       "{\"status\":\"%s\",\"message\":\"%s\"}",
+                       (status ? status : "ok"),
+                       (message ? message : ""));
+    char *payload = malloc(len + 1);
+    if (!payload) {
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+    memcpy(payload, body, len + 1);
+    *response_data = payload;
+    *response_datalen = len;
+    http_response_add_header(response, "Content-Type", "application/json");
+    http_response_add_header(response, "Cache-Control", "no-store");
+    http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+}
+
+static void
+http_handler_stop_control(raop_conn_t *conn, http_request_t *request, http_response_t *response,
+                          char **response_data, int *response_datalen) {
+    const char *method = http_request_get_method(request);
+    const char *protocol = http_request_get_protocol(request);
+    if (!method) {
+        http_stop_send_error(protocol, response, 400, "Bad Request", "missing HTTP method",
+                             response_data, response_datalen);
+        return;
+    }
+
+    if (!strcmp(method, "OPTIONS")) {
+        http_response_init(response, protocol ? protocol : "HTTP/1.1", 204, "No Content");
+        http_response_add_header(response, "Access-Control-Allow-Origin", "*");
+        http_response_add_header(response, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        http_response_add_header(response, "Access-Control-Allow-Headers", "Content-Type");
+        *response_data = NULL;
+        *response_datalen = 0;
+        return;
+    }
+
+    bool allow_stop = (!strcmp(method, "POST") || !strcmp(method, "GET"));
+    if (!allow_stop) {
+        http_stop_send_error(protocol, response, 405, "Method Not Allowed",
+                             "method not allowed", response_data, response_datalen);
+        http_response_add_header(response, "Allow", "GET, POST, OPTIONS");
+        return;
+    }
+
+    logger_log(conn->raop->logger, LOGGER_INFO, "HTTP control requested stop casting");
+    if (conn->raop->callbacks.on_video_stop) {
+        conn->raop->callbacks.on_video_stop(conn->raop->callbacks.cls);
+    }
+    if (conn->raop->callbacks.video_reset) {
+        conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
+    }
+    httpd_remove_known_connections_except(conn->raop->httpd, conn);
+    http_stop_send_status(protocol, "ok", "casting stopped", response, response_data, response_datalen);
+}
+
 static int
 http_pin_parse_digits(const char *digits, unsigned short *pin_out) {
     if (!digits || !pin_out) {
