@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, safeStorage, sharedTexture } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain, safeStorage, sharedTexture } = require('electron');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -90,6 +90,7 @@ function broadcastControlStatus() {
     muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
     audioUpdating: mirrorAudioUpdateInFlight,
     stopUpdating: stopUpdateInFlight,
+    isFullscreen: win.isFullScreen(),
   });
 }
 
@@ -822,6 +823,7 @@ function setupIpcHandlers() {
         muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
         audioUpdating: mirrorAudioUpdateInFlight,
         stopUpdating: stopUpdateInFlight,
+        isFullscreen: Boolean(win && !win.isDestroyed() && win.isFullScreen()),
       };
     } catch (error) {
       return {
@@ -874,19 +876,88 @@ function setupIpcHandlers() {
       };
     }
   });
+
+  ipcMain.handle('window-control:get-state', (event) => {
+    try {
+      ensureTrustedSender(event);
+      return {
+        ok: true,
+        isFullscreen: Boolean(win && !win.isDestroyed() && win.isFullScreen()),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
+
+  ipcMain.handle('window-control:toggle-fullscreen', (event, payload) => {
+    try {
+      ensureTrustedSender(event);
+      ensureControlToken(payload?.token);
+      if (!win || win.isDestroyed()) {
+        throw createControlError('WINDOW_UNAVAILABLE', 'Application window is not available.', {
+          httpStatus: 503,
+        });
+      }
+      const nextFullscreen = !win.isFullScreen();
+      win.setFullScreen(nextFullscreen);
+      return {
+        ok: true,
+        isFullscreen: nextFullscreen,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
+
+  ipcMain.handle('window-control:set-windowed', (event, payload) => {
+    try {
+      ensureTrustedSender(event);
+      ensureControlToken(payload?.token);
+      if (!win || win.isDestroyed()) {
+        throw createControlError('WINDOW_UNAVAILABLE', 'Application window is not available.', {
+          httpStatus: 503,
+        });
+      }
+      win.setFullScreen(false);
+      return {
+        ok: true,
+        isFullscreen: false,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
 }
 
 function createWindow() {
+  Menu.setApplicationMenu(null);
   win = new BrowserWindow({
     width: 1280,
     height: 800,
-    backgroundColor: '#101214',
+    minWidth: 960,
+    minHeight: 540,
+    backgroundColor: '#000000',
+    frame: false,
+    autoHideMenuBar: true,
+    fullscreen: true,
+    fullscreenable: true,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
     },
   });
 
+  win.removeMenu();
+  win.setMenuBarVisibility(false);
   win.loadFile(path.join(__dirname, 'index.html'));
   win.webContents.on('console-message', (_event, levelOrDetails, message, line, sourceId) => {
     if (typeof levelOrDetails === 'object' && levelOrDetails) {
@@ -898,6 +969,12 @@ function createWindow() {
     }
 
     console.log(`[renderer:${levelOrDetails}] ${message} (${sourceId}:${line})`);
+  });
+  win.on('enter-full-screen', () => {
+    broadcastControlStatus();
+  });
+  win.on('leave-full-screen', () => {
+    broadcastControlStatus();
   });
   win.on('closed', () => {
     win = null;
