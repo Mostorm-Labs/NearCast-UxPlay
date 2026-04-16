@@ -49,6 +49,14 @@ let currentMuted = null;
 let windowFullscreen = null;
 let windowControlsEnabled = false;
 let castingActive = false;
+const lastFrameCanvas = document.createElement('canvas');
+const lastFrameContext = lastFrameCanvas.getContext('2d', { alpha: false });
+let lastFrameWidth = 0;
+let lastFrameHeight = 0;
+
+if (!lastFrameContext) {
+  throw new Error('Unable to initialize cached frame context.');
+}
 
 function setFeedback(element, message, tone = 'muted') {
   element.textContent = message;
@@ -112,6 +120,41 @@ function clearCanvasToBlack() {
   context.fillRect(0, 0, canvas.width, canvas.height);
 }
 
+function drawSourceToViewport(source, width, height) {
+  resizeCanvasToViewport();
+
+  const canvasWidth = canvas.width;
+  const canvasHeight = canvas.height;
+  const scale = Math.max(canvasWidth / width, canvasHeight / height);
+  const drawWidth = width * scale;
+  const drawHeight = height * scale;
+  const offsetX = (canvasWidth - drawWidth) * 0.5;
+  const offsetY = (canvasHeight - drawHeight) * 0.5;
+
+  context.drawImage(source, offsetX, offsetY, drawWidth, drawHeight);
+}
+
+function cacheAndDrawFrameSource(source, width, height) {
+  if (lastFrameCanvas.width !== width || lastFrameCanvas.height !== height) {
+    lastFrameCanvas.width = width;
+    lastFrameCanvas.height = height;
+  }
+
+  lastFrameContext.drawImage(source, 0, 0, width, height);
+  lastFrameWidth = width;
+  lastFrameHeight = height;
+  drawSourceToViewport(lastFrameCanvas, width, height);
+}
+
+function redrawFromCachedFrame() {
+  if (lastFrameWidth <= 0 || lastFrameHeight <= 0) {
+    return false;
+  }
+
+  drawSourceToViewport(lastFrameCanvas, lastFrameWidth, lastFrameHeight);
+  return true;
+}
+
 function setCastingState(active) {
   const nextState = active === true;
   if (castingActive === nextState) {
@@ -124,6 +167,8 @@ function setCastingState(active) {
       releasePacket(pendingPacket);
       pendingPacket = null;
     }
+    lastFrameWidth = 0;
+    lastFrameHeight = 0;
     clearCanvasToBlack();
     statusBadge.textContent = '未投屏';
     return;
@@ -401,21 +446,11 @@ function resizeCanvasToViewport() {
 }
 
 async function drawFrame(frame, width, height) {
-  resizeCanvasToViewport();
-
-  const canvasWidth = canvas.width;
-  const canvasHeight = canvas.height;
-  const scale = Math.max(canvasWidth / width, canvasHeight / height);
-  const drawWidth = width * scale;
-  const drawHeight = height * scale;
-  const offsetX = (canvasWidth - drawWidth) * 0.5;
-  const offsetY = (canvasHeight - drawHeight) * 0.5;
-
   if (typeof createImageBitmap === 'function') {
     try {
       const bitmap = await createImageBitmap(frame);
       try {
-        context.drawImage(bitmap, offsetX, offsetY, drawWidth, drawHeight);
+        cacheAndDrawFrameSource(bitmap, width, height);
         return;
       } finally {
         bitmap.close();
@@ -425,7 +460,7 @@ async function drawFrame(frame, width, height) {
     }
   }
 
-  context.drawImage(frame, offsetX, offsetY, drawWidth, drawHeight);
+  cacheAndDrawFrameSource(frame, width, height);
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -535,6 +570,9 @@ fullscreenToggleButton.addEventListener('click', () => {
 
 window.addEventListener('resize', () => {
   resizeCanvasToViewport();
+  if (!castingActive || !redrawFromCachedFrame()) {
+    clearCanvasToBlack();
+  }
 });
 
 resizeCanvasToViewport();
