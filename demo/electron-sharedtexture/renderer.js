@@ -41,6 +41,7 @@ if (
 const query =
   typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
 const renderTimeoutMs = Number.parseInt(query.get('renderTimeoutMs') || '250', 10) || 0;
+const fitMode = (query.get('fit') || 'contain').toLowerCase();
 
 let drawInFlight = false;
 let pendingPacket = null;
@@ -125,12 +126,17 @@ function drawSourceToViewport(source, width, height) {
 
   const canvasWidth = canvas.width;
   const canvasHeight = canvas.height;
-  const scale = Math.max(canvasWidth / width, canvasHeight / height);
+  const scaleBase = fitMode === 'cover'
+    ? Math.max(canvasWidth / width, canvasHeight / height)
+    : Math.min(canvasWidth / width, canvasHeight / height);
+  const scale = Number.isFinite(scaleBase) && scaleBase > 0 ? scaleBase : 1;
   const drawWidth = width * scale;
   const drawHeight = height * scale;
   const offsetX = (canvasWidth - drawWidth) * 0.5;
   const offsetY = (canvasHeight - drawHeight) * 0.5;
 
+  context.fillStyle = '#000000';
+  context.fillRect(0, 0, canvasWidth, canvasHeight);
   context.drawImage(source, offsetX, offsetY, drawWidth, drawHeight);
 }
 
