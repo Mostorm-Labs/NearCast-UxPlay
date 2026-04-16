@@ -48,6 +48,7 @@ let controlSessionToken = null;
 let currentMuted = null;
 let windowFullscreen = null;
 let windowControlsEnabled = false;
+let castingActive = false;
 
 function setFeedback(element, message, tone = 'muted') {
   element.textContent = message;
@@ -105,12 +106,39 @@ function setWindowControlsEnabled(enabled) {
   updateWindowButtons();
 }
 
+function clearCanvasToBlack() {
+  resizeCanvasToViewport();
+  context.fillStyle = '#000000';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function setCastingState(active) {
+  const nextState = active === true;
+  if (castingActive === nextState) {
+    return;
+  }
+  castingActive = nextState;
+
+  if (!castingActive) {
+    if (pendingPacket) {
+      releasePacket(pendingPacket);
+      pendingPacket = null;
+    }
+    clearCanvasToBlack();
+    statusBadge.textContent = '未投屏';
+    return;
+  }
+
+  statusBadge.textContent = '投屏中（等待画面）';
+}
+
 function applyControlStatus(status) {
   const port = Number.isInteger(status?.port) ? status.port : null;
   const pin = typeof status?.pin === 'string' ? status.pin : null;
   const rotating = status?.rotating === true;
   const audioUpdating = status?.audioUpdating === true;
   const stopUpdating = status?.stopUpdating === true;
+  const controlCastingActive = status?.castingActive === true;
   const muted = typeof status?.muted === 'boolean'
     ? status.muted
     : (typeof status?.mirrorAudioEnabled === 'boolean' ? !status.mirrorAudioEnabled : null);
@@ -120,6 +148,7 @@ function applyControlStatus(status) {
     setWindowDisplayState(status.isFullscreen);
   }
 
+  setCastingState(controlCastingActive);
   updatePortDisplay(port);
   updatePinDisplay(pin);
   updateMuteDisplay(muted);
@@ -177,6 +206,7 @@ async function initializeControls() {
   setWindowControlsEnabled(false);
   updatePinDisplay(null);
   updateMuteDisplay(null);
+  setCastingState(false);
 
   try {
     const [session, windowState] = await Promise.all([
@@ -435,6 +465,11 @@ async function drainFrameQueue() {
     const packet = pendingPacket;
     pendingPacket = null;
 
+    if (!castingActive) {
+      releasePacket(packet);
+      continue;
+    }
+
     const { importedSharedTexture, info } = packet;
     let frame;
     try {
@@ -445,10 +480,15 @@ async function drainFrameQueue() {
         'drawFrame',
       );
 
-      statusBadge.textContent = `投屏中 ${info.width}x${info.height}`;
+      if (castingActive) {
+        statusBadge.textContent = `投屏中 ${info.width}x${info.height}`;
+      } else {
+        clearCanvasToBlack();
+        statusBadge.textContent = '未投屏';
+      }
     } catch (error) {
       console.error('Shared texture render failed:', error);
-      statusBadge.textContent = `渲染失败: ${error.message}`;
+      statusBadge.textContent = castingActive ? `渲染失败: ${error.message}` : '未投屏';
     } finally {
       if (frame) {
         frame.close();
@@ -461,6 +501,11 @@ async function drainFrameQueue() {
 }
 
 sharedTexture.setSharedTextureReceiver(({ importedSharedTexture }, info) => {
+  if (!castingActive) {
+    releasePacket({ importedSharedTexture });
+    return;
+  }
+
   if (pendingPacket) {
     // Keep renderer real-time: only keep the latest waiting frame.
     releasePacket(pendingPacket);
@@ -493,6 +538,7 @@ window.addEventListener('resize', () => {
 });
 
 resizeCanvasToViewport();
+clearCanvasToBlack();
 void initializeControls();
 
 window.addEventListener('beforeunload', () => {
@@ -500,4 +546,3 @@ window.addEventListener('beforeunload', () => {
   releasePacket(pendingPacket);
   pendingPacket = null;
 });
-

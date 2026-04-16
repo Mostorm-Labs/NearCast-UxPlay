@@ -734,6 +734,9 @@ void video_renderer_stop() {
     g_mutex_lock(&renderer_mutex);
     renderers_started = false;
     video_renderer_reset_sync_state();
+    if (shared_texture_bridge) {
+        shared_texture_bridge_set_session_active(shared_texture_bridge, false, "video-renderer-stop");
+    }
     if (renderer) {
         logger_log(logger, LOGGER_DEBUG,"video_renderer_stop");
         if (renderer->appsrc) {

@@ -43,6 +43,7 @@ let pinUpdateInFlight = false;
 let mirrorAudioEnabled = null;
 let mirrorAudioUpdateInFlight = false;
 let stopUpdateInFlight = false;
+let castingActive = false;
 let mirrorSessionActive = false;
 let mirrorSessionIdleTimer = null;
 let frameSending = false;
@@ -84,6 +85,7 @@ function broadcastControlStatus() {
   win.webContents.send('uxplay-control:status', {
     ready: bridgeReady,
     port: uxplayHttpPort,
+    castingActive,
     pin: currentPin,
     rotating: pinUpdateInFlight,
     mirrorAudioEnabled,
@@ -215,6 +217,45 @@ function touchMirrorSessionActivity() {
   mirrorSessionIdleTimer = setTimeout(() => {
     mirrorSessionActive = false;
   }, mirrorSessionIdleMs);
+}
+
+function clearMirrorSessionIdleTimer() {
+  if (!mirrorSessionIdleTimer) {
+    return;
+  }
+  clearTimeout(mirrorSessionIdleTimer);
+  mirrorSessionIdleTimer = null;
+}
+
+function clearPendingMainFrame(reason = 'unspecified') {
+  if (!pendingFrame) {
+    return;
+  }
+
+  const frameId = pendingFrame.frameId;
+  releasePendingFrame(pendingFrame, { notifyRelease: true });
+  pendingFrame = null;
+  if (traceSharedTexture) {
+    traceSharedTextureStats(`drop-${reason}-${frameId}`);
+  }
+}
+
+function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
+  const normalized = nextActive === true;
+  if (options.clearPending === true) {
+    clearPendingMainFrame(`casting-${reason}`);
+  }
+  if (castingActive === normalized) {
+    return;
+  }
+  castingActive = normalized;
+  if (traceSharedTexture) {
+    console.log(`[shared-texture:session] castingActive=${castingActive} reason=${reason}`);
+  }
+  broadcastControlStatus();
+  if (castingActive) {
+    void flushFrameQueue();
+  }
 }
 
 function ensureTrustedSender(event) {
@@ -797,6 +838,9 @@ async function handleStopCastingRequest(event, payload) {
   try {
     ensureControlPortReady();
     const upstream = await requestUxplayStop(uxplayHttpPort);
+    mirrorSessionActive = false;
+    clearMirrorSessionIdleTimer();
+    setCastingActive(false, 'http-stop-success', { clearPending: true });
     return {
       ok: true,
       port: uxplayHttpPort,
@@ -817,6 +861,7 @@ function setupIpcHandlers() {
         token: controlSessionToken,
         port: uxplayHttpPort,
         ready: bridgeReady,
+        castingActive,
         pin: currentPin,
         rotating: pinUpdateInFlight,
         mirrorAudioEnabled,
@@ -1030,6 +1075,11 @@ function releasePendingFrame(frame, options = {}) {
 }
 
 function queueFrame(frame) {
+  if (!castingActive) {
+    releasePendingFrame(frame, { notifyRelease: true });
+    return;
+  }
+
   if (pendingFrame) {
     releasePendingFrame(pendingFrame, { notifyRelease: true });
   }
@@ -1089,7 +1139,7 @@ async function sendFrameToRenderer(frame) {
 }
 
 async function flushFrameQueue() {
-  if (frameSending || !pendingFrame || !win || win.isDestroyed() || !bridgeReady) {
+  if (frameSending || !pendingFrame || !win || win.isDestroyed() || !bridgeReady || !castingActive) {
     return;
   }
 
@@ -1099,6 +1149,11 @@ async function flushFrameQueue() {
     const frame = pendingFrame;
     pendingFrame = null;
     let sentToRenderer = false;
+
+    if (!castingActive) {
+      releasePendingFrame(frame, { notifyRelease: true });
+      continue;
+    }
 
     try {
       await sendFrameToRenderer(frame);
@@ -1171,11 +1226,9 @@ function startBridge() {
     mirrorAudioEnabled = null;
     mirrorAudioUpdateInFlight = false;
     stopUpdateInFlight = false;
+    setCastingActive(false, 'bridge-exit', { clearPending: true });
     mirrorSessionActive = false;
-    if (mirrorSessionIdleTimer) {
-      clearTimeout(mirrorSessionIdleTimer);
-      mirrorSessionIdleTimer = null;
-    }
+    clearMirrorSessionIdleTimer();
     broadcastControlStatus();
   });
 
@@ -1198,6 +1251,21 @@ function startBridge() {
     }
 
     const [type, ...rest] = line.split('\t');
+    if (type === 'SESSION') {
+      const [sessionState, ...reasonParts] = rest;
+      const reason = reasonParts.length > 0 ? reasonParts.join('\t') : 'bridge';
+      if (sessionState === 'ACTIVE') {
+        setCastingActive(true, `session-active:${reason}`);
+      } else if (sessionState === 'INACTIVE') {
+        mirrorSessionActive = false;
+        clearMirrorSessionIdleTimer();
+        setCastingActive(false, `session-inactive:${reason}`, { clearPending: true });
+      } else {
+        console.log(`[uxplay] ${line}`);
+      }
+      return;
+    }
+
     if (type !== 'FRAME' || rest.length < 5) {
       updateHttpPortFromLogLine(line);
       console.log(`[uxplay] ${line}`);
@@ -1209,6 +1277,9 @@ function startBridge() {
     const width = Number(widthText);
     const height = Number(heightText);
     const timestampUs = Number(timestampText);
+    if (!castingActive) {
+      setCastingActive(true, 'frame-fallback');
+    }
     framesReceived += 1;
     touchMirrorSessionActivity();
     void triggerAutoPinRotationOnMirrorStart();
@@ -1283,11 +1354,6 @@ app.on('before-quit', () => {
   if (bridge && bridge.stdin.writable) {
     bridge.stdin.write('STOP\n');
   }
-  if (mirrorSessionIdleTimer) {
-    clearTimeout(mirrorSessionIdleTimer);
-    mirrorSessionIdleTimer = null;
-  }
-
-  releasePendingFrame(pendingFrame, { notifyRelease: true });
-  pendingFrame = null;
+  clearMirrorSessionIdleTimer();
+  setCastingActive(false, 'before-quit', { clearPending: true });
 });

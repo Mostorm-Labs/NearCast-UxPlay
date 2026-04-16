@@ -131,6 +131,7 @@ struct shared_texture_bridge_s {
     }
 
     stopping = true;
+    SetSessionActive(false, "bridge-stop");
 
     if (command_thread.joinable()) {
       command_thread.join();
@@ -233,6 +234,7 @@ struct shared_texture_bridge_s {
         Log(LOGGER_ERR, "shared texture export failed to duplicate handle into pid=%u", target_pid);
       }
       exporting_enabled.store(false, std::memory_order_relaxed);
+      SetSessionActive(false, "duplicate-handle-failed");
       ReleaseAllFrames();
       return GST_FLOW_OK;
     }
@@ -270,6 +272,7 @@ struct shared_texture_bridge_s {
          << (pts / GST_USECOND) << '\t' << "0x" << std::hex
          << static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(remote_handle));
     std::cout << line.str() << std::endl;
+    SetSessionActive(true, "frame-exported");
 
     const guint64 exported = exported_frames.fetch_add(1, std::memory_order_relaxed) + 1;
     if (exported <= 5 || exported % 120 == 0) {
@@ -322,6 +325,7 @@ struct shared_texture_bridge_s {
   void HandleCommand(const std::string &line) {
     if (line == "STOP") {
       exporting_enabled.store(false, std::memory_order_relaxed);
+      SetSessionActive(false, "stop-command");
       ReleaseAllFrames();
       return;
     }
@@ -408,6 +412,27 @@ struct shared_texture_bridge_s {
     if (flag.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
       Log(LOGGER_INFO, "%s", message);
     }
+  }
+
+  void SetSessionActive(bool active, const char *reason) {
+    const int next_state = active ? 1 : 0;
+    const int previous_state = session_active_state.exchange(next_state, std::memory_order_relaxed);
+    if (previous_state == next_state) {
+      return;
+    }
+
+    EmitSessionStateLine(active, reason);
+  }
+
+  void EmitSessionStateLine(bool active, const char *reason) const {
+    std::ostringstream line;
+    line << "SESSION\t" << (active ? "ACTIVE" : "INACTIVE") << '\t';
+    if (reason && reason[0]) {
+      line << reason;
+    } else {
+      line << "unspecified";
+    }
+    std::cout << line.str() << std::endl;
   }
 
   bool DescsMatch(const D3D11_TEXTURE2D_DESC &left, const D3D11_TEXTURE2D_DESC &right) const {
@@ -732,6 +757,7 @@ struct shared_texture_bridge_s {
   std::atomic<bool> exporting_enabled{true};
   std::atomic<bool> stopping{false};
   std::atomic<bool> stop_started{false};
+  std::atomic<int> session_active_state{0};
   mutable std::atomic<bool> direct_info_logged{false};
   mutable std::atomic<bool> fallback_info_logged{false};
   std::atomic<bool> duplicate_failure_logged{false};
@@ -759,6 +785,14 @@ void shared_texture_bridge_destroy(shared_texture_bridge_t *bridge) {
 
 bool shared_texture_bridge_is_active(const shared_texture_bridge_t *bridge) {
   return bridge && bridge->IsActive();
+}
+
+void shared_texture_bridge_set_session_active(shared_texture_bridge_t *bridge, bool active,
+                                              const char *reason) {
+  if (!bridge) {
+    return;
+  }
+  bridge->SetSessionActive(active, reason);
 }
 
 GstFlowReturn shared_texture_bridge_on_new_sample(shared_texture_bridge_t *bridge, GstAppSink *sink) {
@@ -792,6 +826,13 @@ void shared_texture_bridge_destroy(shared_texture_bridge_t *bridge) {
 bool shared_texture_bridge_is_active(const shared_texture_bridge_t *bridge) {
   (void) bridge;
   return false;
+}
+
+void shared_texture_bridge_set_session_active(shared_texture_bridge_t *bridge, bool active,
+                                              const char *reason) {
+  (void) bridge;
+  (void) active;
+  (void) reason;
 }
 
 GstFlowReturn shared_texture_bridge_on_new_sample(shared_texture_bridge_t *bridge, GstAppSink *sink) {

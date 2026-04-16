@@ -46,6 +46,7 @@ npm start
 - `uxplay.exe` is started with `-stpid <ElectronPID>` so decoded frames are exported from UxPlay's GStreamer renderer.
 - In `-stpid` mode, UxPlay runs export-only video output for stability; the local UxPlay video window is intentionally disabled.
 - `READY` and `FRAME\t...` records are read from UxPlay stdout. `allReferencesReleased` sends `RELEASE\t<frameId>` back to UxPlay stdin.
+- Session-state records are also read from stdout: `SESSION\tACTIVE|INACTIVE\t<reason>`.
 - If `GstD3D11Memory` cannot expose a shareable NT handle directly, UxPlay falls back to copying into a bridge-owned shareable texture before exporting it.
 
 ## PIN Control API Integration
@@ -70,3 +71,9 @@ npm start
 - The sidebar provides a `Stop Casting` button that calls `POST /api/stop`.
 - The main process exposes `uxplay-control:stop-casting` and reuses the trusted-renderer + per-session control token checks used by PIN/audio controls.
 - `uxplay-control:get-session` / status push now include `stopUpdating` so renderer button state and feedback remain authoritative.
+
+## Casting State Sync
+
+- The main process now treats `castingActive` as the authoritative casting state for the demo UI.
+- `uxplay-control:get-session` / `uxplay-control:status` include `castingActive`.
+- Renderer clears canvas to black immediately when `castingActive` becomes `false`, so the last frame is not kept on screen.
