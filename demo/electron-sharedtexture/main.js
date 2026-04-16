@@ -46,6 +46,7 @@ let stopUpdateInFlight = false;
 let castingActive = false;
 let mirrorSessionActive = false;
 let mirrorSessionIdleTimer = null;
+let autoPinRotatedForCastingSession = false;
 let frameSending = false;
 let pendingFrame = null;
 let framesReceived = 0;
@@ -249,6 +250,15 @@ function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
     return;
   }
   castingActive = normalized;
+  if (castingActive) {
+    mirrorSessionActive = true;
+    autoPinRotatedForCastingSession = false;
+    void triggerAutoPinRotationOnMirrorStart();
+  } else {
+    mirrorSessionActive = false;
+    autoPinRotatedForCastingSession = false;
+    clearMirrorSessionIdleTimer();
+  }
   if (traceSharedTexture) {
     console.log(`[shared-texture:session] castingActive=${castingActive} reason=${reason}`);
   }
@@ -756,17 +766,17 @@ async function rotatePinRandom(trigger = 'manual') {
 }
 
 async function triggerAutoPinRotationOnMirrorStart() {
-  if (mirrorSessionActive) {
+  if (autoPinRotatedForCastingSession) {
     return;
   }
-  mirrorSessionActive = true;
+  autoPinRotatedForCastingSession = true;
   try {
     const updated = await rotatePinRandom('auto');
     console.log(`[pin-control] auto rotated pin to ${updated.pin} on mirror session start`);
   } catch (error) {
     console.error(`[pin-control] auto pin rotation failed: ${error?.message || 'unknown error'}`);
     if (shouldRetryAutoPinUpdate(error)) {
-      mirrorSessionActive = false;
+      autoPinRotatedForCastingSession = false;
     }
   }
 }
@@ -1282,7 +1292,6 @@ function startBridge() {
     }
     framesReceived += 1;
     touchMirrorSessionActivity();
-    void triggerAutoPinRotationOnMirrorStart();
     if (traceSharedTexture && (framesReceived <= 5 || framesReceived % 30 === 0)) {
       traceSharedTextureStats(`recv-${frameId}`);
     }

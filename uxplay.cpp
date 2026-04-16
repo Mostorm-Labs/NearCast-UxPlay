@@ -2297,7 +2297,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.audio_set_coverart = audio_set_coverart;
     raop_cbs.audio_set_progress = audio_set_progress;
     raop_cbs.report_client_request = report_client_request;
-    raop_cbs.display_pin = display_pin;
+    raop_cbs.display_pin = 0;//display_pin;
     raop_cbs.register_client = register_client;
     raop_cbs.check_register = check_register;
     raop_cbs.passwd = passwd;
