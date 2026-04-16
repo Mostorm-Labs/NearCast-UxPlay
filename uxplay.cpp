@@ -62,6 +62,7 @@
 #include "lib/stream.h"
 #include "lib/logger.h"
 #include "lib/dnssd.h"
+#include "lib/threads.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 
@@ -104,6 +105,9 @@ static std::string audiosink = "autoaudiosink";
 static int  audiodelay = -1;
 static bool use_audio = true;
 static bool audio_renderer_initialized = false;
+static bool audio_renderer_running = false;
+static mutex_handle_t audio_control_mutex;
+static bool audio_control_mutex_initialized = false;
 #if __APPLE__
 static bool new_window_closing_behavior = false;
 #else
@@ -181,6 +185,48 @@ static guint missed_feedback_limit = MISSED_FEEDBACK_LIMIT;
 static guint missed_feedback = 0;
 static guint playbin_version = DEFAULT_PLAYBIN_VERSION;
 static bool reset_httpd = false;
+
+static bool mirror_audio_is_enabled() {
+    if (!audio_control_mutex_initialized) {
+        return use_audio;
+    }
+    bool enabled;
+    MUTEX_LOCK(audio_control_mutex);
+    enabled = use_audio;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return enabled;
+}
+
+static void mirror_audio_set_requested(bool enabled) {
+    if (!audio_control_mutex_initialized) {
+        use_audio = enabled;
+        return;
+    }
+    MUTEX_LOCK(audio_control_mutex);
+    use_audio = enabled;
+    MUTEX_UNLOCK(audio_control_mutex);
+}
+
+static bool audio_renderer_is_running() {
+    if (!audio_control_mutex_initialized) {
+        return audio_renderer_running;
+    }
+    bool running;
+    MUTEX_LOCK(audio_control_mutex);
+    running = audio_renderer_running;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return running;
+}
+
+static void audio_renderer_set_running(bool running) {
+    if (!audio_control_mutex_initialized) {
+        audio_renderer_running = running;
+        return;
+    }
+    MUTEX_LOCK(audio_control_mutex);
+    audio_renderer_running = running;
+    MUTEX_UNLOCK(audio_control_mutex);
+}
 /* logging */
 
 static void log(int level, const char* format, ...) {
@@ -1823,6 +1869,7 @@ extern "C" void conn_destroy (void *cls) {
         compression_type = 0;
         if (audio_renderer_initialized) {
             audio_renderer_stop();
+            audio_renderer_set_running(false);
         }
         if (dacpfile.length()) {
             remove (dacpfile.c_str());
@@ -1883,29 +1930,39 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
     if (dump_audio) {
         dump_audio_to_file(data->data, data->data_len, (data->data)[0] & 0xf0);
     }
-    if (use_audio) {
-        if (!remote_clock_offset) {
-            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
-            remote_clock_offset = local_time - data->ntp_time_remote;
+    if (!mirror_audio_is_enabled()) {
+        if (audio_renderer_initialized && audio_renderer_is_running()) {
+            audio_renderer_stop();
+            audio_renderer_set_running(false);
         }
-        data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
-        switch (data->ct) {
-        case 2:
-            if (audio_delay_alac) {
-                data->ntp_time_remote = (uint64_t) ((int64_t) data->ntp_time_remote + audio_delay_alac);
-            }
-            break;
-        case 4:
-        case 8:
-            if (audio_delay_aac) {
-                data->ntp_time_remote = (uint64_t) ((int64_t) data->ntp_time_remote + audio_delay_aac);
-            }
-            break;
-        default:
-            break;
-        }
-        audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
+        return;
     }
+    if (audio_renderer_initialized && !audio_renderer_is_running() && data->ct) {
+        unsigned char ct = data->ct;
+        audio_renderer_start(&ct);
+        audio_renderer_set_running(true);
+    }
+    if (!remote_clock_offset) {
+        uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+        remote_clock_offset = local_time - data->ntp_time_remote;
+    }
+    data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+    switch (data->ct) {
+    case 2:
+        if (audio_delay_alac) {
+            data->ntp_time_remote = (uint64_t) ((int64_t) data->ntp_time_remote + audio_delay_alac);
+        }
+        break;
+    case 4:
+    case 8:
+        if (audio_delay_aac) {
+            data->ntp_time_remote = (uint64_t) ((int64_t) data->ntp_time_remote + audio_delay_aac);
+        }
+        break;
+    default:
+        break;
+    }
+    audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
 }
 
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
@@ -1945,7 +2002,7 @@ extern "C" void video_resume (void *cls) {
 
 
 extern "C" void audio_flush (void *cls) {
-    if (use_audio) {
+    if (mirror_audio_is_enabled()) {
         audio_renderer_flush();
     }
 }
@@ -1961,31 +2018,31 @@ extern "C" double audio_set_client_volume(void *cls) {
 }
 
 extern "C" bool mirror_audio_get_enabled(void *cls) {
-    return use_audio;
+    return mirror_audio_is_enabled();
 }
 
 extern "C" void mirror_audio_set_enabled(void *cls, bool enabled) {
-    if (enabled == use_audio) {
+    if (enabled == mirror_audio_is_enabled()) {
         return;
     }
     if (enabled && !audio_renderer_initialized) {
         LOGW("HTTP control requested mirror-audio enable, but audio renderer is unavailable");
         return;
     }
-    if (!enabled && audio_renderer_initialized) {
-        audio_renderer_flush();
-    }
-    use_audio = enabled;
-    if (enabled && audio_renderer_initialized && compression_type && open_connections > 0) {
-        unsigned char ct = compression_type;
-        audio_renderer_start(&ct);
-    }
-    LOGI("HTTP control mirror audio %s", (use_audio ? "enabled" : "disabled"));
+    mirror_audio_set_requested(enabled);
+    /*
+     * This callback runs in the single httpd thread, which also receives the
+     * client's once-per-second /feedback requests.  Avoid GStreamer state
+     * changes here; they can occasionally block long enough for the feedback
+     * watchdog to reset an otherwise healthy session.  The RTP audio thread
+     * lazily starts the renderer when audio is enabled again.
+     */
+    LOGI("HTTP control mirror audio %s", (enabled ? "enabled" : "disabled"));
 }
 
 extern "C" void audio_set_volume (void *cls, float volume) {
     double db, db_flat, frac, gst_volume;
-    if (!use_audio) {
+    if (!mirror_audio_is_enabled()) {
       return;
     }
     /* convert from AirPlay dB  volume in range {-30dB : 0dB}, to GStreamer volume */
@@ -2049,8 +2106,9 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     }
     audio_type = type;
     
-    if (use_audio) {
+    if (mirror_audio_is_enabled()) {
       audio_renderer_start(ct);
+      audio_renderer_set_running(true);
     }
 
     if (coverart_filename.length()) {
@@ -2476,8 +2534,11 @@ int main (int argc, char *argv[]) {
 
     LOGI("UxPlay %s: An Open-Source AirPlay mirroring and audio-streaming server.", VERSION);
 
+    MUTEX_CREATE(audio_control_mutex);
+    audio_control_mutex_initialized = true;
+
     if (audiosink == "0") {
-        use_audio = false;
+        mirror_audio_set_requested(false);
         dump_audio = false;
     }
     if (dump_video) {
@@ -2628,7 +2689,7 @@ int main (int argc, char *argv[]) {
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
 
-    if (use_audio) {
+    if (mirror_audio_is_enabled()) {
       audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);
       audio_renderer_initialized = true;
     } else {
@@ -2712,6 +2773,7 @@ int main (int argc, char *argv[]) {
         }
         if (audio_renderer_initialized) {
             audio_renderer_stop();
+            audio_renderer_set_running(false);
         }
         if (use_video && (close_window || preserve_connections)) {
             video_renderer_destroy();
@@ -2741,6 +2803,7 @@ int main (int argc, char *argv[]) {
     cleanup:
     if (audio_renderer_initialized) {
         audio_renderer_destroy();
+        audio_renderer_set_running(false);
     }
     if (use_video)  {
         video_renderer_destroy();
@@ -2763,5 +2826,9 @@ int main (int argc, char *argv[]) {
     if (log_file) {
         fclose(log_file);
         log_file = NULL;
+    }
+    if (audio_control_mutex_initialized) {
+        audio_control_mutex_initialized = false;
+        MUTEX_DESTROY(audio_control_mutex);
     }
 }
