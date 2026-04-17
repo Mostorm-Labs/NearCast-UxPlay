@@ -1201,6 +1201,8 @@ function startBridge() {
     // '7',
     // '-d',
     '-pw',
+    '-nh',
+    '-fs',
     '-nohold',
     '-logfile',
     ...extraArgs,
