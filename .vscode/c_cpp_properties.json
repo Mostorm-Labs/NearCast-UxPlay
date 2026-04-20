@@ -4,7 +4,7 @@
             "name": "Win32-MSYS2",
             "includePath": [
                 "${workspaceFolder}/**",
-                "D:/msys64/mingw64/include/**"
+                "${env:MSYS2_ROOT}/mingw64/include/**"
             ],
             "defines": [
                 "_WIN32",
@@ -13,7 +13,7 @@
                 "_UNICODE"
             ],
             "windowsSdkVersion": "",
-            "compilerPath": "D:/msys64/mingw64/bin/gcc.exe",
+            "compilerPath": "${env:MSYS2_ROOT}/mingw64/bin/gcc.exe",
             "cStandard": "c11",
             "cppStandard": "c++11",
             "intelliSenseMode": "gcc-x64",

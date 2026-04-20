@@ -20,20 +20,20 @@
       "environment": [
         {
           "name": "PATH",
-          "value": "D:\\msys64\\mingw64\\bin;${env:PATH}"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\bin;${env:PATH}"
         },
         {
           "name": "GST_PLUGIN_PATH",
-          "value": "D:\\msys64\\mingw64\\lib\\gstreamer-1.0"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\lib\\gstreamer-1.0"
         },
         {
           "name": "GST_PLUGIN_SYSTEM_PATH",
-          "value": "D:\\msys64\\mingw64\\lib\\gstreamer-1.0"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\lib\\gstreamer-1.0"
         }
       ],
       "externalConsole": true,
       "MIMode": "gdb",
-      "miDebuggerPath": "D:/msys64/mingw64/bin/gdb.exe",
+      "miDebuggerPath": "${env:MSYS2_ROOT}/mingw64/bin/gdb.exe",
       "setupCommands": [
         {
           "description": "Enable pretty printing",
@@ -78,20 +78,20 @@
       "environment": [
         {
           "name": "PATH",
-          "value": "D:\\msys64\\mingw64\\bin;${env:PATH}"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\bin;${env:PATH}"
         },
         {
           "name": "GST_PLUGIN_PATH",
-          "value": "D:\\msys64\\mingw64\\lib\\gstreamer-1.0"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\lib\\gstreamer-1.0"
         },
         {
           "name": "GST_PLUGIN_SYSTEM_PATH",
-          "value": "D:\\msys64\\mingw64\\lib\\gstreamer-1.0"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\lib\\gstreamer-1.0"
         }
       ],
       "externalConsole": false,
       "MIMode": "gdb",
-      "miDebuggerPath": "D:/msys64/mingw64/bin/gdb.exe",
+      "miDebuggerPath": "${env:MSYS2_ROOT}/mingw64/bin/gdb.exe",
       "setupCommands": [
         {
           "description": "Enable pretty printing",
@@ -127,20 +127,20 @@
       "environment": [
         {
           "name": "PATH",
-          "value": "D:\\msys64\\mingw64\\bin;${env:PATH}"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\bin;${env:PATH}"
         },
         {
           "name": "GST_PLUGIN_PATH",
-          "value": "D:\\msys64\\mingw64\\lib\\gstreamer-1.0"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\lib\\gstreamer-1.0"
         },
         {
           "name": "GST_PLUGIN_SYSTEM_PATH",
-          "value": "D:\\msys64\\mingw64\\lib\\gstreamer-1.0"
+          "value": "${env:MSYS2_ROOT}\\mingw64\\lib\\gstreamer-1.0"
         }
       ],
       "externalConsole": false,
       "MIMode": "gdb",
-      "miDebuggerPath": "D:/msys64/mingw64/bin/gdb.exe",
+      "miDebuggerPath": "${env:MSYS2_ROOT}/mingw64/bin/gdb.exe",
       "setupCommands": [
         {
           "description": "Enable pretty printing",
@@ -165,7 +165,7 @@
       "program": "${workspaceFolder}/build/uxplay.exe",
       "processId": "${command:pickProcess}",
       "MIMode": "gdb",
-      "miDebuggerPath": "D:/msys64/mingw64/bin/gdb.exe",
+      "miDebuggerPath": "${env:MSYS2_ROOT}/mingw64/bin/gdb.exe",
       "setupCommands": [
         {
           "description": "Enable pretty printing",

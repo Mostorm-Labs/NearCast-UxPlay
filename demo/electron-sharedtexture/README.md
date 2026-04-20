@@ -15,7 +15,7 @@ This demo shows the smallest end-to-end path:
 - Windows
 - Electron 40.x
 - Built `UxPlay` binary, default location `..\..\build\uxplay.exe`
-- MSYS2 MinGW64 runtime/GStreamer, default location `D:\msys64\mingw64`
+- MSYS2 MinGW64 runtime/GStreamer, set `MSYS2_ROOT` (default `D:\msys64`, runtime path `${env:MSYS2_ROOT}\mingw64`)
 
 ## Run
 

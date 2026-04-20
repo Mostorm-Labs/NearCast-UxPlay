@@ -2,9 +2,22 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "Setup: configure MSYS2_ROOT",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}/.vscode/setup-msys2-root.ps1"
+      ],
+      "problemMatcher": []
+    },
+    {
       "label": "CMake: configure",
       "type": "shell",
-      "command": "D:/msys64/msys2_shell.cmd",
+      "command": "${env:MSYS2_ROOT}/msys2_shell.cmd",
       "args": [
         "-mingw64",
         "-defterm",
@@ -16,6 +29,10 @@
       "options": {
         "cwd": "${workspaceFolder}"
       },
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Setup: configure MSYS2_ROOT"
+      ],
       "problemMatcher": [],
       "group": {
         "kind": "build",
@@ -25,7 +42,7 @@
     {
       "label": "CMake: build",
       "type": "shell",
-      "command": "D:/msys64/msys2_shell.cmd",
+      "command": "${env:MSYS2_ROOT}/msys2_shell.cmd",
       "args": [
         "-mingw64",
         "-defterm",
@@ -51,7 +68,7 @@
     {
       "label": "CMake: clean",
       "type": "shell",
-      "command": "D:/msys64/msys2_shell.cmd",
+      "command": "${env:MSYS2_ROOT}/msys2_shell.cmd",
       "args": [
         "-mingw64",
         "-defterm",

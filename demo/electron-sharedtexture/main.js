@@ -18,7 +18,7 @@ const uxplayExecutable =
 const uxplayWorkdir = path.dirname(uxplayExecutable);
 const uxplayServerName =
   process.env.UXPLAY_SERVER_NAME || 'UxPlay SharedTexture';
-const msysRoot = process.env.MSYS64_ROOT || 'D:\\msys64';
+const msysRoot = process.env.MSYS2_ROOT || 'D:\\msys64';
 const gstreamerBin = path.join(msysRoot, 'mingw64', 'bin');
 const gstreamerPluginPath =
   process.env.GST_PLUGIN_PATH || path.join(uxplayWorkdir, 'lib', 'gstreamer-1.0');
