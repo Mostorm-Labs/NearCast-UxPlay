@@ -1,69 +1,111 @@
 {
-    "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "CMake: configure",
-            "type": "shell",
-            "command": "D:/msys64/msys2_shell.cmd",
-            "args": [
-                "-mingw64",
-                "-defterm",
-                "-no-start",
-                "-here",
-                "-c",
-                "cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": [],
-            "group": {
-                "kind": "build",
-                "isDefault": false
-            }
-        },
-        {
-            "label": "CMake: build",
-            "type": "shell",
-            "command": "D:/msys64/msys2_shell.cmd",
-            "args": [
-                "-mingw64",
-                "-defterm",
-                "-no-start",
-                "-here",
-                "-c",
-                "cmake --build build --config Debug -- -j 4"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": [
-                "$gcc"
-            ],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "dependsOn": [
-                "CMake: configure"
-            ]
-        },
-        {
-            "label": "CMake: clean",
-            "type": "shell",
-            "command": "D:/msys64/msys2_shell.cmd",
-            "args": [
-                "-mingw64",
-                "-defterm",
-                "-no-start",
-                "-here",
-                "-c",
-                "cmake --build build --target clean"
-            ],
-            "options": {
-                "cwd": "${workspaceFolder}"
-            },
-            "problemMatcher": []
-        }
-    ]
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "CMake: configure",
+      "type": "shell",
+      "command": "D:/msys64/msys2_shell.cmd",
+      "args": [
+        "-mingw64",
+        "-defterm",
+        "-no-start",
+        "-here",
+        "-c",
+        "cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
+    },
+    {
+      "label": "CMake: build",
+      "type": "shell",
+      "command": "D:/msys64/msys2_shell.cmd",
+      "args": [
+        "-mingw64",
+        "-defterm",
+        "-no-start",
+        "-here",
+        "-c",
+        "cmake --build build --config Debug -- -j 4"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "dependsOn": [
+        "CMake: configure"
+      ]
+    },
+    {
+      "label": "CMake: clean",
+      "type": "shell",
+      "command": "D:/msys64/msys2_shell.cmd",
+      "args": [
+        "-mingw64",
+        "-defterm",
+        "-no-start",
+        "-here",
+        "-c",
+        "cmake --build build --target clean"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Demo: build native (electron-sharedtexture)",
+      "type": "shell",
+      "command": "npm",
+      "args": [
+        "run",
+        "build:native"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/demo/electron-sharedtexture"
+      },
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
+    },
+    {
+      "label": "Demo: build all (electron-sharedtexture)",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "CMake: build",
+        "Demo: build native (electron-sharedtexture)"
+      ],
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
+    },
+    {
+      "label": "Demo: start electron (electron-sharedtexture)",
+      "type": "shell",
+      "command": "npm",
+      "args": [
+        "start"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/demo/electron-sharedtexture"
+      },
+      "problemMatcher": []
+    }
+  ]
 }
