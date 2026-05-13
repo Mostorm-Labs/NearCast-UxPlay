@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, ipcMain, safeStorage, sharedTexture } = require('electron');
+const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, safeStorage, sharedTexture } = require('electron');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -42,11 +42,16 @@ const uxplayControlTimeoutMs = Number.parseInt(process.env.UXPLAY_CONTROL_TIMEOU
 const uxplayWsPort = Number.parseInt(process.env.UXPLAY_WS_PORT || '7001', 10) || 7001;
 const uxplayWsEnabled = process.env.UXPLAY_WS_ENABLE !== '0' && process.env.UXPLAY_WS_ENABLE !== 'false';
 const mirrorSessionIdleMs = Number.parseInt(process.env.UXPLAY_MIRROR_IDLE_MS || '3000', 10) || 3000;
+const castWindowFullscreen =
+  process.env.UXPLAY_CAST_FULLSCREEN !== '0' &&
+  process.env.UXPLAY_CAST_FULLSCREEN !== 'false';
 const uxplayPinStoreFileName = 'uxplay-pin-state.json';
 const controlSessionToken = crypto.randomBytes(24).toString('hex');
 const serverPortLogPattern = /Initialized server socket\(s\) on port (\d{1,5})/;
 
 let win;
+let tray;
+let isExplicitlyQuitting = false;
 let bridge;
 let bridgeReader;
 let bridgeReady = false;
@@ -75,6 +80,11 @@ if (!app || !BrowserWindow || !sharedTexture) {
   throw new Error('Electron sharedTexture API is unavailable. Use Electron 40+ and ensure ELECTRON_RUN_AS_NODE is not set.');
 }
 
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
+
 function splitCommandLineArgs(text) {
   if (!text) {
     return [];
@@ -97,6 +107,7 @@ function broadcastControlStatus() {
   if (!win || win.isDestroyed()) {
     return;
   }
+  const castWindowState = getCastWindowState();
   win.webContents.send('uxplay-control:status', {
     ready: bridgeReady,
     port: uxplayHttpPort,
@@ -109,7 +120,9 @@ function broadcastControlStatus() {
     muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
     audioUpdating: mirrorAudioUpdateInFlight,
     stopUpdating: stopUpdateInFlight,
-    isFullscreen: win.isFullScreen(),
+    isFullscreen: castWindowState.fullscreen,
+    windowVisible: castWindowState.visible,
+    castWindowVisible: castWindowState.visible,
   });
 }
 
@@ -232,7 +245,9 @@ function touchMirrorSessionActivity() {
     clearTimeout(mirrorSessionIdleTimer);
   }
   mirrorSessionIdleTimer = setTimeout(() => {
+    mirrorSessionIdleTimer = null;
     mirrorSessionActive = false;
+    setCastingActive(false, 'mirror-idle-timeout', { clearPending: true });
   }, mirrorSessionIdleMs);
 }
 
@@ -257,27 +272,140 @@ function clearPendingMainFrame(reason = 'unspecified') {
   }
 }
 
+function getCastWindowState() {
+  return {
+    visible: Boolean(win && !win.isDestroyed() && win.isVisible()),
+    fullscreen: Boolean(win && !win.isDestroyed() && win.isFullScreen()),
+  };
+}
+
+function updateTrayMenu() {
+  if (!tray) {
+    return;
+  }
+
+  const { visible } = getCastWindowState();
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: castingActive ? '投屏中' : '等待投屏',
+      enabled: false,
+    },
+    {
+      label: visible ? '隐藏投屏窗口' : '显示投屏窗口',
+      click: () => {
+        if (visible) {
+          hideCastWindow('tray');
+        } else {
+          showCastWindow('tray');
+        }
+      },
+    },
+    {
+      type: 'separator',
+    },
+    {
+      label: '退出',
+      click: () => {
+        quitApplication();
+      },
+    },
+  ]);
+  tray.setContextMenu(contextMenu);
+  tray.setToolTip(castingActive ? `${uxplayServerName} - 投屏中` : `${uxplayServerName} - 后台运行`);
+}
+
+function createTrayIcon() {
+  const image = nativeImage.createFromDataURL(
+    'data:image/png;base64,' +
+      'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAACjSURBVFhH7ZXNCYAwDEZdwZsbdBov3t3HgzdH8gecqvIhiJTPEG2Lggk8WohNXnOwRVk5/yYmYAImQAXqpvVdPyQHdcNeVAAf5wjUDXuJAuO8HvYxoA4C+7CXKMAOPEGqZwImYAIm8G2B13/FqUMtoH2Op2W/GVaWD1E/x1pQFIGV5TXcFjhPh02A3VLitgCaSIE8O3dF1AQY2SeQGhP4u4DzGwJ201+dn0XKAAAAAElFTkSuQmCC',
+  );
+  return image.isEmpty() ? nativeImage.createFromPath(process.execPath) : image;
+}
+
+function createTray() {
+  if (tray) {
+    return;
+  }
+  tray = new Tray(createTrayIcon());
+  tray.on('double-click', () => {
+    if (win && !win.isDestroyed() && win.isVisible()) {
+      hideCastWindow('tray-double-click');
+    } else {
+      showCastWindow('tray-double-click');
+    }
+  });
+  updateTrayMenu();
+}
+
+function showCastWindow(reason = 'unspecified') {
+  if (!win || win.isDestroyed()) {
+    return;
+  }
+
+  if (castWindowFullscreen !== win.isFullScreen()) {
+    win.setFullScreen(castWindowFullscreen);
+  }
+  if (!win.isVisible()) {
+    win.show();
+  }
+  updateTrayMenu();
+  if (traceSharedTexture) {
+    console.log(`[window] cast window shown reason=${reason}`);
+  }
+}
+
+function hideCastWindow(reason = 'unspecified') {
+  if (!win || win.isDestroyed()) {
+    return;
+  }
+
+  if (win.isVisible()) {
+    win.hide();
+  }
+  if (win.isFullScreen()) {
+    win.setFullScreen(false);
+  }
+  updateTrayMenu();
+  if (traceSharedTexture) {
+    console.log(`[window] cast window hidden reason=${reason}`);
+  }
+}
+
+function quitApplication() {
+  isExplicitlyQuitting = true;
+  app.quit();
+}
+
 function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
   const normalized = nextActive === true;
-  if (options.clearPending === true) {
+  if (!normalized || options.clearPending === true) {
     clearPendingMainFrame(`casting-${reason}`);
   }
   if (castingActive === normalized) {
+    if (castingActive) {
+      showCastWindow(reason);
+      void flushFrameQueue();
+    } else {
+      hideCastWindow(reason);
+    }
     return;
   }
   castingActive = normalized;
   if (castingActive) {
     mirrorSessionActive = true;
     autoPinRotatedForCastingSession = false;
+    showCastWindow(reason);
     void triggerAutoPinRotationOnMirrorStart();
   } else {
     mirrorSessionActive = false;
     autoPinRotatedForCastingSession = false;
     clearMirrorSessionIdleTimer();
+    hideCastWindow(reason);
   }
   if (traceSharedTexture) {
     console.log(`[shared-texture:session] castingActive=${castingActive} reason=${reason}`);
   }
+  updateTrayMenu();
   broadcastControlStatus();
   if (castingActive) {
     void flushFrameQueue();
@@ -882,6 +1010,7 @@ function setupIpcHandlers() {
   ipcMain.handle('uxplay-control:get-session', (event) => {
     try {
       ensureTrustedSender(event);
+      const castWindowState = getCastWindowState();
       return {
         ok: true,
         token: controlSessionToken,
@@ -896,7 +1025,9 @@ function setupIpcHandlers() {
         muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
         audioUpdating: mirrorAudioUpdateInFlight,
         stopUpdating: stopUpdateInFlight,
-        isFullscreen: Boolean(win && !win.isDestroyed() && win.isFullScreen()),
+        isFullscreen: castWindowState.fullscreen,
+        windowVisible: castWindowState.visible,
+        castWindowVisible: castWindowState.visible,
       };
     } catch (error) {
       return {
@@ -953,9 +1084,11 @@ function setupIpcHandlers() {
   ipcMain.handle('window-control:get-state', (event) => {
     try {
       ensureTrustedSender(event);
+      const castWindowState = getCastWindowState();
       return {
         ok: true,
-        isFullscreen: Boolean(win && !win.isDestroyed() && win.isFullScreen()),
+        isFullscreen: castWindowState.fullscreen,
+        visible: castWindowState.visible,
       };
     } catch (error) {
       return {
@@ -976,6 +1109,7 @@ function setupIpcHandlers() {
       }
       const nextFullscreen = !win.isFullScreen();
       win.setFullScreen(nextFullscreen);
+      broadcastControlStatus();
       return {
         ok: true,
         isFullscreen: nextFullscreen,
@@ -998,6 +1132,7 @@ function setupIpcHandlers() {
         });
       }
       win.setFullScreen(false);
+      broadcastControlStatus();
       return {
         ok: true,
         isFullscreen: false,
@@ -1021,8 +1156,10 @@ function createWindow() {
     backgroundColor: '#000000',
     frame: false,
     autoHideMenuBar: true,
-    fullscreen: true,
+    show: false,
+    fullscreen: false,
     fullscreenable: true,
+    skipTaskbar: true,
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -1048,6 +1185,21 @@ function createWindow() {
   });
   win.on('leave-full-screen', () => {
     broadcastControlStatus();
+  });
+  win.on('show', () => {
+    updateTrayMenu();
+    broadcastControlStatus();
+  });
+  win.on('hide', () => {
+    updateTrayMenu();
+    broadcastControlStatus();
+  });
+  win.on('close', (event) => {
+    if (isExplicitlyQuitting) {
+      return;
+    }
+    event.preventDefault();
+    hideCastWindow('window-close');
   });
   win.on('closed', () => {
     win = null;
@@ -1369,30 +1521,42 @@ function startBridge() {
   });
 }
 
-app.whenReady().then(() => {
-  restorePersistedPin();
-  setupIpcHandlers();
-  createWindow();
-  broadcastControlStatus();
-  if (sendTimeoutMs > 0) {
-    console.log(`sendSharedTexture watchdog timeout: ${sendTimeoutMs}ms`);
-  } else {
-    console.log('sendSharedTexture watchdog disabled');
-  }
-
-  win.webContents.once('did-finish-load', () => {
-    startBridge();
+if (gotSingleInstanceLock) {
+  app.on('second-instance', () => {
+    if (castingActive) {
+      showCastWindow('second-instance');
+    }
   });
-});
 
-app.on('window-all-closed', () => {
-  app.quit();
-});
+  app.whenReady().then(() => {
+    restorePersistedPin();
+    setupIpcHandlers();
+    createWindow();
+    createTray();
+    broadcastControlStatus();
+    if (sendTimeoutMs > 0) {
+      console.log(`sendSharedTexture watchdog timeout: ${sendTimeoutMs}ms`);
+    } else {
+      console.log('sendSharedTexture watchdog disabled');
+    }
 
-app.on('before-quit', () => {
-  if (bridge && bridge.stdin.writable) {
-    bridge.stdin.write('STOP\n');
-  }
-  clearMirrorSessionIdleTimer();
-  setCastingActive(false, 'before-quit', { clearPending: true });
-});
+    win.webContents.once('did-finish-load', () => {
+      startBridge();
+    });
+  });
+
+  app.on('window-all-closed', () => {
+    if (isExplicitlyQuitting) {
+      app.quit();
+    }
+  });
+
+  app.on('before-quit', () => {
+    isExplicitlyQuitting = true;
+    if (bridge && bridge.stdin.writable) {
+      bridge.stdin.write('STOP\n');
+    }
+    clearMirrorSessionIdleTimer();
+    setCastingActive(false, 'before-quit', { clearPending: true });
+  });
+}
