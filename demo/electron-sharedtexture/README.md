@@ -52,7 +52,7 @@ npm start
 ## PIN Control API Integration
 
 - The sidebar shows the current PIN in a read-only field; clicking `Randomize PIN` generates and applies a new random 4-digit PIN.
-- On each successful mirroring session start (first received shared-texture frame), the demo automatically rotates to a new random PIN via `PUT /api/pin`.
+- On each successful mirroring session start (first received shared-texture frame), the demo automatically rotates to a new random PIN via the UxPlay WebSocket `setPin` operation.
 - The demo parses UxPlay logs for `Initialized server socket(s) on port <port>` (from `lib/httpd.c`) to discover the control port automatically.
 - Main process enforces permission checks (trusted renderer + per-session control token) and returns structured error codes for permission, network, upstream, and state failures.
 - On successful update, the PIN is persisted in encrypted form via Electron `safeStorage` into `app.getPath('userData')/uxplay-pin-state.json`.
@@ -61,14 +61,14 @@ npm start
 
 ## Mirror Audio Mute API Integration
 
-- The sidebar provides a `Mute` / `Unmute` toggle that calls `PUT /api/audio` with `{"enabled": false|true}`.
-- At startup, when UxPlay control port is discovered, the demo requests `GET /api/audio` to sync the current mirror-audio state.
+- The sidebar provides a `Mute` / `Unmute` toggle that calls the UxPlay WebSocket `setAudio` operation with `{"enabled": false|true}`.
+- At startup, when UxPlay control port is discovered, the demo requests the UxPlay WebSocket `getAudio` operation to sync the current mirror-audio state.
 - The main process returns `mirrorAudioEnabled`, `muted`, and `audioUpdating` in `uxplay-control:get-session` / status push so renderer state stays authoritative.
 - `uxplay-control:set-muted` uses the same trusted-renderer + control-token gate as PIN APIs.
 
 ## Stop Casting API Integration
 
-- The sidebar provides a `Stop Casting` button that calls `POST /api/stop`.
+- The sidebar provides a `Stop Casting` button that calls the UxPlay WebSocket `stop` operation.
 - The main process exposes `uxplay-control:stop-casting` and reuses the trusted-renderer + per-session control token checks used by PIN/audio controls.
 - `uxplay-control:get-session` / status push now include `stopUpdating` so renderer button state and feedback remain authoritative.
 

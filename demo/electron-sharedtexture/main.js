@@ -1,10 +1,10 @@
-const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, safeStorage, sharedTexture } = require('electron');
+const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, safeStorage, screen, sharedTexture } = require('electron');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
-const http = require('node:http');
 const path = require('node:path');
 const readline = require('node:readline');
+const WebSocket = require('ws');
 
 // 启用调试模式
 if (process.env.NODE_ENV === 'development') {
@@ -39,23 +39,43 @@ const traceSharedTexture =
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === 'true';
 const sendTimeoutMs = Number.parseInt(process.env.UXPLAY_SEND_TIMEOUT_MS || '1200', 10) || 0;
 const uxplayControlTimeoutMs = Number.parseInt(process.env.UXPLAY_CONTROL_TIMEOUT_MS || '3000', 10) || 3000;
+const uxplayWsResponseLimitBytes = 16 * 1024;
 const uxplayWsPort = Number.parseInt(process.env.UXPLAY_WS_PORT || '7001', 10) || 7001;
 const uxplayWsEnabled = process.env.UXPLAY_WS_ENABLE !== '0' && process.env.UXPLAY_WS_ENABLE !== 'false';
+const appWsEnabled = process.env.UXPLAY_APP_WS_ENABLE !== '0' && process.env.UXPLAY_APP_WS_ENABLE !== 'false';
+const appWsAllowLan =
+  process.env.UXPLAY_APP_WS_ALLOW_LAN === '1' ||
+  process.env.UXPLAY_APP_WS_ALLOW_LAN === 'true';
+const requestedAppWsHost = process.env.UXPLAY_APP_WS_HOST || '127.0.0.1';
+const appWsHost = appWsAllowLan ? requestedAppWsHost : '127.0.0.1';
+const appWsPort = Number.parseInt(process.env.UXPLAY_APP_WS_PORT || '7010', 10) || 7010;
 const mirrorSessionIdleMs = Number.parseInt(process.env.UXPLAY_MIRROR_IDLE_MS || '3000', 10) || 3000;
 const castWindowFullscreen =
   process.env.UXPLAY_CAST_FULLSCREEN !== '0' &&
   process.env.UXPLAY_CAST_FULLSCREEN !== 'false';
+const pinWindowAutoHideMs = Number.parseInt(process.env.UXPLAY_PIN_WINDOW_AUTO_HIDE_MS || '6000', 10) || 6000;
 const uxplayPinStoreFileName = 'uxplay-pin-state.json';
 const controlSessionToken = crypto.randomBytes(24).toString('hex');
+const appWsToken = process.env.UXPLAY_APP_WS_TOKEN || controlSessionToken;
 const serverPortLogPattern = /Initialized server socket\(s\) on port (\d{1,5})/;
 
 let win;
+let pinWindow;
 let tray;
 let isExplicitlyQuitting = false;
+let appReady = false;
+let appWsServer;
+const appWsClients = new Set();
+let lastError = null;
+let pinWindowAutoHideTimer = null;
 let bridge;
 let bridgeReader;
 let bridgeReady = false;
 let uxplayHttpPort = null;
+let uxplayWsRequestSequence = 0;
+let uxplayEventWs = null;
+let uxplayEventAuthenticated = false;
+let uxplayEventReconnectTimer = null;
 let uxplayStderrBuffer = '';
 let currentPin = null;
 let pinUpdateInFlight = false;
@@ -103,27 +123,151 @@ function splitCommandLineArgs(text) {
   });
 }
 
-function broadcastControlStatus() {
-  if (!win || win.isDestroyed()) {
-    return;
+function getWsUrl(host, port) {
+  if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    return null;
   }
+  return `ws://${host}:${port}/`;
+}
+
+function rememberLastError(error, fallbackCode = 'INTERNAL_ERROR') {
+  const formatted = formatControlError(error || createControlError(fallbackCode, 'unknown error'));
+  lastError = {
+    ...formatted,
+    at: new Date().toISOString(),
+  };
+  return lastError;
+}
+
+function getPinWindowState() {
+  return {
+    available: Boolean(pinWindow && !pinWindow.isDestroyed()),
+    visible: Boolean(pinWindow && !pinWindow.isDestroyed() && pinWindow.isVisible()),
+  };
+}
+
+function getFrameStats() {
+  return {
+    received: framesReceived,
+    queued: framesQueued,
+    sent: framesSent,
+    releases: frameReleases,
+    importFailures,
+    sendFailures,
+    sendTimeouts,
+    pending: Boolean(pendingFrame),
+    sending: frameSending,
+  };
+}
+
+function getAppStatus() {
   const castWindowState = getCastWindowState();
-  win.webContents.send('uxplay-control:status', {
+  const pinWindowState = getPinWindowState();
+  const uxplayWsUrl = uxplayWsEnabled ? getWsUrl('127.0.0.1', uxplayWsPort) : null;
+  const electronWsUrl = appWsEnabled ? getWsUrl(appWsHost, appWsPort) : null;
+  const muted = typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null;
+
+  return {
+    app: {
+      ready: appReady,
+      packaged: app.isPackaged,
+      name: uxplayServerName,
+    },
+    uxplay: {
+      ready: bridgeReady,
+      pid: bridge?.pid || null,
+      httpPort: uxplayHttpPort,
+      ws: {
+        enabled: uxplayWsEnabled,
+        host: uxplayWsEnabled ? '127.0.0.1' : null,
+        port: uxplayWsEnabled ? uxplayWsPort : null,
+        url: uxplayWsUrl,
+      },
+    },
+    electronWs: {
+      enabled: appWsEnabled,
+      host: appWsEnabled ? appWsHost : null,
+      port: appWsEnabled ? appWsPort : null,
+      url: electronWsUrl,
+      allowLan: appWsAllowLan,
+      connectedClients: appWsClients.size,
+      authenticatedClients: [...appWsClients].filter((client) => client.isAuthenticated).length,
+    },
+    casting: {
+      active: castingActive,
+      mirrorSessionActive,
+      frameStats: getFrameStats(),
+    },
+    pinState: {
+      value: currentPin,
+      updating: pinUpdateInFlight,
+      window: pinWindowState,
+    },
+    audio: {
+      mirrorAudioEnabled,
+      muted,
+      updating: mirrorAudioUpdateInFlight,
+    },
+    windows: {
+      cast: castWindowState,
+      pin: pinWindowState,
+    },
+    control: {
+      stopUpdating: stopUpdateInFlight,
+    },
+    error: lastError,
+
+    // Backward-compatible flat shape used by the current renderer.
     ready: bridgeReady,
     port: uxplayHttpPort,
     wsPort: uxplayWsEnabled ? uxplayWsPort : null,
-    wsUrl: uxplayWsEnabled ? `ws://127.0.0.1:${uxplayWsPort}/` : null,
+    wsUrl: uxplayWsUrl,
+    appWsPort: appWsEnabled ? appWsPort : null,
+    appWsUrl: electronWsUrl,
     castingActive,
     pin: currentPin,
     rotating: pinUpdateInFlight,
     mirrorAudioEnabled,
-    muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
+    muted,
     audioUpdating: mirrorAudioUpdateInFlight,
     stopUpdating: stopUpdateInFlight,
     isFullscreen: castWindowState.fullscreen,
     windowVisible: castWindowState.visible,
     castWindowVisible: castWindowState.visible,
-  });
+    pinWindowVisible: pinWindowState.visible,
+  };
+}
+
+function sendJsonToWebSocket(ws, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  ws.send(JSON.stringify(payload));
+  return true;
+}
+
+function broadcastAppEvent(op, data = {}) {
+  const payload = {
+    type: 'event',
+    op,
+    data,
+  };
+  for (const client of appWsClients) {
+    if (client.isAuthenticated) {
+      sendJsonToWebSocket(client, payload);
+    }
+  }
+}
+
+function broadcastControlStatus() {
+  const status = getAppStatus();
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('uxplay-control:status', status);
+  }
+  if (pinWindow && !pinWindow.isDestroyed()) {
+    pinWindow.webContents.send('uxplay-control:status', status);
+  }
+  broadcastAppEvent('status.changed', status);
 }
 
 function createControlError(code, message, extras = {}) {
@@ -159,7 +303,11 @@ function updateHttpPortFromLogLine(line) {
     const changed = uxplayHttpPort !== parsedPort;
     uxplayHttpPort = parsedPort;
     if (changed) {
+      broadcastAppEvent('control.portChanged', {
+        port: uxplayHttpPort,
+      });
       broadcastControlStatus();
+      scheduleUxplayEventWebSocketReconnect('port-ready', 0);
       void triggerAutoPinRotationOnPortReady();
       void refreshMirrorAudioStateFromUxPlay('port-ready');
     }
@@ -186,6 +334,14 @@ function normalizePinInput(rawPin) {
     );
   }
   return pin;
+}
+
+function normalizeOptionalPin(rawPin) {
+  if (typeof rawPin === 'undefined' || rawPin === null) {
+    return null;
+  }
+  const pin = typeof rawPin === 'number' ? String(rawPin).padStart(4, '0') : String(rawPin).trim();
+  return /^\d{4}$/.test(pin) ? pin : null;
 }
 
 function extractMirrorAudioEnabled(responseBody) {
@@ -223,9 +379,19 @@ function generateRandomPin(excludePin = null) {
   return String(crypto.randomInt(0, 10000)).padStart(4, '0');
 }
 
-function ensureControlPortReady() {
-  if (!Number.isInteger(uxplayHttpPort) || uxplayHttpPort <= 0 || uxplayHttpPort > 65535) {
-    throw createControlError('HTTP_PORT_UNAVAILABLE', 'UxPlay HTTP control port is not ready yet.', {
+function ensureUxplayWebSocketReady() {
+  if (!uxplayWsEnabled) {
+    throw createControlError('UXPLAY_WS_DISABLED', 'UxPlay WebSocket control is disabled.', {
+      httpStatus: 503,
+    });
+  }
+  if (!Number.isInteger(uxplayWsPort) || uxplayWsPort <= 0 || uxplayWsPort > 65535) {
+    throw createControlError('UXPLAY_WS_PORT_UNAVAILABLE', 'UxPlay WebSocket control port is not configured.', {
+      httpStatus: 503,
+    });
+  }
+  if (!bridge) {
+    throw createControlError('UXPLAY_UNAVAILABLE', 'UxPlay process is not running.', {
       httpStatus: 503,
     });
   }
@@ -233,7 +399,9 @@ function ensureControlPortReady() {
 
 function shouldRetryAutoPinUpdate(error) {
   return (
-    error?.code === 'HTTP_PORT_UNAVAILABLE' ||
+    error?.code === 'UXPLAY_WS_DISABLED' ||
+    error?.code === 'UXPLAY_WS_PORT_UNAVAILABLE' ||
+    error?.code === 'UXPLAY_UNAVAILABLE' ||
     error?.code === 'UPSTREAM_TIMEOUT' ||
     error?.code === 'UPSTREAM_UNREACHABLE' ||
     error?.code === 'UPSTREAM_REJECTED'
@@ -245,9 +413,7 @@ function touchMirrorSessionActivity() {
     clearTimeout(mirrorSessionIdleTimer);
   }
   mirrorSessionIdleTimer = setTimeout(() => {
-    mirrorSessionIdleTimer = null;
     mirrorSessionActive = false;
-    setCastingActive(false, 'mirror-idle-timeout', { clearPending: true });
   }, mirrorSessionIdleMs);
 }
 
@@ -348,6 +514,12 @@ function showCastWindow(reason = 'unspecified') {
   if (!win.isVisible()) {
     win.show();
   }
+  broadcastAppEvent('window.changed', {
+    window: 'cast',
+    action: 'show',
+    reason,
+    state: getCastWindowState(),
+  });
   updateTrayMenu();
   if (traceSharedTexture) {
     console.log(`[window] cast window shown reason=${reason}`);
@@ -365,10 +537,152 @@ function hideCastWindow(reason = 'unspecified') {
   if (win.isFullScreen()) {
     win.setFullScreen(false);
   }
+  broadcastAppEvent('window.changed', {
+    window: 'cast',
+    action: 'hide',
+    reason,
+    state: getCastWindowState(),
+  });
   updateTrayMenu();
   if (traceSharedTexture) {
     console.log(`[window] cast window hidden reason=${reason}`);
   }
+}
+
+function clearPinWindowAutoHideTimer() {
+  if (!pinWindowAutoHideTimer) {
+    return;
+  }
+  clearTimeout(pinWindowAutoHideTimer);
+  pinWindowAutoHideTimer = null;
+}
+
+function positionPinWindow(targetWindow) {
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return;
+  }
+  const display = screen.getPrimaryDisplay();
+  const workArea = display.workArea || display.bounds;
+  const [windowWidth, windowHeight] = targetWindow.getSize();
+  targetWindow.setPosition(
+    Math.round(workArea.x + (workArea.width - windowWidth) / 2),
+    Math.round(workArea.y + 24),
+    false,
+  );
+}
+
+function schedulePinWindowAutoHide(reason = 'timeout') {
+  clearPinWindowAutoHideTimer();
+  if (!Number.isInteger(pinWindowAutoHideMs) || pinWindowAutoHideMs <= 0) {
+    return;
+  }
+  pinWindowAutoHideTimer = setTimeout(() => {
+    pinWindowAutoHideTimer = null;
+    hidePinWindow(reason);
+  }, pinWindowAutoHideMs);
+}
+
+function createPinWindow() {
+  if (pinWindow && !pinWindow.isDestroyed()) {
+    return pinWindow;
+  }
+
+  pinWindow = new BrowserWindow({
+    width: 260,
+    height: 70,
+    minWidth: 260,
+    minHeight: 70,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    autoHideMenuBar: true,
+    focusable: false,
+    show: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+    },
+  });
+
+  pinWindow.removeMenu();
+  pinWindow.setMenuBarVisibility(false);
+  pinWindow.setAlwaysOnTop(true, 'screen-saver');
+  pinWindow.setIgnoreMouseEvents(true, { forward: true });
+  pinWindow.loadFile(path.join(__dirname, 'pin.html'));
+  pinWindow.webContents.once('did-finish-load', () => {
+    pinWindow.webContents.send('uxplay-control:status', getAppStatus());
+  });
+  pinWindow.on('show', () => {
+    broadcastAppEvent('window.changed', {
+      window: 'pin',
+      action: 'show',
+      state: getPinWindowState(),
+    });
+    broadcastControlStatus();
+  });
+  pinWindow.on('hide', () => {
+    broadcastAppEvent('window.changed', {
+      window: 'pin',
+      action: 'hide',
+      state: getPinWindowState(),
+    });
+    broadcastAppEvent('pin.hidden', {
+      pin: currentPin,
+    });
+    clearPinWindowAutoHideTimer();
+    broadcastControlStatus();
+  });
+  pinWindow.on('close', (event) => {
+    if (isExplicitlyQuitting) {
+      return;
+    }
+    event.preventDefault();
+    hidePinWindow('window-close');
+  });
+  pinWindow.on('closed', () => {
+    clearPinWindowAutoHideTimer();
+    pinWindow = null;
+    broadcastControlStatus();
+  });
+
+  return pinWindow;
+}
+
+function showPinWindow(reason = 'unspecified') {
+  const targetWindow = createPinWindow();
+  if (!targetWindow || targetWindow.isDestroyed()) {
+    return;
+  }
+
+  positionPinWindow(targetWindow);
+  if (!targetWindow.isVisible()) {
+    targetWindow.showInactive();
+  }
+  targetWindow.webContents.send('uxplay-control:status', getAppStatus());
+  schedulePinWindowAutoHide('pin-auto-hide');
+  broadcastAppEvent('pin.required', {
+    pin: currentPin,
+    reason,
+  });
+  broadcastControlStatus();
+}
+
+function hidePinWindow(reason = 'unspecified') {
+  if (!pinWindow || pinWindow.isDestroyed()) {
+    return;
+  }
+  clearPinWindowAutoHideTimer();
+  if (!pinWindow.isVisible()) {
+    return;
+  }
+  pinWindow.hide();
+  broadcastControlStatus();
 }
 
 function quitApplication() {
@@ -394,13 +708,34 @@ function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
   if (castingActive) {
     mirrorSessionActive = true;
     autoPinRotatedForCastingSession = false;
+    if (pinWindow && !pinWindow.isDestroyed() && pinWindow.isVisible()) {
+      broadcastAppEvent('pin.accepted', {
+        pin: currentPin,
+        reason,
+      });
+      hidePinWindow('casting-started');
+    }
     showCastWindow(reason);
+    broadcastAppEvent('casting.started', {
+      reason,
+      status: getAppStatus(),
+    });
+    broadcastAppEvent('mirrorStarted', {
+      reason,
+    });
     void triggerAutoPinRotationOnMirrorStart();
   } else {
     mirrorSessionActive = false;
     autoPinRotatedForCastingSession = false;
     clearMirrorSessionIdleTimer();
     hideCastWindow(reason);
+    broadcastAppEvent('casting.stopped', {
+      reason,
+      status: getAppStatus(),
+    });
+    broadcastAppEvent('mirrorStopped', {
+      reason,
+    });
   }
   if (traceSharedTexture) {
     console.log(`[shared-texture:session] castingActive=${castingActive} reason=${reason}`);
@@ -429,367 +764,446 @@ function ensureControlToken(token) {
   }
 }
 
-function requestUxplayPinUpdate(port, pin) {
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function nextUxplayWsRequestId(op) {
+  uxplayWsRequestSequence += 1;
+  return `uxplay-${process.pid}-${Date.now()}-${uxplayWsRequestSequence}-${op}`;
+}
+
+function makeUxplayWsRejectError(response, op) {
+  const upstreamError = response?.error || 'UPSTREAM_REJECTED';
+  const message =
+    response?.data?.message ||
+    response?.data?.error?.message ||
+    `UxPlay WebSocket ${op} request failed: ${upstreamError}.`;
+  return createControlError('UPSTREAM_REJECTED', message, {
+    httpStatus: 502,
+    details: {
+      upstreamError,
+      op,
+    },
+  });
+}
+
+function requestUxplayWebSocketOnce(op, data = {}, fallbackMessage = 'ok', timeoutMs = uxplayControlTimeoutMs) {
+  ensureUxplayWebSocketReady();
+  const url = getWsUrl('127.0.0.1', uxplayWsPort);
+  const authId = nextUxplayWsRequestId('auth');
+  const requestId = nextUxplayWsRequestId(op);
+
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ pin });
-    const req = http.request(
-      {
-        host: '127.0.0.1',
-        port,
-        path: '/api/pin',
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
+    let ws = null;
+    let settled = false;
+    let authenticated = false;
+    let timeout = null;
+
+    const cleanup = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (ws) {
+        ws.removeAllListeners();
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      }
+    };
+
+    const finish = (callback, value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+
+    const fail = (error) => {
+      finish(reject, error);
+    };
+
+    const sendRequest = (payload) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        fail(
+          createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay WebSocket control endpoint.', {
+            httpStatus: 502,
+          }),
+        );
+        return;
+      }
+      ws.send(JSON.stringify(payload), (error) => {
+        if (error) {
+          fail(
+            createControlError('UPSTREAM_UNREACHABLE', 'Unable to send UxPlay WebSocket control request.', {
+              httpStatus: 502,
+              details: {
+                cause: error.message,
+              },
+            }),
+          );
+        }
+      });
+    };
+
+    timeout = setTimeout(() => {
+      fail(
+        createControlError('UPSTREAM_TIMEOUT', `UxPlay WebSocket ${op} request timed out.`, {
+          httpStatus: 504,
+          details: {
+            op,
+          },
+        }),
+      );
+    }, Math.max(1, timeoutMs));
+
+    ws = new WebSocket(url, {
+      handshakeTimeout: Math.max(1, timeoutMs),
+      maxPayload: uxplayWsResponseLimitBytes,
+    });
+
+    ws.on('open', () => {
+      sendRequest({
+        type: 'request',
+        id: authId,
+        op: 'auth',
+        data: {
+          token: controlSessionToken,
         },
-        timeout: uxplayControlTimeoutMs,
-      },
-      (res) => {
-        const chunks = [];
-        let totalLength = 0;
-        res.on('data', (chunk) => {
-          totalLength += chunk.length;
-          if (totalLength > 16384) {
-            req.destroy(
-              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
-                httpStatus: 502,
-              }),
-            );
-            return;
-          }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8').trim();
-          let json = null;
-          if (text) {
-            try {
-              json = JSON.parse(text);
-            } catch {
-              json = null;
-            }
-          }
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({
-              statusCode: res.statusCode,
-              body: json || { message: text || 'pin updated' },
-            });
-            return;
-          }
-
-          const errorMessage =
-            json?.message ||
-            text ||
-            `UxPlay pin update failed with HTTP ${res.statusCode || 'unknown'}.`;
-          reject(
-            createControlError('UPSTREAM_REJECTED', errorMessage, {
-              httpStatus: 502,
-              details: {
-                upstreamStatusCode: res.statusCode || 0,
-              },
-            }),
-          );
-        });
-      },
-    );
-
-    req.on('timeout', () => {
-      req.destroy(
-        createControlError('UPSTREAM_TIMEOUT', 'UxPlay pin update request timed out.', {
-          httpStatus: 504,
-        }),
-      );
+      });
     });
-    req.on('error', (error) => {
-      if (
-        error?.code === 'UPSTREAM_TIMEOUT' ||
-        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
-        error?.code === 'UPSTREAM_REJECTED'
-      ) {
-        reject(error);
+
+    ws.on('message', (rawMessage) => {
+      const rawLength = Buffer.isBuffer(rawMessage)
+        ? rawMessage.length
+        : Buffer.byteLength(String(rawMessage));
+      if (rawLength > uxplayWsResponseLimitBytes) {
+        fail(
+          createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay WebSocket response is too large.', {
+            httpStatus: 502,
+          }),
+        );
         return;
       }
-      reject(
-        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
+
+      let response;
+      try {
+        response = JSON.parse(rawMessage.toString('utf8'));
+      } catch {
+        fail(
+          createControlError('UPSTREAM_INVALID_RESPONSE', 'UxPlay WebSocket response is not valid JSON.', {
+            httpStatus: 502,
+            details: {
+              op,
+            },
+          }),
+        );
+        return;
+      }
+
+      if (!response || response.type !== 'response') {
+        return;
+      }
+
+      if (response.id === authId) {
+        if (!response.ok) {
+          fail(makeUxplayWsRejectError(response, 'auth'));
+          return;
+        }
+        authenticated = true;
+        sendRequest({
+          type: 'request',
+          id: requestId,
+          op,
+          data,
+        });
+        return;
+      }
+
+      if (response.id !== requestId) {
+        return;
+      }
+
+      if (!response.ok) {
+        fail(makeUxplayWsRejectError(response, op));
+        return;
+      }
+
+      finish(resolve, {
+        statusCode: 200,
+        body: response.data && typeof response.data === 'object'
+          ? response.data
+          : { message: fallbackMessage },
+      });
+    });
+
+    ws.on('error', (error) => {
+      fail(
+        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay WebSocket control endpoint.', {
           httpStatus: 502,
           details: {
             cause: error?.message || 'connection error',
+            op,
           },
         }),
       );
     });
-    req.write(body);
-    req.end();
+
+    ws.on('close', (code, reason) => {
+      if (settled) {
+        return;
+      }
+      fail(
+        createControlError(
+          authenticated ? 'UPSTREAM_REJECTED' : 'UPSTREAM_UNREACHABLE',
+          'UxPlay WebSocket control endpoint closed before responding.',
+          {
+            httpStatus: 502,
+            details: {
+              closeCode: code,
+              closeReason: reason?.toString('utf8') || '',
+              op,
+            },
+          },
+        ),
+      );
+    });
   });
 }
 
-function requestUxplayAudioUpdate(port, enabled) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ enabled });
-    const req = http.request(
-      {
-        host: '127.0.0.1',
-        port,
-        path: '/api/audio',
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(body),
-        },
-        timeout: uxplayControlTimeoutMs,
-      },
-      (res) => {
-        const chunks = [];
-        let totalLength = 0;
-        res.on('data', (chunk) => {
-          totalLength += chunk.length;
-          if (totalLength > 16384) {
-            req.destroy(
-              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
-                httpStatus: 502,
-              }),
-            );
-            return;
-          }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8').trim();
-          let json = null;
-          if (text) {
-            try {
-              json = JSON.parse(text);
-            } catch {
-              json = null;
-            }
-          }
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({
-              statusCode: res.statusCode,
-              body: json || { message: text || 'mirror audio updated' },
-            });
-            return;
-          }
+async function requestUxplayWebSocket(op, data = {}, fallbackMessage = 'ok') {
+  ensureUxplayWebSocketReady();
+  const deadline = Date.now() + uxplayControlTimeoutMs;
+  let lastError = null;
 
-          const errorMessage =
-            json?.message ||
-            text ||
-            `UxPlay mirror audio update failed with HTTP ${res.statusCode || 'unknown'}.`;
-          reject(
-            createControlError('UPSTREAM_REJECTED', errorMessage, {
-              httpStatus: 502,
-              details: {
-                upstreamStatusCode: res.statusCode || 0,
-              },
-            }),
-          );
-        });
-      },
-    );
-
-    req.on('timeout', () => {
-      req.destroy(
-        createControlError('UPSTREAM_TIMEOUT', 'UxPlay mirror audio update request timed out.', {
-          httpStatus: 504,
-        }),
-      );
-    });
-    req.on('error', (error) => {
-      if (
-        error?.code === 'UPSTREAM_TIMEOUT' ||
-        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
-        error?.code === 'UPSTREAM_REJECTED'
-      ) {
-        reject(error);
-        return;
+  do {
+    const remainingMs = Math.max(1, deadline - Date.now());
+    try {
+      return await requestUxplayWebSocketOnce(op, data, fallbackMessage, remainingMs);
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== 'UPSTREAM_UNREACHABLE' || Date.now() >= deadline) {
+        throw error;
       }
-      reject(
-        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
-          httpStatus: 502,
-          details: {
-            cause: error?.message || 'connection error',
-          },
-        }),
-      );
-    });
-    req.write(body);
-    req.end();
+      await delay(Math.min(100, Math.max(1, deadline - Date.now())));
+    }
+  } while (Date.now() < deadline);
+
+  throw lastError || createControlError('UPSTREAM_TIMEOUT', `UxPlay WebSocket ${op} request timed out.`, {
+    httpStatus: 504,
+    details: {
+      op,
+    },
   });
 }
 
-function requestUxplayAudioStatus(port) {
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        host: '127.0.0.1',
-        port,
-        path: '/api/audio',
-        method: 'GET',
-        timeout: uxplayControlTimeoutMs,
-      },
-      (res) => {
-        const chunks = [];
-        let totalLength = 0;
-        res.on('data', (chunk) => {
-          totalLength += chunk.length;
-          if (totalLength > 16384) {
-            req.destroy(
-              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
-                httpStatus: 502,
-              }),
-            );
-            return;
-          }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8').trim();
-          let json = null;
-          if (text) {
-            try {
-              json = JSON.parse(text);
-            } catch {
-              json = null;
-            }
-          }
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({
-              statusCode: res.statusCode,
-              body: json || { message: text || 'mirror audio status' },
-            });
-            return;
-          }
-
-          const errorMessage =
-            json?.message ||
-            text ||
-            `UxPlay mirror audio status failed with HTTP ${res.statusCode || 'unknown'}.`;
-          reject(
-            createControlError('UPSTREAM_REJECTED', errorMessage, {
-              httpStatus: 502,
-              details: {
-                upstreamStatusCode: res.statusCode || 0,
-              },
-            }),
-          );
-        });
-      },
-    );
-
-    req.on('timeout', () => {
-      req.destroy(
-        createControlError('UPSTREAM_TIMEOUT', 'UxPlay mirror audio status request timed out.', {
-          httpStatus: 504,
-        }),
-      );
-    });
-    req.on('error', (error) => {
-      if (
-        error?.code === 'UPSTREAM_TIMEOUT' ||
-        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
-        error?.code === 'UPSTREAM_REJECTED'
-      ) {
-        reject(error);
-        return;
-      }
-      reject(
-        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
-          httpStatus: 502,
-          details: {
-            cause: error?.message || 'connection error',
-          },
-        }),
-      );
-    });
-    req.end();
-  });
+function requestUxplayPinUpdate(pin) {
+  return requestUxplayWebSocket('setPin', { pin }, 'pin updated');
 }
 
-function requestUxplayStop(port) {
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        host: '127.0.0.1',
-        port,
-        path: '/api/stop',
-        method: 'POST',
-        timeout: uxplayControlTimeoutMs,
-      },
-      (res) => {
-        const chunks = [];
-        let totalLength = 0;
-        res.on('data', (chunk) => {
-          totalLength += chunk.length;
-          if (totalLength > 16384) {
-            req.destroy(
-              createControlError('UPSTREAM_RESPONSE_TOO_LARGE', 'UxPlay response is too large.', {
-                httpStatus: 502,
-              }),
-            );
-            return;
-          }
-          chunks.push(chunk);
-        });
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8').trim();
-          let json = null;
-          if (text) {
-            try {
-              json = JSON.parse(text);
-            } catch {
-              json = null;
-            }
-          }
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({
-              statusCode: res.statusCode,
-              body: json || { message: text || 'casting stopped' },
-            });
-            return;
-          }
+function requestUxplayAudioUpdate(enabled) {
+  return requestUxplayWebSocket('setAudio', { enabled }, 'mirror audio updated');
+}
 
-          const errorMessage =
-            json?.message ||
-            text ||
-            `UxPlay stop request failed with HTTP ${res.statusCode || 'unknown'}.`;
-          reject(
-            createControlError('UPSTREAM_REJECTED', errorMessage, {
-              httpStatus: 502,
-              details: {
-                upstreamStatusCode: res.statusCode || 0,
-              },
-            }),
-          );
-        });
-      },
-    );
+function requestUxplayAudioStatus() {
+  return requestUxplayWebSocket('getAudio', {}, 'mirror audio status');
+}
 
-    req.on('timeout', () => {
-      req.destroy(
-        createControlError('UPSTREAM_TIMEOUT', 'UxPlay stop request timed out.', {
-          httpStatus: 504,
-        }),
-      );
-    });
-    req.on('error', (error) => {
-      if (
-        error?.code === 'UPSTREAM_TIMEOUT' ||
-        error?.code === 'UPSTREAM_RESPONSE_TOO_LARGE' ||
-        error?.code === 'UPSTREAM_REJECTED'
-      ) {
-        reject(error);
-        return;
+function requestUxplayStop() {
+  return requestUxplayWebSocket('stop', {}, 'casting stopped');
+}
+
+function updateCurrentPinFromUxplayEvent(rawPin, source) {
+  const pin = normalizeOptionalPin(rawPin);
+  if (!pin) {
+    return null;
+  }
+  if (currentPin === pin) {
+    return pin;
+  }
+  currentPin = pin;
+  broadcastAppEvent('pin.changed', {
+    port: uxplayHttpPort,
+    pin,
+    source,
+  });
+  broadcastAppEvent('pinChanged', {
+    pin,
+  });
+  broadcastControlStatus();
+  return pin;
+}
+
+function handleUxplayControlEvent(op, data = {}) {
+  switch (op) {
+    case 'pinRequired': {
+      const pin = updateCurrentPinFromUxplayEvent(data?.pin, 'uxplay-pin-required');
+      showPinWindow('uxplay-pin-required');
+      broadcastAppEvent('pinRequired', {
+        pin: pin || currentPin,
+        reason: 'uxplay-event',
+      });
+      return;
+    }
+
+    case 'pinChanged':
+      updateCurrentPinFromUxplayEvent(data?.pin, 'uxplay-pin-changed');
+      return;
+
+    case 'audioChanged':
+      if (typeof data?.mirrorAudio === 'boolean' && mirrorAudioEnabled !== data.mirrorAudio) {
+        mirrorAudioEnabled = data.mirrorAudio;
+        broadcastAppEvent('audio.changed', {
+          mirrorAudioEnabled,
+          muted: !mirrorAudioEnabled,
+          source: 'uxplay-event',
+        });
+        broadcastControlStatus();
       }
-      reject(
-        createControlError('UPSTREAM_UNREACHABLE', 'Unable to reach UxPlay control endpoint.', {
-          httpStatus: 502,
-          details: {
-            cause: error?.message || 'connection error',
-          },
-        }),
-      );
+      return;
+
+    default:
+      return;
+  }
+}
+
+function closeUxplayEventWebSocket(reason = 'unspecified') {
+  if (uxplayEventReconnectTimer) {
+    clearTimeout(uxplayEventReconnectTimer);
+    uxplayEventReconnectTimer = null;
+  }
+
+  const ws = uxplayEventWs;
+  uxplayEventWs = null;
+  uxplayEventAuthenticated = false;
+  if (!ws) {
+    return;
+  }
+  ws.removeAllListeners();
+  try {
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close(1000, reason);
+    }
+  } catch {
+    try {
+      ws.terminate();
+    } catch {
+      // Ignore shutdown races.
+    }
+  }
+}
+
+function scheduleUxplayEventWebSocketReconnect(reason = 'unspecified', delayMs = 1000) {
+  if (!uxplayWsEnabled || !bridge || uxplayEventReconnectTimer) {
+    return;
+  }
+  if (
+    uxplayEventWs &&
+    (uxplayEventWs.readyState === WebSocket.OPEN || uxplayEventWs.readyState === WebSocket.CONNECTING)
+  ) {
+    return;
+  }
+  uxplayEventReconnectTimer = setTimeout(() => {
+    uxplayEventReconnectTimer = null;
+    connectUxplayEventWebSocket(reason);
+  }, Math.max(0, delayMs));
+}
+
+function handleUxplayEventSocketMessage(ws, rawMessage, authId) {
+  const rawLength = Buffer.isBuffer(rawMessage)
+    ? rawMessage.length
+    : Buffer.byteLength(String(rawMessage));
+  if (rawLength > uxplayWsResponseLimitBytes) {
+    ws.close(1009, 'message too large');
+    return;
+  }
+
+  let message;
+  try {
+    message = JSON.parse(rawMessage.toString('utf8'));
+  } catch {
+    return;
+  }
+
+  if (!message || typeof message !== 'object') {
+    return;
+  }
+
+  if (message.type === 'response' && message.id === authId) {
+    if (!message.ok) {
+      console.warn('[uxplay-ws-events] authentication failed');
+      ws.close(1008, 'auth failed');
+      return;
+    }
+    uxplayEventAuthenticated = true;
+    return;
+  }
+
+  if (message.type !== 'event' || typeof message.op !== 'string') {
+    return;
+  }
+
+  handleUxplayControlEvent(
+    message.op,
+    message.data && typeof message.data === 'object' ? message.data : {},
+  );
+}
+
+function connectUxplayEventWebSocket(reason = 'manual') {
+  if (!uxplayWsEnabled || !bridge) {
+    return;
+  }
+  if (
+    uxplayEventWs &&
+    (uxplayEventWs.readyState === WebSocket.OPEN || uxplayEventWs.readyState === WebSocket.CONNECTING)
+  ) {
+    return;
+  }
+
+  const url = getWsUrl('127.0.0.1', uxplayWsPort);
+  if (!url) {
+    return;
+  }
+
+  const authId = nextUxplayWsRequestId('event-auth');
+  const ws = new WebSocket(url, {
+    handshakeTimeout: uxplayControlTimeoutMs,
+    maxPayload: uxplayWsResponseLimitBytes,
+  });
+  uxplayEventWs = ws;
+  uxplayEventAuthenticated = false;
+
+  ws.on('open', () => {
+    sendJsonToWebSocket(ws, {
+      type: 'request',
+      id: authId,
+      op: 'auth',
+      data: {
+        token: controlSessionToken,
+      },
     });
-    req.end();
+  });
+
+  ws.on('message', (rawMessage) => {
+    handleUxplayEventSocketMessage(ws, rawMessage, authId);
+  });
+
+  ws.on('error', (error) => {
+    if (uxplayEventWs === ws && traceSharedTexture) {
+      console.log(`[uxplay-ws-events] connection error (${reason}): ${error?.message || 'unknown error'}`);
+    }
+  });
+
+  ws.on('close', () => {
+    if (uxplayEventWs === ws) {
+      uxplayEventWs = null;
+      uxplayEventAuthenticated = false;
+      scheduleUxplayEventWebSocketReconnect('event-socket-closed', 1000);
+    }
   });
 }
 
@@ -807,6 +1221,7 @@ function persistEncryptedPin(pin, port) {
     encryptedBy: 'electron.safeStorage',
     updatedAt: new Date().toISOString(),
     httpPort: port,
+    wsPort: uxplayWsEnabled ? uxplayWsPort : null,
     ciphertext: encryptedPin.toString('base64'),
   };
   fs.writeFileSync(getPinStorePath(), `${JSON.stringify(state, null, 2)}\n`, 'utf8');
@@ -836,10 +1251,17 @@ function restorePersistedPin() {
 }
 
 async function applyPinUpdate(pin) {
-  ensureControlPortReady();
-  const upstream = await requestUxplayPinUpdate(uxplayHttpPort, pin);
+  ensureUxplayWebSocketReady();
+  const upstream = await requestUxplayPinUpdate(pin);
   persistEncryptedPin(pin, uxplayHttpPort);
   currentPin = pin;
+  broadcastAppEvent('pin.changed', {
+    port: uxplayHttpPort,
+    pin,
+  });
+  broadcastAppEvent('pinChanged', {
+    pin,
+  });
   broadcastControlStatus();
   return {
     port: uxplayHttpPort,
@@ -850,8 +1272,8 @@ async function applyPinUpdate(pin) {
 
 async function refreshMirrorAudioStateFromUxPlay(trigger = 'manual') {
   try {
-    ensureControlPortReady();
-    const upstream = await requestUxplayAudioStatus(uxplayHttpPort);
+    ensureUxplayWebSocketReady();
+    const upstream = await requestUxplayAudioStatus();
     const enabled = extractMirrorAudioEnabled(upstream.body);
     if (typeof enabled === 'boolean') {
       mirrorAudioEnabled = enabled;
@@ -871,10 +1293,17 @@ async function applyMirrorAudioEnabled(enabled) {
   mirrorAudioUpdateInFlight = true;
   broadcastControlStatus();
   try {
-    ensureControlPortReady();
-    const upstream = await requestUxplayAudioUpdate(uxplayHttpPort, enabled);
+    ensureUxplayWebSocketReady();
+    const upstream = await requestUxplayAudioUpdate(enabled);
     const applied = extractMirrorAudioEnabled(upstream.body);
     mirrorAudioEnabled = typeof applied === 'boolean' ? applied : enabled;
+    broadcastAppEvent('audio.changed', {
+      mirrorAudioEnabled,
+      muted: !mirrorAudioEnabled,
+    });
+    broadcastAppEvent('audioChanged', {
+      mirrorAudio: mirrorAudioEnabled,
+    });
     broadcastControlStatus();
     return {
       port: uxplayHttpPort,
@@ -978,9 +1407,7 @@ async function handleSetMutedRequest(event, payload) {
   };
 }
 
-async function handleStopCastingRequest(event, payload) {
-  ensureTrustedSender(event);
-  ensureControlToken(payload?.token);
+async function performStopCasting() {
   if (stopUpdateInFlight) {
     throw createControlError('STOP_UPDATE_BUSY', 'Stop casting request already in progress.', {
       httpStatus: 409,
@@ -990,11 +1417,11 @@ async function handleStopCastingRequest(event, payload) {
   stopUpdateInFlight = true;
   broadcastControlStatus();
   try {
-    ensureControlPortReady();
-    const upstream = await requestUxplayStop(uxplayHttpPort);
+    ensureUxplayWebSocketReady();
+    const upstream = await requestUxplayStop();
     mirrorSessionActive = false;
     clearMirrorSessionIdleTimer();
-    setCastingActive(false, 'http-stop-success', { clearPending: true });
+    setCastingActive(false, 'ws-stop-success', { clearPending: true });
     return {
       ok: true,
       port: uxplayHttpPort,
@@ -1006,28 +1433,321 @@ async function handleStopCastingRequest(event, payload) {
   }
 }
 
+async function handleStopCastingRequest(event, payload) {
+  ensureTrustedSender(event);
+  ensureControlToken(payload?.token);
+  return performStopCasting();
+}
+
+function setCastWindowFullscreen(nextFullscreen, reason = 'manual') {
+  if (!win || win.isDestroyed()) {
+    throw createControlError('WINDOW_UNAVAILABLE', 'Application window is not available.', {
+      httpStatus: 503,
+    });
+  }
+  if (typeof nextFullscreen !== 'boolean') {
+    throw createControlError('INVALID_FULLSCREEN_VALUE', 'Fullscreen must be a boolean value.', {
+      httpStatus: 400,
+    });
+  }
+  win.setFullScreen(nextFullscreen);
+  broadcastAppEvent('window.changed', {
+    window: 'cast',
+    action: 'fullscreen',
+    reason,
+    state: getCastWindowState(),
+  });
+  broadcastControlStatus();
+  return {
+    isFullscreen: nextFullscreen,
+  };
+}
+
+function sendAppWsResponse(ws, id, ok, data = {}, error = null) {
+  const payload = {
+    type: 'response',
+    id: typeof id === 'undefined' || id === null ? '' : String(id),
+    ok,
+    data,
+  };
+  if (!ok) {
+    payload.error = error?.code || 'INTERNAL_ERROR';
+    payload.data = {
+      ...(data && typeof data === 'object' ? data : {}),
+      error: formatControlError(error),
+    };
+  }
+  sendJsonToWebSocket(ws, payload);
+}
+
+function parseAppWsRequest(rawMessage) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawMessage.toString('utf8'));
+  } catch {
+    throw createControlError('INVALID_JSON', 'Request payload must be valid JSON.', {
+      httpStatus: 400,
+    });
+  }
+
+  if (!parsed || parsed.type !== 'request' || typeof parsed.op !== 'string') {
+    throw createControlError('INVALID_REQUEST', 'Request must contain type=request and op.', {
+      httpStatus: 400,
+    });
+  }
+  return parsed;
+}
+
+async function stopBridge(reason = 'manual') {
+  if (!bridge) {
+    return;
+  }
+
+  const child = bridge;
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve();
+    };
+    child.once('exit', finish);
+    try {
+      if (child.stdin?.writable) {
+        child.stdin.write('STOP\n');
+      } else {
+        child.kill();
+      }
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        // Ignore shutdown races.
+      }
+    }
+    setTimeout(() => {
+      if (!settled) {
+        try {
+          child.kill();
+        } catch {
+          // Ignore shutdown races.
+        }
+        if (bridge === child) {
+          bridge = null;
+          bridgeReady = false;
+        }
+      }
+      finish();
+    }, 3000);
+  });
+}
+
+async function restartUxPlay(reason = 'manual') {
+  await stopBridge(reason);
+  startBridge();
+  return getAppStatus();
+}
+
+async function handleAuthenticatedAppWsRequest(ws, request) {
+  const data = request.data && typeof request.data === 'object' ? request.data : {};
+
+  switch (request.op) {
+    case 'getStatus':
+      return getAppStatus();
+
+    case 'getPin':
+      return {
+        pin: currentPin,
+        updating: pinUpdateInFlight,
+      };
+
+    case 'rotatePin':
+      return rotatePinRandom('ws-random');
+
+    case 'setPin': {
+      const pin = normalizePinInput(data.pin);
+      return {
+        ...(await applyPinUpdate(pin)),
+        trigger: 'ws-set',
+      };
+    }
+
+    case 'setMuted': {
+      const muted = normalizeMutedInput(data.muted);
+      return applyMirrorAudioEnabled(!muted);
+    }
+
+    case 'setAudio': {
+      if (typeof data.enabled !== 'boolean') {
+        throw createControlError('INVALID_AUDIO_VALUE', 'Audio enabled must be a boolean value.', {
+          httpStatus: 400,
+        });
+      }
+      return applyMirrorAudioEnabled(data.enabled);
+    }
+
+    case 'getAudio':
+      return {
+        mirrorAudioEnabled,
+        muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
+        updating: mirrorAudioUpdateInFlight,
+      };
+
+    case 'stop':
+    case 'stopCasting':
+      return performStopCasting();
+
+    case 'showCastWindow':
+      showCastWindow('ws-command');
+      broadcastControlStatus();
+      return getAppStatus();
+
+    case 'hideCastWindow':
+      hideCastWindow('ws-command');
+      broadcastControlStatus();
+      return getAppStatus();
+
+    case 'setFullscreen': {
+      const fullscreen = data.fullscreen;
+      return {
+        ...setCastWindowFullscreen(fullscreen, 'ws-command'),
+        status: getAppStatus(),
+      };
+    }
+
+    case 'showPinWindow':
+      showPinWindow('ws-command');
+      return getAppStatus();
+
+    case 'hidePinWindow':
+      hidePinWindow('ws-command');
+      return getAppStatus();
+
+    case 'restartUxPlay':
+      return restartUxPlay('ws-command');
+
+    case 'quitApp':
+      setImmediate(() => {
+        quitApplication();
+      });
+      return {
+        message: 'quitting',
+      };
+
+    default:
+      throw createControlError('INVALID_OP', `Unknown operation: ${request.op}`, {
+        httpStatus: 400,
+      });
+  }
+}
+
+async function handleAppWsMessage(ws, rawMessage) {
+  let request;
+  try {
+    request = parseAppWsRequest(rawMessage);
+
+    if (!ws.isAuthenticated) {
+      if (request.op !== 'auth') {
+        throw createControlError('UNAUTHORIZED', 'First request must be auth.', {
+          httpStatus: 401,
+        });
+      }
+      if (request.data?.token !== appWsToken) {
+        throw createControlError('UNAUTHORIZED', 'Invalid WebSocket control token.', {
+          httpStatus: 401,
+        });
+      }
+      ws.isAuthenticated = true;
+      sendAppWsResponse(ws, request.id, true, { message: 'authenticated' });
+      broadcastAppEvent('app.ready', getAppStatus());
+      return;
+    }
+
+    if (request.op === 'auth') {
+      sendAppWsResponse(ws, request.id, true, { message: 'authenticated' });
+      return;
+    }
+
+    const result = await handleAuthenticatedAppWsRequest(ws, request);
+    sendAppWsResponse(ws, request.id, true, result);
+  } catch (error) {
+    const formatted = rememberLastError(error);
+    broadcastAppEvent('error', formatted);
+    sendAppWsResponse(ws, request?.id, false, {}, error);
+    if (error?.code === 'UNAUTHORIZED') {
+      ws.close(1008, 'unauthorized');
+    }
+  }
+}
+
+function startAppWebSocketServer() {
+  if (!appWsEnabled || appWsServer) {
+    return;
+  }
+
+  appWsServer = new WebSocket.Server({
+    host: appWsHost,
+    port: appWsPort,
+    maxPayload: 64 * 1024,
+  });
+
+  appWsServer.on('connection', (ws) => {
+    ws.isAuthenticated = false;
+    appWsClients.add(ws);
+    ws.on('message', (message) => {
+      void handleAppWsMessage(ws, message);
+    });
+    ws.on('close', () => {
+      appWsClients.delete(ws);
+      broadcastControlStatus();
+    });
+    ws.on('error', (error) => {
+      rememberLastError(error, 'WS_CLIENT_ERROR');
+      appWsClients.delete(ws);
+      broadcastControlStatus();
+    });
+    broadcastControlStatus();
+  });
+
+  appWsServer.on('listening', () => {
+    console.log(`Electron WebSocket control server listening on ${getWsUrl(appWsHost, appWsPort)}`);
+    broadcastAppEvent('app.ready', getAppStatus());
+    broadcastControlStatus();
+  });
+
+  appWsServer.on('error', (error) => {
+    const formatted = rememberLastError(error, 'WS_SERVER_ERROR');
+    console.error(`Electron WebSocket control server failed: ${formatted.message}`);
+    broadcastAppEvent('error', formatted);
+    broadcastControlStatus();
+  });
+}
+
+function stopAppWebSocketServer() {
+  for (const client of appWsClients) {
+    try {
+      client.close(1001, 'app quitting');
+    } catch {
+      // Ignore shutdown races.
+    }
+  }
+  appWsClients.clear();
+  if (appWsServer) {
+    appWsServer.close();
+    appWsServer = null;
+  }
+}
+
 function setupIpcHandlers() {
   ipcMain.handle('uxplay-control:get-session', (event) => {
     try {
       ensureTrustedSender(event);
-      const castWindowState = getCastWindowState();
       return {
         ok: true,
+        ...getAppStatus(),
         token: controlSessionToken,
-        port: uxplayHttpPort,
-        wsPort: uxplayWsEnabled ? uxplayWsPort : null,
-        wsUrl: uxplayWsEnabled ? `ws://127.0.0.1:${uxplayWsPort}/` : null,
-        ready: bridgeReady,
-        castingActive,
-        pin: currentPin,
-        rotating: pinUpdateInFlight,
-        mirrorAudioEnabled,
-        muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
-        audioUpdating: mirrorAudioUpdateInFlight,
-        stopUpdating: stopUpdateInFlight,
-        isFullscreen: castWindowState.fullscreen,
-        windowVisible: castWindowState.visible,
-        castWindowVisible: castWindowState.visible,
       };
     } catch (error) {
       return {
@@ -1108,8 +1828,7 @@ function setupIpcHandlers() {
         });
       }
       const nextFullscreen = !win.isFullScreen();
-      win.setFullScreen(nextFullscreen);
-      broadcastControlStatus();
+      setCastWindowFullscreen(nextFullscreen, 'ipc-toggle');
       return {
         ok: true,
         isFullscreen: nextFullscreen,
@@ -1131,8 +1850,7 @@ function setupIpcHandlers() {
           httpStatus: 503,
         });
       }
-      win.setFullScreen(false);
-      broadcastControlStatus();
+      setCastWindowFullscreen(false, 'ipc-windowed');
       return {
         ok: true,
         isFullscreen: false,
@@ -1181,9 +1899,19 @@ function createWindow() {
     console.log(`[renderer:${levelOrDetails}] ${message} (${sourceId}:${line})`);
   });
   win.on('enter-full-screen', () => {
+    broadcastAppEvent('window.changed', {
+      window: 'cast',
+      action: 'enter-fullscreen',
+      state: getCastWindowState(),
+    });
     broadcastControlStatus();
   });
   win.on('leave-full-screen', () => {
+    broadcastAppEvent('window.changed', {
+      window: 'cast',
+      action: 'leave-fullscreen',
+      state: getCastWindowState(),
+    });
     broadcastControlStatus();
   });
   win.on('show', () => {
@@ -1355,6 +2083,9 @@ async function flushFrameQueue() {
 }
 
 function startBridge() {
+  if (bridge) {
+    return;
+  }
   if (!fs.existsSync(uxplayExecutable)) {
     throw new Error(
       `UxPlay executable not found: ${uxplayExecutable}. Build UxPlay first or set UXPLAY_EXE.`,
@@ -1405,11 +2136,15 @@ function startBridge() {
   );
 
   bridge.on('error', (error) => {
+    const formatted = rememberLastError(error, 'UXPLAY_START_FAILED');
+    broadcastAppEvent('error', formatted);
+    broadcastControlStatus();
     console.error('Failed to launch UxPlay:', error);
   });
 
   bridge.on('exit', (code, signal) => {
     console.error(`UxPlay exited code=${code} signal=${signal}`);
+    closeUxplayEventWebSocket('bridge-exit');
     bridge = null;
     bridgeReady = false;
     uxplayHttpPort = null;
@@ -1421,6 +2156,10 @@ function startBridge() {
     setCastingActive(false, 'bridge-exit', { clearPending: true });
     mirrorSessionActive = false;
     clearMirrorSessionIdleTimer();
+    broadcastAppEvent('uxplay.exited', {
+      code,
+      signal,
+    });
     broadcastControlStatus();
   });
 
@@ -1436,7 +2175,9 @@ function startBridge() {
 
     if (line === 'READY') {
       bridgeReady = true;
+      broadcastAppEvent('uxplay.ready', getAppStatus());
       broadcastControlStatus();
+      scheduleUxplayEventWebSocketReconnect('uxplay-ready', 0);
       console.log(`UxPlay shared texture export is ready. AirPlay server name: ${uxplayServerName}`);
       void flushFrameQueue();
       return;
@@ -1474,6 +2215,9 @@ function startBridge() {
     }
     framesReceived += 1;
     touchMirrorSessionActivity();
+    if (framesReceived <= 3 || framesReceived % 60 === 0) {
+      broadcastAppEvent('casting.frameStats', getFrameStats());
+    }
     if (traceSharedTexture && (framesReceived <= 5 || framesReceived % 30 === 0)) {
       traceSharedTextureStats(`recv-${frameId}`);
     }
@@ -1519,6 +2263,8 @@ function startBridge() {
     consumeUxplayStderrChunk(chunk);
     process.stderr.write(chunk);
   });
+
+  scheduleUxplayEventWebSocketReconnect('bridge-start', 250);
 }
 
 if (gotSingleInstanceLock) {
@@ -1532,7 +2278,11 @@ if (gotSingleInstanceLock) {
     restorePersistedPin();
     setupIpcHandlers();
     createWindow();
+    createPinWindow();
     createTray();
+    appReady = true;
+    startAppWebSocketServer();
+    broadcastAppEvent('app.ready', getAppStatus());
     broadcastControlStatus();
     if (sendTimeoutMs > 0) {
       console.log(`sendSharedTexture watchdog timeout: ${sendTimeoutMs}ms`);
@@ -1541,7 +2291,14 @@ if (gotSingleInstanceLock) {
     }
 
     win.webContents.once('did-finish-load', () => {
-      startBridge();
+      try {
+        startBridge();
+      } catch (error) {
+        const formatted = rememberLastError(error, 'UXPLAY_START_FAILED');
+        console.error(`Failed to start UxPlay bridge: ${formatted.message}`);
+        broadcastAppEvent('error', formatted);
+        broadcastControlStatus();
+      }
     });
   });
 
@@ -1553,6 +2310,8 @@ if (gotSingleInstanceLock) {
 
   app.on('before-quit', () => {
     isExplicitlyQuitting = true;
+    stopAppWebSocketServer();
+    closeUxplayEventWebSocket('app-quitting');
     if (bridge && bridge.stdin.writable) {
       bridge.stdin.write('STOP\n');
     }

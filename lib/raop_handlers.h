@@ -202,6 +202,17 @@ raop_handler_info(raop_conn_t *conn,
 }
 
 static void
+raop_report_pin_required(raop_conn_t *conn, char *pin) {
+    if (conn->raop->callbacks.display_pin) {
+         conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, pin);
+    }
+    if (conn->raop->callbacks.control_pin_required) {
+         conn->raop->callbacks.control_pin_required(conn->raop->callbacks.cls, pin);
+    }
+    logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", pin);
+}
+
+static void
 raop_handler_pairpinstart(raop_conn_t *conn,
                           http_request_t *request, http_response_t *response,
                           char **response_data, int *response_datalen) {
@@ -220,10 +231,7 @@ raop_handler_pairpinstart(raop_conn_t *conn,
     }
     char pin[6];
     snprintf(pin, 5, "%04u", pin_4);
-    if (conn->raop->callbacks.display_pin) {
-         conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, pin);
-    }
-    logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", pin);
+    raop_report_pin_required(conn, pin);
     *response_data = NULL;
     response_datalen = 0;
 }
@@ -616,10 +624,7 @@ raop_handler_setup(raop_conn_t *conn,
                 snprintf(pin, len + 1, "%04u", pin_4 % 10000);
                 pin[len] = '\0';
                 conn->raop->auth_fail_count = 0;
-                if (conn->raop->callbacks.display_pin) {
-                    conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, pin);
-                }
-                logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", pin);
+                raop_report_pin_required(conn, pin);
             }
 	    if (len && !conn->authenticated) {
  	        if (len == -1) {
@@ -639,6 +644,9 @@ raop_handler_setup(raop_conn_t *conn,
                         logger_log(conn->raop->logger, LOGGER_INFO, "*** authentication failure: count = %u", conn->raop->auth_fail_count);
 		        if (conn->raop->callbacks.display_pin && conn->raop->auth_fail_count > 1) {
                             conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, conn->raop->random_pw);
+                        }
+                        if (conn->raop->callbacks.control_pin_required) {
+                            conn->raop->callbacks.control_pin_required(conn->raop->callbacks.cls, conn->raop->random_pw);
                         }
                         logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", conn->raop->random_pw);
                     }

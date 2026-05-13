@@ -9,8 +9,6 @@ if (!ipcRenderer) {
 
 const canvas = document.getElementById('videoCanvas');
 const statusBadge = document.getElementById('statusBadge');
-const pinDisplayValue = document.getElementById('pinDisplayValue');
-const pinPortValue = document.getElementById('pinPortValue');
 const pinSubmitButton = document.getElementById('pinSubmitButton');
 const pinFeedback = document.getElementById('pinFeedback');
 const muteToggleButton = document.getElementById('muteToggleButton');
@@ -24,8 +22,6 @@ const context = canvas.getContext('2d', { alpha: false });
 if (
   !context ||
   !statusBadge ||
-  !pinDisplayValue ||
-  !pinPortValue ||
   !pinSubmitButton ||
   !pinFeedback ||
   !muteToggleButton ||
@@ -62,14 +58,6 @@ if (!lastFrameContext) {
 function setFeedback(element, message, tone = 'muted') {
   element.textContent = message;
   element.dataset.tone = tone;
-}
-
-function updatePortDisplay(port) {
-  pinPortValue.textContent = Number.isInteger(port) && port > 0 ? `Port: ${port}` : 'Port: -';
-}
-
-function updatePinDisplay(pin) {
-  pinDisplayValue.textContent = typeof pin === 'string' && /^\d{4}$/.test(pin) ? pin : '----';
 }
 
 function updateMuteDisplay(muted) {
@@ -200,8 +188,6 @@ function applyControlStatus(status) {
   }
 
   setCastingState(controlCastingActive);
-  updatePortDisplay(port);
-  updatePinDisplay(pin);
   updateMuteDisplay(muted);
   setPinControlEnabled(hasPort && !rotating);
   setMuteControlEnabled(hasPort && !audioUpdating);
@@ -255,7 +241,6 @@ async function initializeControls() {
   setMuteControlEnabled(false);
   setStopControlEnabled(false);
   setWindowControlsEnabled(false);
-  updatePinDisplay(null);
   updateMuteDisplay(null);
   setCastingState(false);
 

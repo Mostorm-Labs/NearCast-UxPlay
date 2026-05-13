@@ -2820,6 +2820,13 @@ extern "C" void control_pin_changed(void *cls, unsigned short pin) {
     ws_control_queue_event("pinChanged", data);
 }
 
+extern "C" void control_pin_required(void *cls, char *pin) {
+    (void) cls;
+    std::string pin_value = pin ? pin : "";
+    std::string data = "{\"pin\":" + json_string_or_null(pin_value) + "}";
+    ws_control_queue_event("pinRequired", data);
+}
+
 extern "C" void control_audio_changed(void *cls, bool enabled) {
     ws_control_queue_event("audioChanged", enabled ? "{\"mirrorAudio\":true}" : "{\"mirrorAudio\":false}");
 }
@@ -2866,6 +2873,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.on_video_stop = on_video_stop;
     raop_cbs.on_video_acquire_playback_info = on_video_acquire_playback_info;
     raop_cbs.control_pin_changed = control_pin_changed;
+    raop_cbs.control_pin_required = control_pin_required;
     raop_cbs.control_audio_changed = control_audio_changed;
 
     raop = raop_init(&raop_cbs);
