@@ -123,6 +123,27 @@
         "cwd": "${workspaceFolder}/demo/electron-sharedtexture"
       },
       "problemMatcher": []
+    },
+    {
+      "label": "Demo: package electron (electron-sharedtexture)",
+      "type": "shell",
+      "command": "npm",
+      "args": [
+        "run",
+        "package:win"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/demo/electron-sharedtexture"
+      },
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Demo: build all (electron-sharedtexture)"
+      ],
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
     }
   ]
 }

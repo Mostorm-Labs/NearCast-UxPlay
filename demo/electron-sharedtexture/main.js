@@ -13,20 +13,34 @@ if (process.env.NODE_ENV === 'development') {
 }
 
 const repoRoot = path.resolve(__dirname, '..', '..');
+const packagedUxplayRuntimeDir = path.join(process.resourcesPath, 'uxplay-runtime');
+const defaultUxplayExecutable = app.isPackaged
+  ? path.join(packagedUxplayRuntimeDir, 'uxplay.exe')
+  : path.join(repoRoot, 'build', 'uxplay.exe');
 const uxplayExecutable =
-  process.env.UXPLAY_EXE || path.join(repoRoot, 'build', 'uxplay.exe');
+  process.env.UXPLAY_EXE || defaultUxplayExecutable;
 const uxplayWorkdir = path.dirname(uxplayExecutable);
 const uxplayServerName =
   process.env.UXPLAY_SERVER_NAME || 'UxPlay SharedTexture';
 const msysRoot = process.env.MSYS2_ROOT || 'D:\\msys64';
-const gstreamerBin = path.join(msysRoot, 'mingw64', 'bin');
+const gstreamerBin = app.isPackaged
+  ? uxplayWorkdir
+  : path.join(msysRoot, 'mingw64', 'bin');
 const gstreamerPluginPath =
   process.env.GST_PLUGIN_PATH || path.join(uxplayWorkdir, 'lib', 'gstreamer-1.0');
+const gstreamerPluginScanner = path.join(
+  uxplayWorkdir,
+  'libexec',
+  'gstreamer-1.0',
+  'gst-plugin-scanner.exe',
+);
 const traceSharedTexture =
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === '1' ||
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === 'true';
 const sendTimeoutMs = Number.parseInt(process.env.UXPLAY_SEND_TIMEOUT_MS || '1200', 10) || 0;
 const uxplayControlTimeoutMs = Number.parseInt(process.env.UXPLAY_CONTROL_TIMEOUT_MS || '3000', 10) || 3000;
+const uxplayWsPort = Number.parseInt(process.env.UXPLAY_WS_PORT || '7001', 10) || 7001;
+const uxplayWsEnabled = process.env.UXPLAY_WS_ENABLE !== '0' && process.env.UXPLAY_WS_ENABLE !== 'false';
 const mirrorSessionIdleMs = Number.parseInt(process.env.UXPLAY_MIRROR_IDLE_MS || '3000', 10) || 3000;
 const uxplayPinStoreFileName = 'uxplay-pin-state.json';
 const controlSessionToken = crypto.randomBytes(24).toString('hex');
@@ -86,6 +100,8 @@ function broadcastControlStatus() {
   win.webContents.send('uxplay-control:status', {
     ready: bridgeReady,
     port: uxplayHttpPort,
+    wsPort: uxplayWsEnabled ? uxplayWsPort : null,
+    wsUrl: uxplayWsEnabled ? `ws://127.0.0.1:${uxplayWsPort}/` : null,
     castingActive,
     pin: currentPin,
     rotating: pinUpdateInFlight,
@@ -870,6 +886,8 @@ function setupIpcHandlers() {
         ok: true,
         token: controlSessionToken,
         port: uxplayHttpPort,
+        wsPort: uxplayWsEnabled ? uxplayWsPort : null,
+        wsUrl: uxplayWsEnabled ? `ws://127.0.0.1:${uxplayWsPort}/` : null,
         ready: bridgeReady,
         castingActive,
         pin: currentPin,
@@ -1204,6 +1222,7 @@ function startBridge() {
     '-nh',
     '-fs',
     '-nohold',
+    ...(uxplayWsEnabled ? ['-ws-enable', '-ws-port', String(uxplayWsPort)] : []),
     '-logfile',
     ...extraArgs,
   ];
@@ -1211,8 +1230,16 @@ function startBridge() {
   const childEnv = {
     ...process.env,
     GST_PLUGIN_PATH: gstreamerPluginPath,
+    UXPLAY_CONTROL_TOKEN: controlSessionToken,
     PATH: `${uxplayWorkdir};${gstreamerBin};${process.env.PATH || ''}`,
   };
+  if (!childEnv.GST_PLUGIN_SCANNER && fs.existsSync(gstreamerPluginScanner)) {
+    childEnv.GST_PLUGIN_SCANNER = gstreamerPluginScanner;
+  }
+  if (app.isPackaged) {
+    childEnv.GST_PLUGIN_SYSTEM_PATH = childEnv.GST_PLUGIN_SYSTEM_PATH || '';
+    childEnv.GST_PLUGIN_SYSTEM_PATH_1_0 = childEnv.GST_PLUGIN_SYSTEM_PATH_1_0 || '';
+  }
 
   bridge = spawn(
     uxplayExecutable,

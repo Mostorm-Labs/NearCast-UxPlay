@@ -27,6 +27,7 @@
 #include <ctype.h>
 #include <string>
 #include <algorithm>
+#include <deque>
 #include <vector>
 #include <fstream>
 #include <sstream>
@@ -35,6 +36,7 @@
 #include <cstdio>
 #include <stdarg.h>
 #include <math.h>
+#include <random>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
@@ -65,6 +67,7 @@
 #include "lib/threads.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
+#include "mongoose.h"
 
 #define VERSION "1.72"
 
@@ -77,6 +80,7 @@
 #define MISSED_FEEDBACK_LIMIT 15
 #define MIN_PASSWORD_LENGTH 4
 #define DEFAULT_PLAYBIN_VERSION 3
+#define DEFAULT_WS_CONTROL_PORT 7001
 #define BT709_FIX "capssetter caps=\"video/x-h264, colorimetry=bt709\""
 #define SRGB_FIX  " ! video/x-raw,colorimetry=sRGB,format=RGB  ! "
 #ifdef FULL_RANGE_RGB_FIX
@@ -185,6 +189,21 @@ static guint missed_feedback_limit = MISSED_FEEDBACK_LIMIT;
 static guint missed_feedback = 0;
 static guint playbin_version = DEFAULT_PLAYBIN_VERSION;
 static bool reset_httpd = false;
+static bool ws_control_enabled = false;
+static unsigned short ws_control_port = DEFAULT_WS_CONTROL_PORT;
+static std::string ws_control_token = "";
+static thread_handle_t ws_control_thread;
+static bool ws_control_thread_started = false;
+static bool ws_control_running = false;
+static mutex_handle_t ws_control_mutex;
+static bool ws_control_mutex_initialized = false;
+static std::deque<std::string> ws_control_event_queue;
+static mutex_handle_t control_state_mutex;
+static bool control_state_mutex_initialized = false;
+static bool control_mirror_started_announced = false;
+static std::string control_client_name = "";
+static std::string control_client_model = "";
+static std::string control_client_device_id = "";
 
 static bool mirror_audio_is_enabled() {
     if (!audio_control_mutex_initialized) {
@@ -272,6 +291,508 @@ static void log(int level, const char* format, ...) {
 #define LOGI(...) log(LOGGER_INFO, __VA_ARGS__)
 #define LOGW(...) log(LOGGER_WARNING, __VA_ARGS__)
 #define LOGE(...) log(LOGGER_ERR, __VA_ARGS__)
+
+static std::string json_escape(const std::string &value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (char ch : value) {
+        unsigned char c = (unsigned char) ch;
+        switch (c) {
+        case '\\':
+            escaped.append("\\\\");
+            break;
+        case '"':
+            escaped.append("\\\"");
+            break;
+        case '\b':
+            escaped.append("\\b");
+            break;
+        case '\f':
+            escaped.append("\\f");
+            break;
+        case '\n':
+            escaped.append("\\n");
+            break;
+        case '\r':
+            escaped.append("\\r");
+            break;
+        case '\t':
+            escaped.append("\\t");
+            break;
+        default:
+            if (c < 0x20) {
+                char buf[7];
+                snprintf(buf, sizeof(buf), "\\u%04x", c);
+                escaped.append(buf);
+            } else {
+                escaped.push_back(ch);
+            }
+            break;
+        }
+    }
+    return escaped;
+}
+
+static std::string json_string_or_null(const std::string &value) {
+    if (value.empty()) {
+        return "null";
+    }
+    return std::string("\"") + json_escape(value) + "\"";
+}
+
+static void ws_control_queue_event(const std::string &op, const std::string &data_json) {
+    if (!ws_control_enabled || !ws_control_mutex_initialized) {
+        return;
+    }
+    std::string message = "{\"type\":\"event\",\"op\":\"" + json_escape(op) + "\",\"data\":" +
+                          (data_json.empty() ? "{}" : data_json) + "}";
+    MUTEX_LOCK(ws_control_mutex);
+    if (ws_control_running) {
+        if (ws_control_event_queue.size() >= 128) {
+            ws_control_event_queue.pop_front();
+        }
+        ws_control_event_queue.push_back(message);
+    }
+    MUTEX_UNLOCK(ws_control_mutex);
+}
+
+static void control_state_get_snapshot(unsigned int *connections, bool *mirroring,
+                                       std::string *client, std::string *model,
+                                       std::string *device_id) {
+    if (control_state_mutex_initialized) {
+        MUTEX_LOCK(control_state_mutex);
+    }
+    if (connections) *connections = open_connections;
+    if (mirroring) *mirroring = control_mirror_started_announced;
+    if (client) *client = control_client_name;
+    if (model) *model = control_client_model;
+    if (device_id) *device_id = control_client_device_id;
+    if (control_state_mutex_initialized) {
+        MUTEX_UNLOCK(control_state_mutex);
+    }
+}
+
+static void control_state_note_client(const char *name, const char *model, const char *device_id) {
+    bool should_announce = false;
+    std::string event_client;
+    std::string event_model;
+    std::string event_device_id;
+
+    if (control_state_mutex_initialized) {
+        MUTEX_LOCK(control_state_mutex);
+    }
+    control_client_name = (name ? name : "");
+    control_client_model = (model ? model : "");
+    control_client_device_id = (device_id ? device_id : "");
+    if (open_connections > 0 && !control_mirror_started_announced) {
+        control_mirror_started_announced = true;
+        should_announce = true;
+        event_client = control_client_name;
+        event_model = control_client_model;
+        event_device_id = control_client_device_id;
+    }
+    if (control_state_mutex_initialized) {
+        MUTEX_UNLOCK(control_state_mutex);
+    }
+
+    if (should_announce) {
+        std::string data = "{\"device\":" + json_string_or_null(event_client) +
+                           ",\"model\":" + json_string_or_null(event_model) +
+                           ",\"deviceId\":" + json_string_or_null(event_device_id) +
+                           ",\"ip\":null}";
+        ws_control_queue_event("mirrorStarted", data);
+    }
+}
+
+static void control_state_connection_opened() {
+    if (control_state_mutex_initialized) {
+        MUTEX_LOCK(control_state_mutex);
+    }
+    open_connections++;
+    if (control_state_mutex_initialized) {
+        MUTEX_UNLOCK(control_state_mutex);
+    }
+}
+
+static bool control_state_connection_closed() {
+    bool stopped = false;
+    if (control_state_mutex_initialized) {
+        MUTEX_LOCK(control_state_mutex);
+    }
+    if (open_connections > 0) {
+        open_connections--;
+    }
+    if (open_connections == 0) {
+        stopped = control_mirror_started_announced;
+        control_mirror_started_announced = false;
+        control_client_name.clear();
+        control_client_model.clear();
+        control_client_device_id.clear();
+    }
+    if (control_state_mutex_initialized) {
+        MUTEX_UNLOCK(control_state_mutex);
+    }
+    return stopped;
+}
+
+static std::string generate_ws_control_token() {
+    unsigned char bytes[24];
+    bool have_random = mg_random(bytes, sizeof(bytes));
+    if (!have_random) {
+        std::random_device rd;
+        for (size_t i = 0; i < sizeof(bytes); i++) {
+            bytes[i] = (unsigned char) rd();
+        }
+    }
+    char token[49];
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        snprintf(token + (2 * i), 3, "%02x", bytes[i]);
+    }
+    token[48] = '\0';
+    return std::string(token);
+}
+
+static void initialize_ws_control_token() {
+    const char *env_token = getenv("UXPLAY_CONTROL_TOKEN");
+    if (env_token && strlen(env_token) >= 16) {
+        ws_control_token = env_token;
+        LOGI("WebSocket control token loaded from UXPLAY_CONTROL_TOKEN");
+        return;
+    }
+    ws_control_token = generate_ws_control_token();
+    LOGI("UXPLAY_CONTROL_TOKEN=%s", ws_control_token.c_str());
+}
+
+static bool mg_str_contains(struct mg_str value, const char *needle) {
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0 || value.len < needle_len) {
+        return false;
+    }
+    for (size_t i = 0; i + needle_len <= value.len; i++) {
+        if (!memcmp(value.buf + i, needle, needle_len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ws_control_is_loopback(struct mg_connection *c) {
+    if (c->rem.is_ip6) {
+        for (int i = 0; i < 15; i++) {
+            if (c->rem.addr.ip[i] != 0) {
+                return false;
+            }
+        }
+        return c->rem.addr.ip[15] == 1;
+    }
+    return mg_ntohl(c->rem.addr.ip4) == 0x7f000001UL;
+}
+
+static bool ws_control_origin_allowed(struct mg_http_message *hm) {
+    struct mg_str *origin = mg_http_get_header(hm, "Origin");
+    if (!origin) {
+        return true;
+    }
+    return mg_str_contains(*origin, "127.0.0.1") || mg_str_contains(*origin, "localhost");
+}
+
+static bool ws_connection_authenticated(struct mg_connection *c) {
+    return c->data[0] == 1;
+}
+
+static void ws_connection_set_authenticated(struct mg_connection *c, bool authenticated) {
+    c->data[0] = authenticated ? 1 : 0;
+}
+
+static void ws_send_text(struct mg_connection *c, const std::string &message) {
+    mg_ws_send(c, message.c_str(), message.size(), WEBSOCKET_OP_TEXT);
+}
+
+static void ws_send_response(struct mg_connection *c, const std::string &id, bool ok,
+                             const std::string &data_json, const std::string &error) {
+    std::string message = "{\"type\":\"response\",\"id\":\"" + json_escape(id) +
+                          "\",\"ok\":" + (ok ? "true" : "false") +
+                          ",\"data\":" + (data_json.empty() ? "{}" : data_json);
+    if (!ok) {
+        message.append(",\"error\":\"");
+        message.append(json_escape(error.empty() ? "INTERNAL_ERROR" : error));
+        message.append("\"");
+    }
+    message.append("}");
+    ws_send_text(c, message);
+}
+
+static bool parse_four_digit_pin(const char *pin_text, unsigned short *pin_out) {
+    if (!pin_text || strlen(pin_text) != 4 || !pin_out) {
+        return false;
+    }
+    unsigned short value = 0;
+    for (int i = 0; i < 4; i++) {
+        if (pin_text[i] < '0' || pin_text[i] > '9') {
+            return false;
+        }
+        value = (unsigned short) (value * 10 + (pin_text[i] - '0'));
+    }
+    *pin_out = value;
+    return true;
+}
+
+static std::string ws_status_json() {
+    unsigned int connections = 0;
+    bool mirroring = false;
+    std::string client;
+    std::string model;
+    std::string device_id;
+    control_state_get_snapshot(&connections, &mirroring, &client, &model, &device_id);
+
+    unsigned short current_pin = 0;
+    bool use_pin_now = false;
+    if (raop) {
+        raop_control_get_pin(raop, &current_pin, &use_pin_now);
+    }
+    char pin_json[32];
+    if (use_pin_now) {
+        snprintf(pin_json, sizeof(pin_json), "\"%04u\"", current_pin % 10000);
+    } else {
+        strncpy(pin_json, "null", sizeof(pin_json));
+        pin_json[sizeof(pin_json) - 1] = '\0';
+    }
+
+    std::string data = "{\"mirroring\":";
+    data.append(mirroring ? "true" : "false");
+    data.append(",\"client\":");
+    data.append(json_string_or_null(client));
+    data.append(",\"model\":");
+    data.append(json_string_or_null(model));
+    data.append(",\"deviceId\":");
+    data.append(json_string_or_null(device_id));
+    data.append(",\"ip\":null,\"mirrorAudio\":");
+    data.append(raop && raop_control_get_mirror_audio(raop) ? "true" : "false");
+    data.append(",\"pin\":");
+    data.append(pin_json);
+    data.append("}");
+    return data;
+}
+
+static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
+    char *id_raw = mg_json_get_str(body, "$.id");
+    char *type_raw = mg_json_get_str(body, "$.type");
+    char *op_raw = mg_json_get_str(body, "$.op");
+    std::string id = id_raw ? id_raw : "";
+    std::string type = type_raw ? type_raw : "";
+    std::string op = op_raw ? op_raw : "";
+
+    if (id_raw) mg_free(id_raw);
+    if (type_raw) mg_free(type_raw);
+    if (op_raw) mg_free(op_raw);
+
+    if (type != "request" || op.empty()) {
+        ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
+        return;
+    }
+
+    if (!ws_connection_authenticated(c) && op != "auth") {
+        ws_send_response(c, id, false, "{}", "UNAUTHORIZED");
+        return;
+    }
+
+    if (op == "auth") {
+        char *token_raw = mg_json_get_str(body, "$.data.token");
+        bool ok = token_raw && !ws_control_token.empty() && ws_control_token == token_raw;
+        if (token_raw) mg_free(token_raw);
+        if (!ok) {
+            ws_send_response(c, id, false, "{}", "UNAUTHORIZED");
+            return;
+        }
+        ws_connection_set_authenticated(c, true);
+        ws_send_response(c, id, true, "{\"message\":\"authenticated\"}", "");
+        return;
+    }
+
+    if (!raop) {
+        ws_send_response(c, id, false, "{}", "INVALID_STATE");
+        return;
+    }
+
+    if (op == "setPin") {
+        char *pin_raw = mg_json_get_str(body, "$.data.pin");
+        unsigned short new_pin = 0;
+        bool valid = parse_four_digit_pin(pin_raw, &new_pin);
+        if (pin_raw) mg_free(pin_raw);
+        if (!valid || raop_control_set_pin(raop, new_pin)) {
+            ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
+            return;
+        }
+        char data[32];
+        snprintf(data, sizeof(data), "{\"pin\":\"%04u\"}", new_pin);
+        ws_send_response(c, id, true, data, "");
+        return;
+    }
+
+    if (op == "getPin") {
+        unsigned short current_pin = 0;
+        bool use_pin_now = false;
+        raop_control_get_pin(raop, &current_pin, &use_pin_now);
+        char data[32];
+        if (use_pin_now) {
+            snprintf(data, sizeof(data), "{\"pin\":\"%04u\"}", current_pin % 10000);
+        } else {
+            strncpy(data, "{\"pin\":null}", sizeof(data));
+            data[sizeof(data) - 1] = '\0';
+        }
+        ws_send_response(c, id, true, data, "");
+        return;
+    }
+
+    if (op == "setAudio") {
+        bool enabled = false;
+        if (!mg_json_get_bool(body, "$.data.enabled", &enabled)) {
+            ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
+            return;
+        }
+        raop_control_set_mirror_audio(raop, enabled);
+        ws_send_response(c, id, true,
+                         raop_control_get_mirror_audio(raop) ?
+                         "{\"mirrorAudio\":true}" : "{\"mirrorAudio\":false}", "");
+        return;
+    }
+
+    if (op == "getAudio") {
+        ws_send_response(c, id, true,
+                         raop_control_get_mirror_audio(raop) ?
+                         "{\"mirrorAudio\":true}" : "{\"mirrorAudio\":false}", "");
+        return;
+    }
+
+    if (op == "stop") {
+        raop_control_stop(raop);
+        ws_send_response(c, id, true, "{\"message\":\"casting stopped\"}", "");
+        return;
+    }
+
+    if (op == "getStatus") {
+        ws_send_response(c, id, true, ws_status_json(), "");
+        return;
+    }
+
+    ws_send_response(c, id, false, "{}", "INVALID_OP");
+}
+
+static void ws_control_event_handler(struct mg_connection *c, int ev, void *ev_data) {
+    if (ev == MG_EV_HTTP_MSG) {
+        struct mg_http_message *hm = (struct mg_http_message *) ev_data;
+        if (!ws_control_is_loopback(c) || !ws_control_origin_allowed(hm)) {
+            mg_http_reply(c, 403, "Content-Type: text/plain\r\n", "Forbidden\n");
+            c->is_draining = 1;
+            return;
+        }
+        if (!mg_match(hm->uri, mg_str("/"), NULL)) {
+            mg_http_reply(c, 404, "Content-Type: text/plain\r\n", "Not Found\n");
+            c->is_draining = 1;
+            return;
+        }
+        mg_ws_upgrade(c, hm, NULL);
+    } else if (ev == MG_EV_WS_OPEN) {
+        ws_connection_set_authenticated(c, false);
+    } else if (ev == MG_EV_WS_MSG) {
+        struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
+        int op = wm->flags & 0x0f;
+        if (op != WEBSOCKET_OP_TEXT) {
+            ws_send_response(c, "", false, "{}", "INVALID_PARAMS");
+            return;
+        }
+        ws_handle_request(c, wm->data);
+    } else if (ev == MG_EV_CLOSE) {
+        ws_connection_set_authenticated(c, false);
+    }
+}
+
+static bool ws_control_should_run() {
+    bool running = false;
+    if (ws_control_mutex_initialized) {
+        MUTEX_LOCK(ws_control_mutex);
+        running = ws_control_running;
+        MUTEX_UNLOCK(ws_control_mutex);
+    }
+    return running;
+}
+
+static void ws_control_broadcast_queued_events(struct mg_mgr *mgr) {
+    std::deque<std::string> events;
+    MUTEX_LOCK(ws_control_mutex);
+    events.swap(ws_control_event_queue);
+    MUTEX_UNLOCK(ws_control_mutex);
+
+    for (const std::string &event : events) {
+        for (struct mg_connection *c = mgr->conns; c != NULL; c = c->next) {
+            if (c->is_websocket && ws_connection_authenticated(c)) {
+                ws_send_text(c, event);
+            }
+        }
+    }
+}
+
+static THREAD_RETVAL ws_control_thread_main(void *arg) {
+    (void) arg;
+    struct mg_mgr mgr;
+    mg_mgr_init(&mgr);
+
+    char listen_url[64];
+    snprintf(listen_url, sizeof(listen_url), "http://127.0.0.1:%hu", ws_control_port);
+    if (!mg_http_listen(&mgr, listen_url, ws_control_event_handler, NULL)) {
+        LOGE("failed to start WebSocket control server on ws://127.0.0.1:%hu", ws_control_port);
+        MUTEX_LOCK(ws_control_mutex);
+        ws_control_running = false;
+        MUTEX_UNLOCK(ws_control_mutex);
+        mg_mgr_free(&mgr);
+        return 0;
+    }
+
+    LOGI("WebSocket control server listening on ws://127.0.0.1:%hu/", ws_control_port);
+    while (ws_control_should_run()) {
+        mg_mgr_poll(&mgr, 50);
+        ws_control_broadcast_queued_events(&mgr);
+    }
+    mg_mgr_free(&mgr);
+    LOGI("WebSocket control server stopped");
+    return 0;
+}
+
+static int start_ws_control_server() {
+    if (!ws_control_enabled || ws_control_thread_started) {
+        return 0;
+    }
+    if (ws_control_token.empty()) {
+        initialize_ws_control_token();
+    }
+    MUTEX_LOCK(ws_control_mutex);
+    ws_control_running = true;
+    MUTEX_UNLOCK(ws_control_mutex);
+    THREAD_CREATE(ws_control_thread, ws_control_thread_main, NULL);
+    if (!ws_control_thread) {
+        MUTEX_LOCK(ws_control_mutex);
+        ws_control_running = false;
+        MUTEX_UNLOCK(ws_control_mutex);
+        LOGE("failed to create WebSocket control server thread");
+        return -1;
+    }
+    ws_control_thread_started = true;
+    return 0;
+}
+
+static void stop_ws_control_server() {
+    if (!ws_control_thread_started) {
+        return;
+    }
+    MUTEX_LOCK(ws_control_mutex);
+    ws_control_running = false;
+    MUTEX_UNLOCK(ws_control_mutex);
+    THREAD_JOIN(ws_control_thread);
+    ws_control_thread_started = false;
+    MUTEX_LOCK(ws_control_mutex);
+    ws_control_event_queue.clear();
+    MUTEX_UNLOCK(ws_control_mutex);
+}
 
 static bool file_has_write_access (const char * filename) {
     bool exists = false;
@@ -460,7 +981,9 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
 }
 
 static gboolean feedback_callback(gpointer loop) {
-    if (open_connections) {
+    unsigned int connections = 0;
+    control_state_get_snapshot(&connections, NULL, NULL, NULL, NULL);
+    if (connections) {
         if (missed_feedback_limit && missed_feedback > missed_feedback_limit) {
             LOGI("***ERROR lost connection with client (network problem?)");
             LOGI("%u missed client feedback signals exceeds limit of %u", missed_feedback, missed_feedback_limit);
@@ -763,6 +1286,8 @@ static void print_info (char *name) {
     printf("-p n      Use TCP and UDP ports n,n+1,n+2. range %d-%d\n", LOWEST_ALLOWED_PORT, HIGHEST_PORT);
     printf("          use \"-p n1,n2,n3\" to set each port, \"n1,n2\" for n3 = n2+1\n");
     printf("          \"-p tcp n\" or \"-p udp n\" sets TCP or UDP ports separately\n");
+    printf("-ws-enable Enable local WebSocket control server (Mongoose)\n");
+    printf("-ws-port n Set WebSocket control port (default %d)\n", DEFAULT_WS_CONTROL_PORT);
     printf("-avdec    Force software h264 video decoding with libav decoder\n"); 
     printf("-vp ...   Choose the GSteamer h264 parser: default \"h264parse\"\n");
     printf("-vd ...   Choose the GStreamer h264 decoder; default \"decodebin\"\n");
@@ -1098,6 +1623,17 @@ static void parse_arguments (int argc, char *argv[]) {
                     udp[j] = tcp[j];
                 }
             }
+        } else if (arg == "-ws-enable") {
+            ws_control_enabled = true;
+        } else if (arg == "-ws-port") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            unsigned int value = DEFAULT_WS_CONTROL_PORT;
+            if (!get_value(argv[++i], &value) || value == 0 || value > HIGHEST_PORT) {
+                fprintf(stderr, "invalid \"-ws-port %s\"; -ws-port n requires n in range [1,%d]\n",
+                        argv[i], HIGHEST_PORT);
+                exit(1);
+            }
+            ws_control_port = (unsigned short) value;
         } else if (arg == "-m") {
 	    if (i < argc - 1 && *argv[i+1] != '-') {
                 if (validate_mac(argv[++i])) {
@@ -1855,16 +2391,20 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
 }
 
 extern "C" void conn_init (void *cls) {
-    open_connections++;
-    LOGD("Open connections: %i", open_connections);
+    control_state_connection_opened();
+    unsigned int connections = 0;
+    control_state_get_snapshot(&connections, NULL, NULL, NULL, NULL);
+    LOGD("Open connections: %i", connections);
     //video_renderer_update_background(1);
 }
 
 extern "C" void conn_destroy (void *cls) {
     //video_renderer_update_background(-1);
-    open_connections--;
-    LOGD("Open connections: %i", open_connections);
-    if (open_connections == 0) {
+    bool stopped = control_state_connection_closed();
+    unsigned int connections = 0;
+    control_state_get_snapshot(&connections, NULL, NULL, NULL, NULL);
+    LOGD("Open connections: %i", connections);
+    if (connections == 0) {
         remote_clock_offset = 0;
         compression_type = 0;
         if (audio_renderer_initialized) {
@@ -1874,6 +2414,9 @@ extern "C" void conn_destroy (void *cls) {
         if (dacpfile.length()) {
             remove (dacpfile.c_str());
         }    
+    }
+    if (stopped) {
+        ws_control_queue_event("mirrorStopped", "{}");
     }
 }
 
@@ -1923,6 +2466,9 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
     if (check_blocked_client(deviceid)) {
         *admit = false;
         LOGI("*** attempt to connect by blocked client (clientID %s): DENIED\n", deviceid);
+    }
+    if (*admit) {
+        control_state_note_client(name, model, deviceid);
     }
 }
 
@@ -2268,6 +2814,16 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
     }
 }
 
+extern "C" void control_pin_changed(void *cls, unsigned short pin) {
+    char data[32];
+    snprintf(data, sizeof(data), "{\"pin\":\"%04u\"}", pin % 10000);
+    ws_control_queue_event("pinChanged", data);
+}
+
+extern "C" void control_audio_changed(void *cls, bool enabled) {
+    ws_control_queue_event("audioChanged", enabled ? "{\"mirrorAudio\":true}" : "{\"mirrorAudio\":false}");
+}
+
 extern "C" void log_callback (void *cls, int level, const char *msg) {
     (void) cls;
     log(level, "%s", msg);
@@ -2309,6 +2865,8 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.on_video_rate = on_video_rate;
     raop_cbs.on_video_stop = on_video_stop;
     raop_cbs.on_video_acquire_playback_info = on_video_acquire_playback_info;
+    raop_cbs.control_pin_changed = control_pin_changed;
+    raop_cbs.control_audio_changed = control_audio_changed;
 
     raop = raop_init(&raop_cbs);
     if (raop == NULL) {
@@ -2536,6 +3094,13 @@ int main (int argc, char *argv[]) {
 
     MUTEX_CREATE(audio_control_mutex);
     audio_control_mutex_initialized = true;
+    MUTEX_CREATE(control_state_mutex);
+    control_state_mutex_initialized = true;
+    MUTEX_CREATE(ws_control_mutex);
+    ws_control_mutex_initialized = true;
+    if (ws_control_enabled) {
+        initialize_ws_control_token();
+    }
 
     if (audiosink == "0") {
         mirror_audio_set_requested(false);
@@ -2762,6 +3327,9 @@ int main (int argc, char *argv[]) {
         stop_dnssd();
         goto cleanup;
     }
+    if (start_ws_control_server()) {
+        LOGW("WebSocket control server is unavailable; continuing with HTTP control only");
+    }
     reconnect:
     compression_type = 0;
     close_window = new_window_closing_behavior;
@@ -2777,7 +3345,9 @@ int main (int argc, char *argv[]) {
         }
         if (use_video && (close_window || preserve_connections)) {
             video_renderer_destroy();
-            if (!preserve_connections && open_connections == 0) {
+            unsigned int connections = 0;
+            control_state_get_snapshot(&connections, NULL, NULL, NULL, NULL);
+            if (!preserve_connections && connections == 0) {
                 raop_destroy_airplay_video(raop);
                 url.erase();
                 raop_remove_known_connections(raop);
@@ -2797,10 +3367,12 @@ int main (int argc, char *argv[]) {
         goto reconnect;
     } else {
         LOGI("Stopping RAOP Server...");
+        stop_ws_control_server();
         stop_raop_server();
         stop_dnssd();
     }
     cleanup:
+    stop_ws_control_server();
     if (audio_renderer_initialized) {
         audio_renderer_destroy();
         audio_renderer_set_running(false);
@@ -2830,5 +3402,13 @@ int main (int argc, char *argv[]) {
     if (audio_control_mutex_initialized) {
         audio_control_mutex_initialized = false;
         MUTEX_DESTROY(audio_control_mutex);
+    }
+    if (ws_control_mutex_initialized) {
+        ws_control_mutex_initialized = false;
+        MUTEX_DESTROY(ws_control_mutex);
+    }
+    if (control_state_mutex_initialized) {
+        control_state_mutex_initialized = false;
+        MUTEX_DESTROY(control_state_mutex);
     }
 }

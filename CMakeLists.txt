@@ -44,6 +44,13 @@ add_subdirectory( lib/playfair )
 add_subdirectory( lib )
 add_subdirectory( renderers )
 
+add_library( mongoose STATIC third_party/mongoose/mongoose.c )
+target_include_directories( mongoose PUBLIC third_party/mongoose )
+target_compile_definitions( mongoose PRIVATE MG_ENABLE_DIRLIST=0 MG_ENABLE_LOG=0 )
+if ( WIN32 )
+  target_link_libraries( mongoose PUBLIC ws2_32 )
+endif()
+
 if  ( GST_MACOS )
      add_definitions( -DGST_MACOS )
      message ( STATUS "define GST_MACOS" )
@@ -53,12 +60,14 @@ add_executable( uxplay uxplay.cpp )
 target_link_libraries( uxplay
                    renderers
                    airplay
+                   mongoose
 		   )
 
 install( TARGETS  uxplay RUNTIME DESTINATION bin )
 install( FILES uxplay.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1 )
 install( FILES README.md README.txt README.html LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} ) 
 install( FILES lib/llhttp/LICENSE-MIT DESTINATION ${CMAKE_INSTALL_DOCDIR}/llhttp )
+install( FILES third_party/mongoose/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR}/mongoose )
 install( FILES uxplay.service DESTINATION ${CMAKE_INSTALL_DOCDIR}/systemd ) 
 
 # uninstall target

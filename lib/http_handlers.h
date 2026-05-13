@@ -450,14 +450,11 @@ http_handler_pin_control(raop_conn_t *conn, http_request_t *request, http_respon
         return;
     }
 
-    conn->raop->pin = (unsigned short) (10000 + new_pin);
-    conn->raop->use_pin = true;
-    char pin_str[6];
-    snprintf(pin_str, sizeof(pin_str), "%04u", new_pin);
-    if (conn->raop->callbacks.display_pin) {
-        conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, pin_str);
+    if (raop_control_set_pin(conn->raop, new_pin)) {
+        http_pin_send_error(protocol, response, 400, "Bad Request",
+                            "pin parameter missing or invalid", response_data, response_datalen);
+        return;
     }
-    logger_log(conn->raop->logger, LOGGER_INFO, "HTTP control updated pin to %s", pin_str);
     http_pin_send_status(conn, "ok", "pin updated", true, response, response_data, response_datalen);
 }
 
@@ -716,13 +713,8 @@ http_handler_mirror_audio_control(raop_conn_t *conn, http_request_t *request, ht
         return;
     }
 
-    conn->raop->mirror_audio_enabled = enabled;
-    if (conn->raop->callbacks.mirror_audio_set_enabled) {
-        conn->raop->callbacks.mirror_audio_set_enabled(conn->raop->callbacks.cls, enabled);
-    }
+    raop_control_set_mirror_audio(conn->raop, enabled);
     bool applied = http_mirror_audio_get_enabled(conn);
-    logger_log(conn->raop->logger, LOGGER_INFO, "HTTP control mirror audio set to %s",
-               (applied ? "on" : "off"));
     http_audio_send_status(conn, "ok",
                            (applied ? "mirror audio enabled" : "mirror audio disabled"),
                            response, response_data, response_datalen);

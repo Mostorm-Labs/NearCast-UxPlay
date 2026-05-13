@@ -101,6 +101,8 @@ struct raop_callbacks_s {
     void  (*on_video_rate) (void *cls, const float rate);
     void  (*on_video_stop) (void *cls);
     void  (*on_video_acquire_playback_info) (void *cls, playback_info_t *playback_video);
+    void  (*control_pin_changed) (void *cls, unsigned short pin);
+    void  (*control_audio_changed) (void *cls, bool enabled);
   
 };
 typedef struct raop_callbacks_s raop_callbacks_t;
@@ -132,6 +134,11 @@ RAOP_API void raop_set_dnssd(raop_t *raop, dnssd_t *dnssd);
 RAOP_API void raop_destroy(raop_t *raop);
 RAOP_API void raop_remove_known_connections(raop_t * raop);
 RAOP_API void raop_destroy_airplay_video(raop_t *raop);
+RAOP_API int raop_control_get_pin(raop_t *raop, unsigned short *pin_out, bool *use_pin_out);
+RAOP_API int raop_control_set_pin(raop_t *raop, unsigned short pin);
+RAOP_API bool raop_control_get_mirror_audio(raop_t *raop);
+RAOP_API int raop_control_set_mirror_audio(raop_t *raop, bool enabled);
+RAOP_API void raop_control_stop(raop_t *raop);
 
 #ifdef __cplusplus
 }

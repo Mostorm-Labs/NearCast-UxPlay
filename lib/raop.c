@@ -830,6 +830,77 @@ raop_get_callback_cls(raop_t *raop) {
     return raop->callbacks.cls;
 }
 
+int
+raop_control_get_pin(raop_t *raop, unsigned short *pin_out, bool *use_pin_out) {
+    assert(raop);
+    if (pin_out) {
+        *pin_out = (unsigned short) (raop->pin % 10000);
+    }
+    if (use_pin_out) {
+        *use_pin_out = (raop->use_pin && raop->pin > 0);
+    }
+    return 0;
+}
+
+int
+raop_control_set_pin(raop_t *raop, unsigned short pin) {
+    assert(raop);
+    if (pin > 9999) {
+        return -1;
+    }
+    raop->pin = (unsigned short) (10000 + pin);
+    raop->use_pin = true;
+
+    char pin_str[6];
+    snprintf(pin_str, sizeof(pin_str), "%04u", pin);
+    if (raop->callbacks.display_pin) {
+        raop->callbacks.display_pin(raop->callbacks.cls, pin_str);
+    }
+    logger_log(raop->logger, LOGGER_INFO, "control updated pin to %s", pin_str);
+    if (raop->callbacks.control_pin_changed) {
+        raop->callbacks.control_pin_changed(raop->callbacks.cls, pin);
+    }
+    return 0;
+}
+
+bool
+raop_control_get_mirror_audio(raop_t *raop) {
+    assert(raop);
+    if (raop->callbacks.mirror_audio_get_enabled) {
+        return raop->callbacks.mirror_audio_get_enabled(raop->callbacks.cls);
+    }
+    return raop->mirror_audio_enabled;
+}
+
+int
+raop_control_set_mirror_audio(raop_t *raop, bool enabled) {
+    assert(raop);
+    raop->mirror_audio_enabled = enabled;
+    if (raop->callbacks.mirror_audio_set_enabled) {
+        raop->callbacks.mirror_audio_set_enabled(raop->callbacks.cls, enabled);
+    }
+    bool applied = raop_control_get_mirror_audio(raop);
+    logger_log(raop->logger, LOGGER_INFO, "control mirror audio set to %s",
+               (applied ? "on" : "off"));
+    if (raop->callbacks.control_audio_changed) {
+        raop->callbacks.control_audio_changed(raop->callbacks.cls, applied);
+    }
+    return 0;
+}
+
+void
+raop_control_stop(raop_t *raop) {
+    assert(raop);
+    logger_log(raop->logger, LOGGER_INFO, "control requested stop casting");
+    if (raop->callbacks.on_video_stop) {
+        raop->callbacks.on_video_stop(raop->callbacks.cls);
+    }
+    if (raop->callbacks.video_reset) {
+        raop->callbacks.video_reset(raop->callbacks.cls);
+    }
+    httpd_remove_known_connections(raop->httpd);
+}
+
 void
 raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, void *cls) {
     assert(raop);

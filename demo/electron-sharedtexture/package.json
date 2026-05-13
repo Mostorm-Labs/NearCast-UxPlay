@@ -6,6 +6,7 @@
   "main": "main.js",
   "scripts": {
     "build:native": "powershell -ExecutionPolicy Bypass -File .\\scripts\\build-native.ps1",
+    "package:win": "powershell -ExecutionPolicy Bypass -File .\\scripts\\package-win.ps1",
     "start": "powershell -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron .\""
   },
   "devDependencies": {
