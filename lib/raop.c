@@ -108,6 +108,7 @@ struct raop_conn_s {
     bool authenticated;
     bool have_active_remote;
     bool nohold_disconnect_pending;
+    bool pin_required_announced;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -283,6 +284,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             logger_log(conn->raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type RAOP", ptr);
             httpd_set_connection_type(conn->raop->httpd, ptr, CONNECTION_TYPE_RAOP);
             conn->connection_type = CONNECTION_TYPE_RAOP;
+            raop_report_configured_pin_required(conn);
         } else if (client_session_id) {
             logger_log(conn->raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type AirPlay", ptr);            
             httpd_set_connection_type(conn->raop->httpd, ptr, CONNECTION_TYPE_AIRPLAY);

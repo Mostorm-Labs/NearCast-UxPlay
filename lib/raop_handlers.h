@@ -203,6 +203,7 @@ raop_handler_info(raop_conn_t *conn,
 
 static void
 raop_report_pin_required(raop_conn_t *conn, char *pin) {
+    conn->pin_required_announced = true;
     if (conn->raop->callbacks.display_pin) {
          conn->raop->callbacks.display_pin(conn->raop->callbacks.cls, pin);
     }
@@ -210,6 +211,17 @@ raop_report_pin_required(raop_conn_t *conn, char *pin) {
          conn->raop->callbacks.control_pin_required(conn->raop->callbacks.cls, pin);
     }
     logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", pin);
+}
+
+static void
+raop_report_configured_pin_required(raop_conn_t *conn) {
+    if (!conn->raop->use_pin || conn->raop->pin == 0 || conn->pin_required_announced) {
+        return;
+    }
+
+    char pin[6];
+    snprintf(pin, sizeof(pin), "%04u", conn->raop->pin % 10000);
+    raop_report_pin_required(conn, pin);
 }
 
 static void
