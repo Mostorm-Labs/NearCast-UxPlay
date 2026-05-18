@@ -703,6 +703,9 @@ raop_handler_setup(raop_conn_t *conn,
 
         if (conn->nohold_disconnect_pending && conn->authenticated) {
             logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: authentication succeeded, disconnecting previous client");
+            if (conn->raop->callbacks.handoff_start) {
+                conn->raop->callbacks.handoff_start(conn->raop->callbacks.cls);
+            }
             if (conn->raop->callbacks.video_reset) {
                 conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
             }

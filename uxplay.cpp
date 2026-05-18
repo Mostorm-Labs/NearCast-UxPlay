@@ -435,6 +435,24 @@ static bool control_state_connection_closed() {
     return stopped;
 }
 
+static bool control_state_mirror_stopped() {
+    bool stopped = false;
+    if (control_state_mutex_initialized) {
+        MUTEX_LOCK(control_state_mutex);
+    }
+    stopped = control_mirror_started_announced;
+    control_mirror_started_announced = false;
+    if (open_connections == 0) {
+        control_client_name.clear();
+        control_client_model.clear();
+        control_client_device_id.clear();
+    }
+    if (control_state_mutex_initialized) {
+        MUTEX_UNLOCK(control_state_mutex);
+    }
+    return stopped;
+}
+
 static std::string generate_ws_control_token() {
     unsigned char bytes[24];
     bool have_random = mg_random(bytes, sizeof(bytes));
@@ -2352,6 +2370,13 @@ extern "C" void video_reset(void *cls) {
     reset_loop = true;
 }
 
+extern "C" void handoff_start(void *cls) {
+    (void) cls;
+    fprintf(stdout, "HANDOFF\tSTART\tnohold\n");
+    fflush(stdout);
+    ws_control_queue_event("handoffStarted", "{\"reason\":\"nohold\"}");
+}
+
 extern "C" int video_set_codec(void *cls, video_codec_t codec) {
     bool video_is_h265 = (codec == VIDEO_CODEC_H265);
     return video_renderer_choose_codec(video_is_h265);
@@ -2446,6 +2471,10 @@ extern "C" void conn_reset (void *cls, int reason) {
 }
 
 extern "C" void conn_teardown(void *cls, bool *teardown_96, bool *teardown_110) {
+    if (*teardown_110) {
+        control_state_mirror_stopped();
+        ws_control_queue_event("mirrorStopped", "{\"reason\":\"teardown\"}");
+    }
     if (*teardown_110 && close_window) {
         relaunch_video = true;
         reset_loop = true;
@@ -2866,6 +2895,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.passwd = passwd;
     raop_cbs.export_dacp = export_dacp;
     raop_cbs.video_reset = video_reset;
+    raop_cbs.handoff_start = handoff_start;
     raop_cbs.video_set_codec = video_set_codec;
     raop_cbs.on_video_play = on_video_play;
     raop_cbs.on_video_scrub = on_video_scrub;

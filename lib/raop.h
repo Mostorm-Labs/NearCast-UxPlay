@@ -70,6 +70,7 @@ struct raop_callbacks_s {
     void  (*conn_feedback) (void *cls);
     void  (*conn_reset) (void *cls, int reason);
     void  (*video_reset) (void *cls);
+    void  (*handoff_start) (void *cls);
   
   
     /* Optional but recommended callback functions (probably not optional, check this)*/

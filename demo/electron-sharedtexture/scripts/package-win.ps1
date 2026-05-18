@@ -28,6 +28,76 @@ function Copy-DirectoryContents([string]$Source, [string]$Destination) {
   Copy-Item -Path (Join-Path $Source "*") -Destination $Destination -Recurse -Force
 }
 
+function Get-NpmPackagePath([string]$NodeModulesRoot, [string]$PackageName) {
+  $parts = $PackageName -split "/"
+  $packagePath = $NodeModulesRoot
+  foreach ($part in $parts) {
+    $packagePath = Join-Path $packagePath $part
+  }
+  return $packagePath
+}
+
+function Copy-NpmPackageDependency(
+  [string]$PackageName,
+  [string]$SourceNodeModulesRoot,
+  [string]$DestinationNodeModulesRoot,
+  [hashtable]$CopiedPackages
+) {
+  if ($CopiedPackages.ContainsKey($PackageName)) {
+    return
+  }
+  $CopiedPackages[$PackageName] = $true
+
+  $source = Get-NpmPackagePath $SourceNodeModulesRoot $PackageName
+  $destination = Get-NpmPackagePath $DestinationNodeModulesRoot $PackageName
+
+  if (!(Test-Path $source)) {
+    throw "Production dependency not found: $source. Run npm install in $(Split-Path -Parent $SourceNodeModulesRoot) first."
+  }
+
+  Copy-DirectoryContents $source $destination
+
+  $packageJsonPath = Join-Path $source "package.json"
+  if (!(Test-Path $packageJsonPath)) {
+    return
+  }
+
+  $packageJson = Get-Content -LiteralPath $packageJsonPath -Raw | ConvertFrom-Json
+  if (!$packageJson.dependencies) {
+    return
+  }
+
+  foreach ($dependency in $packageJson.dependencies.PSObject.Properties.Name) {
+    Copy-NpmPackageDependency $dependency $SourceNodeModulesRoot $DestinationNodeModulesRoot $CopiedPackages
+  }
+}
+
+function Copy-NpmProductionDependencies([string]$DemoRoot, [string]$AppRoot) {
+  $packageJsonPath = Join-Path $DemoRoot "package.json"
+  $nodeModulesRoot = Join-Path $DemoRoot "node_modules"
+
+  if (!(Test-Path $packageJsonPath)) {
+    throw "package.json not found: $packageJsonPath."
+  }
+  if (!(Test-Path $nodeModulesRoot)) {
+    throw "node_modules not found: $nodeModulesRoot. Run npm install in $DemoRoot first."
+  }
+
+  $packageJson = Get-Content -LiteralPath $packageJsonPath -Raw | ConvertFrom-Json
+
+  if (!$packageJson.dependencies) {
+    return
+  }
+
+  $destinationNodeModulesRoot = Join-Path $AppRoot "node_modules"
+  New-Item -ItemType Directory -Force -Path $destinationNodeModulesRoot | Out-Null
+
+  $copiedPackages = @{}
+  foreach ($dependency in $packageJson.dependencies.PSObject.Properties.Name) {
+    Copy-NpmPackageDependency $dependency $nodeModulesRoot $destinationNodeModulesRoot $copiedPackages
+  }
+}
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $demoRoot = Split-Path -Parent $scriptDir
 $repoRoot = Resolve-FullPath (Join-Path $demoRoot "..\..")
@@ -66,7 +136,11 @@ if (!(Test-Path $gstPluginSource)) {
 Assert-ChildPath $OutputRoot $packageRoot
 
 if (Test-Path $packageRoot) {
-  Remove-Item -LiteralPath $packageRoot -Recurse -Force
+  try {
+    Remove-Item -LiteralPath $packageRoot -Recurse -Force
+  } catch {
+    throw "Unable to remove existing package directory: $packageRoot. Close any running UxPlaySharedTexture/Electron process using this folder and try again. $($_.Exception.Message)"
+  }
 }
 
 Write-Host "Packaging Electron runtime..."
@@ -83,11 +157,15 @@ Write-Host "Copying Electron app files..."
 New-Item -ItemType Directory -Force -Path $appRoot | Out-Null
 $appFiles = @(
   "package.json",
+  "package-lock.json",
   "main.js",
   "index.html",
+  "pin.html",
+  "pin-renderer.js",
   "renderer.js",
   "README.md",
-  "DEMO_INTRODUCTION.md"
+  "DEMO_INTRODUCTION.md",
+  "WEBSOCKET_PROTOCOL.md"
 )
 foreach ($file in $appFiles) {
   $source = Join-Path $demoRoot $file
@@ -95,6 +173,9 @@ foreach ($file in $appFiles) {
     Copy-Item -LiteralPath $source -Destination $appRoot -Force
   }
 }
+
+Write-Host "Copying Electron app production dependencies..."
+Copy-NpmProductionDependencies $demoRoot $appRoot
 
 Write-Host "Copying UxPlay runtime..."
 New-Item -ItemType Directory -Force -Path $runtimeRoot | Out-Null

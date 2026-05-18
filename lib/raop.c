@@ -269,6 +269,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                         conn->nohold_disconnect_pending = true;
                         logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: delaying previous connection disconnect until authentication succeeds");
                     } else {
+                        if (conn->raop->callbacks.handoff_start) {
+                            conn->raop->callbacks.handoff_start(conn->raop->callbacks.cls);
+                        }
                         if (conn->raop->callbacks.video_reset) {
                             conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
                         }
