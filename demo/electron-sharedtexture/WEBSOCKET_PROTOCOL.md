@@ -1,6 +1,10 @@
 # UxPlay / Electron Demo WebSocket 协议说明
 
-本文档描述当前代码里的 WebSocket 协议现状，覆盖两条链路：
+本文档描述当前代码里的 WebSocket 协议现状，并补充一个参考 `websocket_protocol_advance.md`
+整理出来的增强消息模型。当前代码兼容 `type/id/op/data/ok/error` 的轻量协议和 `sid/op/d` 的增强协议；
+轻量协议仍是 Electron demo 内部默认使用的格式。
+
+文档覆盖两条链路：
 
 - Electron demo 到 UxPlay 的内部控制链路：`ws://127.0.0.1:7001/`
 - 外部控制端到 Electron demo 的应用控制链路：`ws://127.0.0.1:7010/`
@@ -33,7 +37,7 @@ UXPLAY_CONTROL_TOKEN=<48 hex chars>
 
 Electron 自己对外暴露的控制口默认也使用同一个会话 token，除非设置了 `UXPLAY_APP_WS_TOKEN`。
 
-## 2. 公共消息格式
+## 2. 当前公共消息格式
 
 所有 payload 都是 WebSocket text frame，内容为 JSON。
 
@@ -99,7 +103,156 @@ Electron demo 对外控制口的失败响应会把详细错误放在 `data.error
 }
 ```
 
-## 3. 认证
+## 3. 增强协议模型参考
+
+本节来自 `websocket_protocol_advance.md` 的模型整理。当前 UxPlay 内部控制口和 Electron demo 应用控制口
+已经兼容这个 wire format。设计目标是把连接生命周期、请求响应和事件推送放进同一种外层消息结构，便于
+追踪会话和扩展订阅、心跳、挥手等能力。
+
+### 外层消息 Envelope
+
+```json
+{
+  "sid": "session-id",
+  "op": 7,
+  "d": {}
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `sid` | string | SessionId，用于追踪一次 WebSocket 连接的生命周期。 |
+| `op` | number | OpCode，标识当前消息类型。 |
+| `d` | object | 当前消息的业务内容。请求参数、响应结果和事件内容都放在这里。 |
+
+### OpCode
+
+| op | 名称 | 说明 | 当前状态 |
+| --- | --- | --- | --- |
+| `0` | `Hello` | 客户端握手，创建会话。 | 已兼容 |
+| `1` | `HelloAck` | 服务端握手响应，返回 `sid` 和能力信息。 | 已兼容 |
+| `5` | `Subscribe` | 订阅事件。 | 预留；当前实现认证后广播全部事件 |
+| `6` | `Event` | 服务端事件通知。 | 可映射当前 `type=event` |
+| `7` | `Request` | 资源方法请求。 | 可映射当前 `type=request` |
+| `8` | `RequestResponse` | 请求响应。 | 可映射当前 `type=response` |
+| `14` | `Bye` | 客户端结束会话。 | 已兼容 |
+| `15` | `ByeAck` | 服务端结束会话响应。 | 已兼容 |
+
+### 内容对象字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 请求 ID。每个 `method` 请求都应携带，响应必须原样返回。 |
+| `method` | 请求方法名，对应当前协议里的字符串 `op`。 |
+| `params` | 请求参数，对应当前协议里的 `data`。 |
+| `status` | 请求响应状态。 |
+| `code` | 状态码或错误码。 |
+| `comment` | 错误描述或补充说明。 |
+| `result` | 请求成功后的业务结果。 |
+| `event` | 事件名称。 |
+| `data` | 事件内容。 |
+
+### 请求类型 `op=7`
+
+```json
+{
+  "sid": "session-id",
+  "op": 7,
+  "d": {
+    "id": "set-pin-1",
+    "method": "setPin",
+    "params": {
+      "pin": "1234"
+    }
+  }
+}
+```
+
+### 响应类型 `op=8`
+
+成功响应：
+
+```json
+{
+  "sid": "session-id",
+  "op": 8,
+  "d": {
+    "id": "set-pin-1",
+    "method": "setPin",
+    "status": {
+      "result": true,
+      "code": 100
+    },
+    "result": {
+      "pin": "1234"
+    }
+  }
+}
+```
+
+失败响应：
+
+```json
+{
+  "sid": "session-id",
+  "op": 8,
+  "d": {
+    "id": "set-pin-1",
+    "method": "setPin",
+    "status": {
+      "result": false,
+      "code": 300,
+      "comment": "INVALID_PARAMS"
+    }
+  }
+}
+```
+
+### 事件类型 `op=6`
+
+```json
+{
+  "sid": "session-id",
+  "op": 6,
+  "d": {
+    "event": "pinChanged",
+    "data": {
+      "pin": "5678"
+    }
+  }
+}
+```
+
+### 当前协议到增强模型的映射
+
+| 当前字段 | 增强模型字段 | 说明 |
+| --- | --- | --- |
+| `type=request` | `op=7` | 请求消息。 |
+| `type=response` | `op=8` | 响应消息。 |
+| `type=event` | `op=6` | 事件消息。 |
+| `id` | `d.id` | 请求响应关联 ID。 |
+| `op` | `d.method` 或 `d.event` | 请求方法名或事件名。 |
+| `data` | `d.params` / `d.result` / `d.data` | 根据消息类型分别表示参数、结果或事件数据。 |
+| `ok` | `d.status.result` | 布尔成功状态。 |
+| `error` | `d.status.comment` | 错误码字符串。 |
+
+增强模型建议把 `auth` 继续作为 `Request(op=7)` 里的业务方法；`Hello/HelloAck` 只负责创建会话和协商能力，
+不替代 token 认证。
+
+### 推荐增强交互流程
+
+```text
+1. 建立 WebSocket 连接
+2. 客户端发送 Hello(op=0)
+3. 服务端返回 HelloAck(op=1)，包含 sid、协议版本和能力列表
+4. 客户端发送 auth Request(op=7, method=auth)
+5. 服务端返回 RequestResponse(op=8)
+6. 客户端发送业务 Request(op=7)，服务端用 RequestResponse(op=8) 回复
+7. 服务端可随时推送 Event(op=6)
+8. 客户端主动结束时发送 Bye(op=14)，服务端返回 ByeAck(op=15)
+```
+
+## 4. 认证
 
 每条 WebSocket 连接都必须先发送 `auth` 请求，认证通过后才能调用其他操作。
 
@@ -129,7 +282,7 @@ Electron demo 对外控制口的失败响应会把详细错误放在 `data.error
 
 认证失败返回 `UNAUTHORIZED`。Electron demo 的应用控制口会在未授权时关闭连接，close code 为 `1008`。
 
-## 4. UxPlay 内部控制口
+## 5. UxPlay 内部控制口
 
 ### 地址和限制
 
@@ -387,7 +540,7 @@ UxPlay 事件只会广播给已经通过 `auth` 的 WebSocket 连接。内部事
 | `INVALID_OP` | 未知操作 |
 | `INTERNAL_ERROR` | 兜底内部错误 |
 
-## 5. Electron demo 应用控制口
+## 6. Electron demo 应用控制口
 
 ### 地址和环境变量
 
@@ -639,7 +792,7 @@ Electron demo 会向所有已认证外部客户端广播事件。
 | `audioChanged` | `{ "mirrorAudio": boolean }`，兼容事件 |
 | `window.changed` | `{ "window": "cast"|"pin", "action": string, "reason"?: string, "state": object }` |
 
-## 6. 推荐调用流程
+## 7. 推荐调用流程
 
 外部控制 Electron demo：
 
@@ -660,7 +813,7 @@ Electron demo 会向所有已认证外部客户端广播事件。
 4. 如需事件，保持连接并监听 mirrorStarted、mirrorStopped、pinChanged、pinRequired、audioChanged
 ```
 
-## 7. 当前实现注意事项
+## 8. 当前实现注意事项
 
 - UxPlay 控制口是本地 loopback 控制口，不面向局域网开放。
 - Electron 应用控制口默认也是本地监听；只有设置 `UXPLAY_APP_WS_ALLOW_LAN=1` 后才会使用 `UXPLAY_APP_WS_HOST`。
@@ -668,3 +821,11 @@ Electron demo 会向所有已认证外部客户端广播事件。
 - UxPlay 事件和 Electron 应用事件都没有订阅过滤，认证后的客户端会收到全部广播事件。
 - PIN 必须是 4 位数字字符串，例如 `"0007"`。
 - `getStatus.data.ip` 当前为 `null`。
+
+## 9. 演进建议
+
+- 短期保持当前轻量协议作为默认路径，避免破坏 Electron demo 和已有客户端。
+- 新客户端 SDK 可以先在内部抽象出 `method/params/result/status`，再适配当前 wire format。
+- 如果要把增强模型设为唯一协议，建议新增协议版本或独立端点，避免现有客户端收到不兼容消息。
+- `Subscribe(op=5)` 可以作为后续事件过滤能力；当前实现仍是认证后广播全部事件。
+- `Hello/HelloAck` 可以返回 `protocolVersion`、`sid`、`serverName`、`capabilities` 和 `maxPayload`。

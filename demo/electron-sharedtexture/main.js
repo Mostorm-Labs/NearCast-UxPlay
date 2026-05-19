@@ -246,15 +246,46 @@ function sendJsonToWebSocket(ws, payload) {
   return true;
 }
 
-function broadcastAppEvent(op, data = {}) {
-  const payload = {
+function createAppWsSessionId() {
+  return crypto.randomBytes(8).toString('hex');
+}
+
+function ensureAppWsSessionId(ws, sidHint = null) {
+  if (typeof sidHint === 'string' && sidHint.trim()) {
+    ws.sessionId = sidHint.trim().slice(0, 30);
+  }
+  if (!ws.sessionId) {
+    ws.sessionId = createAppWsSessionId();
+  }
+  return ws.sessionId;
+}
+
+function isAppWsAdvanced(ws) {
+  return ws?.protocolMode === 'advanced';
+}
+
+function makeAppWsEventPayload(ws, op, data = {}) {
+  if (isAppWsAdvanced(ws)) {
+    return {
+      sid: ensureAppWsSessionId(ws),
+      op: 6,
+      d: {
+        event: op,
+        data,
+      },
+    };
+  }
+  return {
     type: 'event',
     op,
     data,
   };
+}
+
+function broadcastAppEvent(op, data = {}) {
   for (const client of appWsClients) {
     if (client.isAuthenticated) {
-      sendJsonToWebSocket(client, payload);
+      sendJsonToWebSocket(client, makeAppWsEventPayload(client, op, data));
     }
   }
 }
@@ -1463,10 +1494,42 @@ function setCastWindowFullscreen(nextFullscreen, reason = 'manual') {
   };
 }
 
-function sendAppWsResponse(ws, id, ok, data = {}, error = null) {
+function sendAppWsResponse(ws, requestOrId, ok, data = {}, error = null) {
+  const request = requestOrId && typeof requestOrId === 'object'
+    ? requestOrId
+    : { id: requestOrId, op: '' };
+  const id = typeof request.id === 'undefined' || request.id === null ? '' : String(request.id);
+  const method = typeof request.op === 'string' ? request.op : '';
+
+  if (isAppWsAdvanced(ws)) {
+    const status = {
+      result: ok,
+      code: ok ? 100 : 300,
+    };
+    if (!ok) {
+      status.comment = error?.code || 'INTERNAL_ERROR';
+    }
+    const payload = {
+      sid: ensureAppWsSessionId(ws, request.sid),
+      op: 8,
+      d: {
+        id,
+        status,
+      },
+    };
+    if (method) {
+      payload.d.method = method;
+    }
+    if (ok) {
+      payload.d.result = data;
+    }
+    sendJsonToWebSocket(ws, payload);
+    return;
+  }
+
   const payload = {
     type: 'response',
-    id: typeof id === 'undefined' || id === null ? '' : String(id),
+    id,
     ok,
     data,
   };
@@ -1490,12 +1553,86 @@ function parseAppWsRequest(rawMessage) {
     });
   }
 
-  if (!parsed || parsed.type !== 'request' || typeof parsed.op !== 'string') {
+  if (!parsed || typeof parsed !== 'object') {
     throw createControlError('INVALID_REQUEST', 'Request must contain type=request and op.', {
       httpStatus: 400,
     });
   }
-  return parsed;
+
+  if (parsed.type === 'request' && typeof parsed.op === 'string') {
+    return {
+      protocolMode: 'legacy',
+      id: parsed.id,
+      op: parsed.op,
+      data: parsed.data && typeof parsed.data === 'object' ? parsed.data : {},
+    };
+  }
+
+  if (Number.isInteger(parsed.op)) {
+    const sid = typeof parsed.sid === 'string' ? parsed.sid : null;
+    if (parsed.op === 0) {
+      return {
+        protocolMode: 'advanced',
+        controlOp: 'hello',
+        sid,
+      };
+    }
+    if (parsed.op === 14) {
+      return {
+        protocolMode: 'advanced',
+        controlOp: 'bye',
+        sid,
+      };
+    }
+    if (parsed.op === 7 && parsed.d && typeof parsed.d === 'object' && typeof parsed.d.method === 'string') {
+      return {
+        protocolMode: 'advanced',
+        sid,
+        id: parsed.d.id,
+        op: parsed.d.method,
+        data: parsed.d.params && typeof parsed.d.params === 'object' ? parsed.d.params : {},
+      };
+    }
+    return {
+      protocolMode: 'advanced',
+      sid,
+      id: parsed.d && typeof parsed.d === 'object' ? parsed.d.id : undefined,
+      op: '',
+      invalidRequest: true,
+    };
+  }
+
+  throw createControlError('INVALID_REQUEST', 'Request must be legacy type=request or advanced op=7.', {
+    httpStatus: 400,
+  });
+}
+
+function sendAppWsHelloAck(ws, sidHint = null) {
+  ws.protocolMode = 'advanced';
+  const sid = ensureAppWsSessionId(ws, sidHint);
+  sendJsonToWebSocket(ws, {
+    sid,
+    op: 1,
+    d: {
+      protocolVersion: 2,
+      serverName: uxplayServerName,
+      capabilities: ['auth', 'request', 'event', 'bye'],
+      legacyCompatible: true,
+      maxPayload: 64 * 1024,
+    },
+  });
+}
+
+function sendAppWsByeAck(ws, sidHint = null) {
+  ws.protocolMode = 'advanced';
+  const sid = ensureAppWsSessionId(ws, sidHint);
+  sendJsonToWebSocket(ws, {
+    sid,
+    op: 15,
+    d: {
+      message: 'bye',
+    },
+  });
 }
 
 async function stopBridge(reason = 'manual') {
@@ -1647,6 +1784,27 @@ async function handleAppWsMessage(ws, rawMessage) {
   let request;
   try {
     request = parseAppWsRequest(rawMessage);
+    if (request.protocolMode === 'advanced') {
+      ws.protocolMode = 'advanced';
+      ensureAppWsSessionId(ws, request.sid);
+    }
+
+    if (request.controlOp === 'hello') {
+      sendAppWsHelloAck(ws, request.sid);
+      return;
+    }
+
+    if (request.controlOp === 'bye') {
+      sendAppWsByeAck(ws, request.sid);
+      ws.close(1000, 'bye');
+      return;
+    }
+
+    if (request.invalidRequest) {
+      throw createControlError('INVALID_OP', 'Unknown advanced WebSocket opcode.', {
+        httpStatus: 400,
+      });
+    }
 
     if (!ws.isAuthenticated) {
       if (request.op !== 'auth') {
@@ -1660,22 +1818,22 @@ async function handleAppWsMessage(ws, rawMessage) {
         });
       }
       ws.isAuthenticated = true;
-      sendAppWsResponse(ws, request.id, true, { message: 'authenticated' });
+      sendAppWsResponse(ws, request, true, { message: 'authenticated' });
       broadcastAppEvent('app.ready', getAppStatus());
       return;
     }
 
     if (request.op === 'auth') {
-      sendAppWsResponse(ws, request.id, true, { message: 'authenticated' });
+      sendAppWsResponse(ws, request, true, { message: 'authenticated' });
       return;
     }
 
     const result = await handleAuthenticatedAppWsRequest(ws, request);
-    sendAppWsResponse(ws, request.id, true, result);
+    sendAppWsResponse(ws, request, true, result);
   } catch (error) {
     const formatted = rememberLastError(error);
     broadcastAppEvent('error', formatted);
-    sendAppWsResponse(ws, request?.id, false, {}, error);
+    sendAppWsResponse(ws, request || undefined, false, {}, error);
     if (error?.code === 'UNAUTHORIZED') {
       ws.close(1008, 'unauthorized');
     }
@@ -1695,6 +1853,8 @@ function startAppWebSocketServer() {
 
   appWsServer.on('connection', (ws) => {
     ws.isAuthenticated = false;
+    ws.protocolMode = 'legacy';
+    ws.sessionId = null;
     appWsClients.add(ws);
     ws.on('message', (message) => {
       void handleAppWsMessage(ws, message);
