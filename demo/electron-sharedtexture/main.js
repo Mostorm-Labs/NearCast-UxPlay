@@ -20,7 +20,7 @@ const defaultUxplayExecutable = app.isPackaged
 const uxplayExecutable =
   process.env.UXPLAY_EXE || defaultUxplayExecutable;
 const uxplayWorkdir = path.dirname(uxplayExecutable);
-const uxplayServerName =
+let uxplayServerName =
   process.env.UXPLAY_SERVER_NAME || 'UxPlay SharedTexture';
 const msysRoot = process.env.MSYS2_ROOT || 'D:\\msys64';
 const gstreamerBin = app.isPackaged
@@ -172,6 +172,7 @@ function getAppStatus() {
       ready: appReady,
       packaged: app.isPackaged,
       name: uxplayServerName,
+      serverName: uxplayServerName,
     },
     uxplay: {
       ready: bridgeReady,
@@ -224,6 +225,7 @@ function getAppStatus() {
     wsUrl: uxplayWsUrl,
     appWsPort: appWsEnabled ? appWsPort : null,
     appWsUrl: electronWsUrl,
+    serverName: uxplayServerName,
     castingActive,
     pin: currentPin,
     rotating: pinUpdateInFlight,
@@ -232,8 +234,10 @@ function getAppStatus() {
     audioUpdating: mirrorAudioUpdateInFlight,
     stopUpdating: stopUpdateInFlight,
     isFullscreen: castWindowState.fullscreen,
+    isAlwaysOnTop: castWindowState.alwaysOnTop,
     windowVisible: castWindowState.visible,
     castWindowVisible: castWindowState.visible,
+    castWindowAlwaysOnTop: castWindowState.alwaysOnTop,
     pinWindowVisible: pinWindowState.visible,
   };
 }
@@ -400,6 +404,26 @@ function normalizeMutedInput(rawMuted) {
   });
 }
 
+function normalizeUxplayServerNameInput(rawName) {
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
+  if (!name) {
+    throw createControlError('INVALID_SERVER_NAME', 'Server name must be a non-empty string.', {
+      httpStatus: 400,
+    });
+  }
+  if (/[\u0000-\u001f\u007f]/.test(name)) {
+    throw createControlError('INVALID_SERVER_NAME', 'Server name must not contain control characters.', {
+      httpStatus: 400,
+    });
+  }
+  if (Buffer.byteLength(name, 'utf8') > 63) {
+    throw createControlError('INVALID_SERVER_NAME', 'Server name must be at most 63 UTF-8 bytes.', {
+      httpStatus: 400,
+    });
+  }
+  return name;
+}
+
 function generateRandomPin(excludePin = null) {
   for (let attempt = 0; attempt < 6; ++attempt) {
     const candidate = String(crypto.randomInt(0, 10000)).padStart(4, '0');
@@ -473,6 +497,7 @@ function getCastWindowState() {
   return {
     visible: Boolean(win && !win.isDestroyed() && win.isVisible()),
     fullscreen: Boolean(win && !win.isDestroyed() && win.isFullScreen()),
+    alwaysOnTop: Boolean(win && !win.isDestroyed() && win.isAlwaysOnTop()),
   };
 }
 
@@ -1494,6 +1519,30 @@ function setCastWindowFullscreen(nextFullscreen, reason = 'manual') {
   };
 }
 
+function setCastWindowAlwaysOnTop(nextAlwaysOnTop, reason = 'manual') {
+  if (!win || win.isDestroyed()) {
+    throw createControlError('WINDOW_UNAVAILABLE', 'Application window is not available.', {
+      httpStatus: 503,
+    });
+  }
+  if (typeof nextAlwaysOnTop !== 'boolean') {
+    throw createControlError('INVALID_ALWAYS_ON_TOP_VALUE', 'Always-on-top must be a boolean value.', {
+      httpStatus: 400,
+    });
+  }
+  win.setAlwaysOnTop(nextAlwaysOnTop);
+  broadcastAppEvent('window.changed', {
+    window: 'cast',
+    action: 'always-on-top',
+    reason,
+    state: getCastWindowState(),
+  });
+  broadcastControlStatus();
+  return {
+    alwaysOnTop: win.isAlwaysOnTop(),
+  };
+}
+
 function sendAppWsResponse(ws, requestOrId, ok, data = {}, error = null) {
   const request = requestOrId && typeof requestOrId === 'object'
     ? requestOrId
@@ -1687,12 +1736,61 @@ async function restartUxPlay(reason = 'manual') {
   return getAppStatus();
 }
 
+async function applyUxplayServerName(rawName, reason = 'manual') {
+  const nextServerName = normalizeUxplayServerNameInput(rawName);
+  const previousServerName = uxplayServerName;
+  if (nextServerName === previousServerName) {
+    return {
+      serverName: uxplayServerName,
+      previousServerName,
+      restarted: false,
+      status: getAppStatus(),
+    };
+  }
+
+  uxplayServerName = nextServerName;
+  process.env.UXPLAY_SERVER_NAME = uxplayServerName;
+  updateTrayMenu();
+  broadcastAppEvent('serverName.changed', {
+    serverName: uxplayServerName,
+    previousServerName,
+    reason,
+  });
+  broadcastControlStatus();
+
+  let restarted = false;
+  if (bridge) {
+    await restartUxPlay(`${reason}:server-name`);
+    restarted = true;
+  }
+
+  const status = getAppStatus();
+  broadcastControlStatus();
+  return {
+    serverName: uxplayServerName,
+    previousServerName,
+    restarted,
+    status,
+  };
+}
+
 async function handleAuthenticatedAppWsRequest(ws, request) {
   const data = request.data && typeof request.data === 'object' ? request.data : {};
 
   switch (request.op) {
     case 'getStatus':
       return getAppStatus();
+
+    case 'getServerName':
+      return {
+        serverName: uxplayServerName,
+      };
+
+    case 'setServerName':
+    case 'setUxPlayServerName': {
+      const requestedName = typeof data.serverName === 'string' ? data.serverName : data.name;
+      return applyUxplayServerName(requestedName, 'ws-command');
+    }
 
     case 'getPin':
       return {
@@ -1750,6 +1848,14 @@ async function handleAuthenticatedAppWsRequest(ws, request) {
       const fullscreen = data.fullscreen;
       return {
         ...setCastWindowFullscreen(fullscreen, 'ws-command'),
+        status: getAppStatus(),
+      };
+    }
+
+    case 'setAlwaysOnTop': {
+      const alwaysOnTop = data.alwaysOnTop;
+      return {
+        ...setCastWindowAlwaysOnTop(alwaysOnTop, 'ws-command'),
         status: getAppStatus(),
       };
     }
@@ -1968,6 +2074,7 @@ function setupIpcHandlers() {
       return {
         ok: true,
         isFullscreen: castWindowState.fullscreen,
+        alwaysOnTop: castWindowState.alwaysOnTop,
         visible: castWindowState.visible,
       };
     } catch (error) {
@@ -2014,6 +2121,23 @@ function setupIpcHandlers() {
       return {
         ok: true,
         isFullscreen: false,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: formatControlError(error),
+      };
+    }
+  });
+
+  ipcMain.handle('window-control:set-always-on-top', (event, payload) => {
+    try {
+      ensureTrustedSender(event);
+      ensureControlToken(payload?.token);
+      const response = setCastWindowAlwaysOnTop(payload?.alwaysOnTop, 'ipc-always-on-top');
+      return {
+        ok: true,
+        ...response,
       };
     } catch (error) {
       return {

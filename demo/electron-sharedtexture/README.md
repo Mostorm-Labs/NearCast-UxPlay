@@ -72,6 +72,17 @@ npm start
 - The main process exposes `uxplay-control:stop-casting` and reuses the trusted-renderer + per-session control token checks used by PIN/audio controls.
 - `uxplay-control:get-session` / status push now include `stopUpdating` so renderer button state and feedback remain authoritative.
 
+## Server Name Control API Integration
+
+- The Electron WebSocket control server exposes `getServerName` and `setServerName`.
+- `setServerName` accepts `{"serverName": "Living Room UxPlay"}` or `{"name": "Living Room UxPlay"}`.
+- When the name changes, the demo restarts the UxPlay child process so the new `-n <serverName>` value is advertised.
+
+## Cast Window Control API Integration
+
+- The Electron WebSocket control server exposes `showCastWindow`, `hideCastWindow`, `setFullscreen`, and `setAlwaysOnTop`.
+- `setAlwaysOnTop` accepts `{"alwaysOnTop": true|false}` and updates the cast window topmost state.
+
 ## Casting State Sync
 
 - The main process now treats `castingActive` as the authoritative casting state for the demo UI.

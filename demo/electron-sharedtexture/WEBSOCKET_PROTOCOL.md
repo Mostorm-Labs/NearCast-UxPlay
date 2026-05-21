@@ -562,7 +562,8 @@ UxPlay 事件只会广播给已经通过 `auth` 的 WebSocket 连接。内部事
   "app": {
     "ready": true,
     "packaged": false,
-    "name": "UxPlay SharedTexture"
+    "name": "UxPlay SharedTexture",
+    "serverName": "UxPlay SharedTexture"
   },
   "uxplay": {
     "ready": true,
@@ -616,7 +617,8 @@ UxPlay 事件只会广播给已经通过 `auth` 的 WebSocket 连接。内部事
     "cast": {
       "available": true,
       "visible": true,
-      "fullscreen": true
+      "fullscreen": true,
+      "alwaysOnTop": false
     },
     "pin": {
       "available": true,
@@ -630,7 +632,7 @@ UxPlay 事件只会广播给已经通过 `auth` 的 WebSocket 连接。内部事
 }
 ```
 
-为兼容当前 renderer，响应里还保留了一组扁平字段：`ready`, `port`, `wsPort`, `wsUrl`, `appWsPort`, `appWsUrl`, `castingActive`, `pin`, `rotating`, `mirrorAudioEnabled`, `muted`, `audioUpdating`, `stopUpdating`, `isFullscreen`, `windowVisible`, `castWindowVisible`, `pinWindowVisible`。
+为兼容当前 renderer，响应里还保留了一组扁平字段：`ready`, `port`, `wsPort`, `wsUrl`, `appWsPort`, `appWsUrl`, `serverName`, `castingActive`, `pin`, `rotating`, `mirrorAudioEnabled`, `muted`, `audioUpdating`, `stopUpdating`, `isFullscreen`, `isAlwaysOnTop`, `windowVisible`, `castWindowVisible`, `castWindowAlwaysOnTop`, `pinWindowVisible`。
 
 ### 操作
 
@@ -644,6 +646,54 @@ UxPlay 事件只会广播给已经通过 `auth` 的 WebSocket 连接。内部事
   "id": "status-1",
   "op": "getStatus",
   "data": {}
+}
+```
+
+#### `getServerName`
+
+查询当前 Electron demo 用来启动 UxPlay 的 AirPlay ServerName。
+
+```json
+{
+  "type": "request",
+  "id": "server-name-1",
+  "op": "getServerName",
+  "data": {}
+}
+```
+
+响应数据：
+
+```json
+{
+  "serverName": "UxPlay SharedTexture"
+}
+```
+
+#### `setServerName`
+
+设置 UxPlay 的 AirPlay ServerName。名称变化时 Electron demo 会重启 UxPlay 子进程，并用新的 `-n <serverName>` 参数启动，因此当前投屏会被中断。
+`data.serverName` 和 `data.name` 都可以使用；名称不能为空，不能包含控制字符，且最多 63 个 UTF-8 字节。
+
+```json
+{
+  "type": "request",
+  "id": "set-server-name-1",
+  "op": "setServerName",
+  "data": {
+    "serverName": "Living Room UxPlay"
+  }
+}
+```
+
+响应数据：
+
+```json
+{
+  "serverName": "Living Room UxPlay",
+  "previousServerName": "UxPlay SharedTexture",
+  "restarted": true,
+  "status": {}
 }
 ```
 
@@ -754,8 +804,9 @@ UxPlay 事件只会广播给已经通过 `auth` 的 WebSocket 连接。内部事
 { "type": "request", "id": "w1", "op": "showCastWindow", "data": {} }
 { "type": "request", "id": "w2", "op": "hideCastWindow", "data": {} }
 { "type": "request", "id": "w3", "op": "setFullscreen", "data": { "fullscreen": true } }
-{ "type": "request", "id": "w4", "op": "showPinWindow", "data": {} }
-{ "type": "request", "id": "w5", "op": "hidePinWindow", "data": {} }
+{ "type": "request", "id": "w4", "op": "setAlwaysOnTop", "data": { "alwaysOnTop": true } }
+{ "type": "request", "id": "w5", "op": "showPinWindow", "data": {} }
+{ "type": "request", "id": "w6", "op": "hidePinWindow", "data": {} }
 ```
 
 #### 进程控制
@@ -776,6 +827,7 @@ Electron demo 会向所有已认证外部客户端广播事件。
 | `uxplay.ready` | 完整状态对象 |
 | `uxplay.exited` | `{ "code": number|null, "signal": string|null }` |
 | `error` | `{ "code": string, "message": string, "httpStatus": number, "details"?: object }` |
+| `serverName.changed` | `{ "serverName": string, "previousServerName": string, "reason": string }` |
 | `control.portChanged` | `{ "port": number }` |
 | `casting.started` | `{ "reason": string, "status": object }` |
 | `casting.stopped` | `{ "reason": string, "status": object }` |
@@ -800,7 +852,7 @@ Electron demo 会向所有已认证外部客户端广播事件。
 1. 连接 ws://127.0.0.1:7010/
 2. 发送 auth
 3. 发送 getStatus，拿到当前 UxPlay 和窗口状态
-4. 根据需要调用 rotatePin / setPin / setMuted / stopCasting / 窗口控制
+4. 根据需要调用 setServerName / rotatePin / setPin / setMuted / stopCasting / 窗口控制
 5. 持续监听 status.changed、casting.started、casting.stopped、pin.changed、audio.changed
 ```
 
