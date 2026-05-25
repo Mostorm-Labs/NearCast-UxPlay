@@ -264,25 +264,14 @@ function ensureAppWsSessionId(ws, sidHint = null) {
   return ws.sessionId;
 }
 
-function isAppWsAdvanced(ws) {
-  return ws?.protocolMode === 'advanced';
-}
-
 function makeAppWsEventPayload(ws, op, data = {}) {
-  if (isAppWsAdvanced(ws)) {
-    return {
-      sid: ensureAppWsSessionId(ws),
-      op: 6,
-      d: {
-        event: op,
-        data,
-      },
-    };
-  }
   return {
-    type: 'event',
-    op,
-    data,
+    sid: ensureAppWsSessionId(ws),
+    op: 6,
+    d: {
+      event: op,
+      data,
+    },
   };
 }
 
@@ -831,11 +820,57 @@ function nextUxplayWsRequestId(op) {
   return `uxplay-${process.pid}-${Date.now()}-${uxplayWsRequestSequence}-${op}`;
 }
 
+function makeAdvancedWsRequest(sid, id, method, params = {}) {
+  return {
+    sid,
+    op: 7,
+    d: {
+      id,
+      method,
+      params,
+    },
+  };
+}
+
+function getAdvancedWsPayload(rawMessage, opForError = '') {
+  let payload;
+  try {
+    payload = JSON.parse(rawMessage.toString('utf8'));
+  } catch {
+    throw createControlError('UPSTREAM_INVALID_RESPONSE', 'UxPlay WebSocket response is not valid JSON.', {
+      httpStatus: 502,
+      details: {
+        op: opForError,
+      },
+    });
+  }
+
+  return payload && typeof payload === 'object' ? payload : null;
+}
+
+function parseAdvancedWsResponse(payload) {
+  if (!payload || payload.op !== 8 || !payload.d || typeof payload.d !== 'object') {
+    return null;
+  }
+  const status = payload.d.status && typeof payload.d.status === 'object'
+    ? payload.d.status
+    : {};
+  return {
+    id: typeof payload.d.id === 'undefined' || payload.d.id === null ? '' : String(payload.d.id),
+    ok: status.result === true,
+    error: typeof status.comment === 'string' && status.comment
+      ? status.comment
+      : (status.result === false ? 'UPSTREAM_REJECTED' : ''),
+    data: payload.d.result && typeof payload.d.result === 'object' ? payload.d.result : {},
+  };
+}
+
 function makeUxplayWsRejectError(response, op) {
-  const upstreamError = response?.error || 'UPSTREAM_REJECTED';
+  const advanced = parseAdvancedWsResponse(response);
+  const upstreamError = advanced?.error || response?.error || 'UPSTREAM_REJECTED';
   const message =
-    response?.data?.message ||
-    response?.data?.error?.message ||
+    advanced?.data?.message ||
+    advanced?.data?.error?.message ||
     `UxPlay WebSocket ${op} request failed: ${upstreamError}.`;
   return createControlError('UPSTREAM_REJECTED', message, {
     httpStatus: 502,
@@ -851,10 +886,12 @@ function requestUxplayWebSocketOnce(op, data = {}, fallbackMessage = 'ok', timeo
   const url = getWsUrl('127.0.0.1', uxplayWsPort);
   const authId = nextUxplayWsRequestId('auth');
   const requestId = nextUxplayWsRequestId(op);
+  const sid = createAppWsSessionId();
 
   return new Promise((resolve, reject) => {
     let ws = null;
     let settled = false;
+    let helloAcked = false;
     let authenticated = false;
     let timeout = null;
 
@@ -923,14 +960,7 @@ function requestUxplayWebSocketOnce(op, data = {}, fallbackMessage = 'ok', timeo
     });
 
     ws.on('open', () => {
-      sendRequest({
-        type: 'request',
-        id: authId,
-        op: 'auth',
-        data: {
-          token: controlSessionToken,
-        },
-      });
+      sendRequest({ sid, op: 0, d: {} });
     });
 
     ws.on('message', (rawMessage) => {
@@ -946,37 +976,36 @@ function requestUxplayWebSocketOnce(op, data = {}, fallbackMessage = 'ok', timeo
         return;
       }
 
-      let response;
+      let payload;
       try {
-        response = JSON.parse(rawMessage.toString('utf8'));
-      } catch {
+        payload = getAdvancedWsPayload(rawMessage, op);
+      } catch (error) {
         fail(
-          createControlError('UPSTREAM_INVALID_RESPONSE', 'UxPlay WebSocket response is not valid JSON.', {
-            httpStatus: 502,
-            details: {
-              op,
-            },
-          }),
+          error,
         );
         return;
       }
 
-      if (!response || response.type !== 'response') {
+      if (!helloAcked && payload?.op === 1) {
+        helloAcked = true;
+        sendRequest(makeAdvancedWsRequest(sid, authId, 'auth', {
+          token: controlSessionToken,
+        }));
+        return;
+      }
+
+      const response = parseAdvancedWsResponse(payload);
+      if (!response) {
         return;
       }
 
       if (response.id === authId) {
         if (!response.ok) {
-          fail(makeUxplayWsRejectError(response, 'auth'));
+          fail(makeUxplayWsRejectError(payload, 'auth'));
           return;
         }
         authenticated = true;
-        sendRequest({
-          type: 'request',
-          id: requestId,
-          op,
-          data,
-        });
+        sendRequest(makeAdvancedWsRequest(sid, requestId, op, data));
         return;
       }
 
@@ -985,13 +1014,13 @@ function requestUxplayWebSocketOnce(op, data = {}, fallbackMessage = 'ok', timeo
       }
 
       if (!response.ok) {
-        fail(makeUxplayWsRejectError(response, op));
+        fail(makeUxplayWsRejectError(payload, op));
         return;
       }
 
       finish(resolve, {
         statusCode: 200,
-        body: response.data && typeof response.data === 'object'
+        body: response.data && Object.keys(response.data).length
           ? response.data
           : { message: fallbackMessage },
       });
@@ -1180,7 +1209,7 @@ function handleUxplayEventSocketMessage(ws, rawMessage, authId) {
 
   let message;
   try {
-    message = JSON.parse(rawMessage.toString('utf8'));
+    message = getAdvancedWsPayload(rawMessage, 'event-auth');
   } catch {
     return;
   }
@@ -1189,8 +1218,17 @@ function handleUxplayEventSocketMessage(ws, rawMessage, authId) {
     return;
   }
 
-  if (message.type === 'response' && message.id === authId) {
-    if (!message.ok) {
+  if (message.op === 1) {
+    const sid = typeof ws.sessionId === 'string' && ws.sessionId ? ws.sessionId : message.sid;
+    sendJsonToWebSocket(ws, makeAdvancedWsRequest(sid, authId, 'auth', {
+      token: controlSessionToken,
+    }));
+    return;
+  }
+
+  const response = parseAdvancedWsResponse(message);
+  if (response?.id === authId) {
+    if (!response.ok) {
       console.warn('[uxplay-ws-events] authentication failed');
       ws.close(1008, 'auth failed');
       return;
@@ -1199,13 +1237,13 @@ function handleUxplayEventSocketMessage(ws, rawMessage, authId) {
     return;
   }
 
-  if (message.type !== 'event' || typeof message.op !== 'string') {
+  if (message.op !== 6 || !message.d || typeof message.d.event !== 'string') {
     return;
   }
 
   handleUxplayControlEvent(
-    message.op,
-    message.data && typeof message.data === 'object' ? message.data : {},
+    message.d.event,
+    message.d.data && typeof message.d.data === 'object' ? message.d.data : {},
   );
 }
 
@@ -1226,22 +1264,17 @@ function connectUxplayEventWebSocket(reason = 'manual') {
   }
 
   const authId = nextUxplayWsRequestId('event-auth');
+  const sid = createAppWsSessionId();
   const ws = new WebSocket(url, {
     handshakeTimeout: uxplayControlTimeoutMs,
     maxPayload: uxplayWsResponseLimitBytes,
   });
+  ws.sessionId = sid;
   uxplayEventWs = ws;
   uxplayEventAuthenticated = false;
 
   ws.on('open', () => {
-    sendJsonToWebSocket(ws, {
-      type: 'request',
-      id: authId,
-      op: 'auth',
-      data: {
-        token: controlSessionToken,
-      },
-    });
+    sendJsonToWebSocket(ws, { sid, op: 0, d: {} });
   });
 
   ws.on('message', (rawMessage) => {
@@ -1550,44 +1583,26 @@ function sendAppWsResponse(ws, requestOrId, ok, data = {}, error = null) {
   const id = typeof request.id === 'undefined' || request.id === null ? '' : String(request.id);
   const method = typeof request.op === 'string' ? request.op : '';
 
-  if (isAppWsAdvanced(ws)) {
-    const status = {
-      result: ok,
-      code: ok ? 100 : 300,
-    };
-    if (!ok) {
-      status.comment = error?.code || 'INTERNAL_ERROR';
-    }
-    const payload = {
-      sid: ensureAppWsSessionId(ws, request.sid),
-      op: 8,
-      d: {
-        id,
-        status,
-      },
-    };
-    if (method) {
-      payload.d.method = method;
-    }
-    if (ok) {
-      payload.d.result = data;
-    }
-    sendJsonToWebSocket(ws, payload);
-    return;
-  }
-
-  const payload = {
-    type: 'response',
-    id,
-    ok,
-    data,
+  const status = {
+    result: ok,
+    code: ok ? 100 : 300,
   };
   if (!ok) {
-    payload.error = error?.code || 'INTERNAL_ERROR';
-    payload.data = {
-      ...(data && typeof data === 'object' ? data : {}),
-      error: formatControlError(error),
-    };
+    status.comment = error?.code || 'INTERNAL_ERROR';
+  }
+  const payload = {
+    sid: ensureAppWsSessionId(ws, request.sid),
+    op: 8,
+    d: {
+      id,
+      status,
+    },
+  };
+  if (method) {
+    payload.d.method = method;
+  }
+  if (ok) {
+    payload.d.result = data;
   }
   sendJsonToWebSocket(ws, payload);
 }
@@ -1603,39 +1618,27 @@ function parseAppWsRequest(rawMessage) {
   }
 
   if (!parsed || typeof parsed !== 'object') {
-    throw createControlError('INVALID_REQUEST', 'Request must contain type=request and op.', {
+    throw createControlError('INVALID_REQUEST', 'Request must use the sid/op/d enhanced message model.', {
       httpStatus: 400,
     });
-  }
-
-  if (parsed.type === 'request' && typeof parsed.op === 'string') {
-    return {
-      protocolMode: 'legacy',
-      id: parsed.id,
-      op: parsed.op,
-      data: parsed.data && typeof parsed.data === 'object' ? parsed.data : {},
-    };
   }
 
   if (Number.isInteger(parsed.op)) {
     const sid = typeof parsed.sid === 'string' ? parsed.sid : null;
     if (parsed.op === 0) {
       return {
-        protocolMode: 'advanced',
         controlOp: 'hello',
         sid,
       };
     }
     if (parsed.op === 14) {
       return {
-        protocolMode: 'advanced',
         controlOp: 'bye',
         sid,
       };
     }
     if (parsed.op === 7 && parsed.d && typeof parsed.d === 'object' && typeof parsed.d.method === 'string') {
       return {
-        protocolMode: 'advanced',
         sid,
         id: parsed.d.id,
         op: parsed.d.method,
@@ -1643,7 +1646,6 @@ function parseAppWsRequest(rawMessage) {
       };
     }
     return {
-      protocolMode: 'advanced',
       sid,
       id: parsed.d && typeof parsed.d === 'object' ? parsed.d.id : undefined,
       op: '',
@@ -1651,13 +1653,12 @@ function parseAppWsRequest(rawMessage) {
     };
   }
 
-  throw createControlError('INVALID_REQUEST', 'Request must be legacy type=request or advanced op=7.', {
+  throw createControlError('INVALID_REQUEST', 'Request must use the sid/op/d enhanced message model.', {
     httpStatus: 400,
   });
 }
 
 function sendAppWsHelloAck(ws, sidHint = null) {
-  ws.protocolMode = 'advanced';
   const sid = ensureAppWsSessionId(ws, sidHint);
   sendJsonToWebSocket(ws, {
     sid,
@@ -1666,14 +1667,12 @@ function sendAppWsHelloAck(ws, sidHint = null) {
       protocolVersion: 2,
       serverName: uxplayServerName,
       capabilities: ['auth', 'request', 'event', 'bye'],
-      legacyCompatible: true,
       maxPayload: 64 * 1024,
     },
   });
 }
 
 function sendAppWsByeAck(ws, sidHint = null) {
-  ws.protocolMode = 'advanced';
   const sid = ensureAppWsSessionId(ws, sidHint);
   sendJsonToWebSocket(ws, {
     sid,
@@ -1890,10 +1889,7 @@ async function handleAppWsMessage(ws, rawMessage) {
   let request;
   try {
     request = parseAppWsRequest(rawMessage);
-    if (request.protocolMode === 'advanced') {
-      ws.protocolMode = 'advanced';
-      ensureAppWsSessionId(ws, request.sid);
-    }
+    ensureAppWsSessionId(ws, request.sid);
 
     if (request.controlOp === 'hello') {
       sendAppWsHelloAck(ws, request.sid);
@@ -1959,7 +1955,6 @@ function startAppWebSocketServer() {
 
   appWsServer.on('connection', (ws) => {
     ws.isAuthenticated = false;
-    ws.protocolMode = 'legacy';
     ws.sessionId = null;
     appWsClients.add(ws);
     ws.on('message', (message) => {

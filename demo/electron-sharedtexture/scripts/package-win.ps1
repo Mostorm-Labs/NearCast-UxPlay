@@ -165,7 +165,8 @@ $appFiles = @(
   "renderer.js",
   "README.md",
   "DEMO_INTRODUCTION.md",
-  "WEBSOCKET_PROTOCOL.md"
+  "WEBSOCKET_PROTOCOL.md",
+  "websocket_protocol_advance.md"
 )
 foreach ($file in $appFiles) {
   $source = Join-Path $demoRoot $file

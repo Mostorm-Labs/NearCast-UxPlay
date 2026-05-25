@@ -524,14 +524,6 @@ static void ws_connection_set_authenticated(struct mg_connection *c, bool authen
     c->data[0] = authenticated ? 1 : 0;
 }
 
-static bool ws_connection_advanced(struct mg_connection *c) {
-    return c->data[1] == 1;
-}
-
-static void ws_connection_set_advanced(struct mg_connection *c, bool advanced) {
-    c->data[1] = advanced ? 1 : 0;
-}
-
 static std::string generate_ws_session_id() {
     unsigned char bytes[8];
     bool have_random = mg_random(bytes, sizeof(bytes));
@@ -570,11 +562,6 @@ static void ws_send_text(struct mg_connection *c, const std::string &message) {
     mg_ws_send(c, message.c_str(), message.size(), WEBSOCKET_OP_TEXT);
 }
 
-static std::string ws_legacy_event_json(const std::string &op, const std::string &data_json) {
-    return "{\"type\":\"event\",\"op\":\"" + json_escape(op) + "\",\"data\":" +
-           (data_json.empty() ? "{}" : data_json) + "}";
-}
-
 static std::string ws_advanced_event_json(struct mg_connection *c, const std::string &op,
                                           const std::string &data_json) {
     return "{\"sid\":\"" + json_escape(ws_connection_sid(c)) +
@@ -582,23 +569,9 @@ static std::string ws_advanced_event_json(struct mg_connection *c, const std::st
            "\",\"data\":" + (data_json.empty() ? "{}" : data_json) + "}}";
 }
 
-static void ws_send_legacy_response(struct mg_connection *c, const std::string &id, bool ok,
-                                    const std::string &data_json, const std::string &error) {
-    std::string message = "{\"type\":\"response\",\"id\":\"" + json_escape(id) +
-                          "\",\"ok\":" + (ok ? "true" : "false") +
-                          ",\"data\":" + (data_json.empty() ? "{}" : data_json);
-    if (!ok) {
-        message.append(",\"error\":\"");
-        message.append(json_escape(error.empty() ? "INTERNAL_ERROR" : error));
-        message.append("\"");
-    }
-    message.append("}");
-    ws_send_text(c, message);
-}
-
-static void ws_send_advanced_response(struct mg_connection *c, const std::string &id,
-                                      const std::string &method, bool ok,
-                                      const std::string &data_json, const std::string &error) {
+static void ws_send_response(struct mg_connection *c, const std::string &id,
+                             const std::string &method, bool ok,
+                             const std::string &data_json, const std::string &error) {
     std::string message = "{\"sid\":\"" + json_escape(ws_connection_sid(c)) +
                           "\",\"op\":8,\"d\":{\"id\":\"" + json_escape(id) + "\"";
     if (!method.empty()) {
@@ -624,35 +597,22 @@ static void ws_send_advanced_response(struct mg_connection *c, const std::string
     ws_send_text(c, message);
 }
 
-static void ws_send_response(struct mg_connection *c, const std::string &id,
-                             const std::string &method, bool ok,
-                             const std::string &data_json, const std::string &error) {
-    if (ws_connection_advanced(c)) {
-        ws_send_advanced_response(c, id, method, ok, data_json, error);
-    } else {
-        ws_send_legacy_response(c, id, ok, data_json, error);
-    }
-}
-
 static void ws_send_response(struct mg_connection *c, const std::string &id, bool ok,
                              const std::string &data_json, const std::string &error) {
     ws_send_response(c, id, "", ok, data_json, error);
 }
 
 static void ws_send_hello_ack(struct mg_connection *c) {
-    ws_connection_set_advanced(c, true);
     std::string sid = ws_connection_sid(c);
     std::string message = "{\"sid\":\"" + json_escape(sid) +
                           "\",\"op\":1,\"d\":{\"protocolVersion\":2,"
                           "\"serverName\":\"UxPlay\","
                           "\"capabilities\":[\"auth\",\"request\",\"event\",\"bye\"],"
-                          "\"legacyCompatible\":true,"
                           "\"maxPayload\":16384}}";
     ws_send_text(c, message);
 }
 
 static void ws_send_bye_ack(struct mg_connection *c) {
-    ws_connection_set_advanced(c, true);
     std::string message = "{\"sid\":\"" + json_escape(ws_connection_sid(c)) +
                           "\",\"op\":15,\"d\":{\"message\":\"bye\"}}";
     ws_send_text(c, message);
@@ -727,8 +687,7 @@ static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
         c->is_draining = 1;
         return;
     }
-    if (envelope_op != -1 && envelope_op != 7) {
-        ws_connection_set_advanced(c, true);
+    if (envelope_op != 7) {
         char *sid_raw = mg_json_get_str(body, "$.sid");
         char *id_raw = mg_json_get_str(body, "$.d.id");
         ws_connection_set_sid(c, sid_raw ? sid_raw : "");
@@ -738,26 +697,19 @@ static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
         return;
     }
 
-    bool advanced = envelope_op == 7;
-    if (advanced) {
-        ws_connection_set_advanced(c, true);
-        char *sid_raw = mg_json_get_str(body, "$.sid");
-        ws_connection_set_sid(c, sid_raw ? sid_raw : "");
-        if (sid_raw) mg_free(sid_raw);
-    }
+    char *sid_raw = mg_json_get_str(body, "$.sid");
+    ws_connection_set_sid(c, sid_raw ? sid_raw : "");
+    if (sid_raw) mg_free(sid_raw);
 
-    char *id_raw = mg_json_get_str(body, advanced ? "$.d.id" : "$.id");
-    char *type_raw = advanced ? NULL : mg_json_get_str(body, "$.type");
-    char *op_raw = mg_json_get_str(body, advanced ? "$.d.method" : "$.op");
+    char *id_raw = mg_json_get_str(body, "$.d.id");
+    char *op_raw = mg_json_get_str(body, "$.d.method");
     std::string id = id_raw ? id_raw : "";
-    std::string type = type_raw ? type_raw : "";
     std::string op = op_raw ? op_raw : "";
 
     if (id_raw) mg_free(id_raw);
-    if (type_raw) mg_free(type_raw);
     if (op_raw) mg_free(op_raw);
 
-    if ((!advanced && type != "request") || op.empty()) {
+    if (op.empty()) {
         ws_send_response(c, id, op, false, "{}", "INVALID_PARAMS");
         return;
     }
@@ -768,7 +720,7 @@ static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
     }
 
     if (op == "auth") {
-        char *token_raw = mg_json_get_str(body, advanced ? "$.d.params.token" : "$.data.token");
+        char *token_raw = mg_json_get_str(body, "$.d.params.token");
         bool ok = token_raw && !ws_control_token.empty() && ws_control_token == token_raw;
         if (token_raw) mg_free(token_raw);
         if (!ok) {
@@ -786,7 +738,7 @@ static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
     }
 
     if (op == "setPin") {
-        char *pin_raw = mg_json_get_str(body, advanced ? "$.d.params.pin" : "$.data.pin");
+        char *pin_raw = mg_json_get_str(body, "$.d.params.pin");
         unsigned short new_pin = 0;
         bool valid = parse_four_digit_pin(pin_raw, &new_pin);
         if (pin_raw) mg_free(pin_raw);
@@ -817,7 +769,7 @@ static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
 
     if (op == "setAudio") {
         bool enabled = false;
-        if (!mg_json_get_bool(body, advanced ? "$.d.params.enabled" : "$.data.enabled", &enabled)) {
+        if (!mg_json_get_bool(body, "$.d.params.enabled", &enabled)) {
             ws_send_response(c, id, op, false, "{}", "INVALID_PARAMS");
             return;
         }
@@ -898,9 +850,7 @@ static void ws_control_broadcast_queued_events(struct mg_mgr *mgr) {
     for (const WsControlEvent &event : events) {
         for (struct mg_connection *c = mgr->conns; c != NULL; c = c->next) {
             if (c->is_websocket && ws_connection_authenticated(c)) {
-                ws_send_text(c, ws_connection_advanced(c) ?
-                             ws_advanced_event_json(c, event.op, event.data_json) :
-                             ws_legacy_event_json(event.op, event.data_json));
+                ws_send_text(c, ws_advanced_event_json(c, event.op, event.data_json));
             }
         }
     }
