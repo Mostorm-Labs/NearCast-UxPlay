@@ -17,8 +17,14 @@ const packagedUxplayRuntimeDir = path.join(process.resourcesPath, 'uxplay-runtim
 const defaultUxplayExecutable = app.isPackaged
   ? path.join(packagedUxplayRuntimeDir, 'uxplay.exe')
   : path.join(repoRoot, 'build', 'uxplay.exe');
+const requestedUxplayExecutable = (process.env.UXPLAY_EXE || '').trim();
+const allowPackagedExternalUxplay =
+  process.env.UXPLAY_ALLOW_EXTERNAL_EXE === '1' ||
+  process.env.UXPLAY_ALLOW_EXTERNAL_EXE === 'true';
 const uxplayExecutable =
-  process.env.UXPLAY_EXE || defaultUxplayExecutable;
+  requestedUxplayExecutable && (!app.isPackaged || allowPackagedExternalUxplay)
+    ? requestedUxplayExecutable
+    : defaultUxplayExecutable;
 const uxplayWorkdir = path.dirname(uxplayExecutable);
 let uxplayServerName =
   process.env.UXPLAY_SERVER_NAME || 'UxPlay SharedTexture';
@@ -34,6 +40,12 @@ const gstreamerPluginScanner = path.join(
   'gstreamer-1.0',
   'gst-plugin-scanner.exe',
 );
+if (app.isPackaged && requestedUxplayExecutable && !allowPackagedExternalUxplay) {
+  console.warn(
+    `[uxplay] ignoring UXPLAY_EXE in packaged app: ${requestedUxplayExecutable}. ` +
+      `Set UXPLAY_ALLOW_EXTERNAL_EXE=1 to use an external executable.`,
+  );
+}
 const traceSharedTexture =
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === '1' ||
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === 'true';
@@ -85,6 +97,7 @@ let stopUpdateInFlight = false;
 let castingActive = false;
 let mirrorSessionActive = false;
 let mirrorSessionIdleTimer = null;
+let frameFallbackSuppressedUntil = 0;
 let autoPinRotatedForCastingSession = false;
 let frameSending = false;
 let pendingFrame = null;
@@ -177,6 +190,8 @@ function getAppStatus() {
     uxplay: {
       ready: bridgeReady,
       pid: bridge?.pid || null,
+      executable: uxplayExecutable,
+      workdir: uxplayWorkdir,
       httpPort: uxplayHttpPort,
       ws: {
         enabled: uxplayWsEnabled,
@@ -469,6 +484,21 @@ function clearMirrorSessionIdleTimer() {
   mirrorSessionIdleTimer = null;
 }
 
+function suppressFrameFallbackAfterStop(reason = 'unspecified') {
+  frameFallbackSuppressedUntil = Date.now() + Math.max(1500, mirrorSessionIdleMs);
+  if (traceSharedTexture) {
+    console.log(`[shared-texture:session] suppressing frame fallback reason=${reason}`);
+  }
+}
+
+function clearFrameFallbackSuppression() {
+  frameFallbackSuppressedUntil = 0;
+}
+
+function isFrameFallbackSuppressed() {
+  return Date.now() < frameFallbackSuppressedUntil;
+}
+
 function clearPendingMainFrame(reason = 'unspecified') {
   if (!pendingFrame) {
     return;
@@ -559,6 +589,12 @@ function showCastWindow(reason = 'unspecified') {
   if (!win.isVisible()) {
     win.show();
   }
+  win.setAlwaysOnTop(true);
+  if (pinWindow && !pinWindow.isDestroyed() && pinWindow.isVisible()) {
+    bringPinWindowToTop();
+  } else if (typeof win.moveTop === 'function') {
+    win.moveTop();
+  }
   broadcastAppEvent('window.changed', {
     window: 'cast',
     action: 'show',
@@ -576,11 +612,21 @@ function hideCastWindow(reason = 'unspecified') {
     return;
   }
 
-  if (win.isVisible()) {
-    win.hide();
-  }
+  const finishHide = () => {
+    if (!win || win.isDestroyed()) {
+      return;
+    }
+    if (win.isVisible()) {
+      win.hide();
+    }
+  };
+
   if (win.isFullScreen()) {
+    win.once('leave-full-screen', finishHide);
     win.setFullScreen(false);
+    setTimeout(finishHide, 250);
+  } else {
+    finishHide();
   }
   broadcastAppEvent('window.changed', {
     window: 'cast',
@@ -699,6 +745,17 @@ function createPinWindow() {
   return pinWindow;
 }
 
+function bringPinWindowToTop() {
+  if (!pinWindow || pinWindow.isDestroyed()) {
+    return;
+  }
+
+  pinWindow.setAlwaysOnTop(true, 'screen-saver');
+  if (typeof pinWindow.moveTop === 'function') {
+    pinWindow.moveTop();
+  }
+}
+
 function showPinWindow(reason = 'unspecified') {
   const targetWindow = createPinWindow();
   if (!targetWindow || targetWindow.isDestroyed()) {
@@ -709,6 +766,7 @@ function showPinWindow(reason = 'unspecified') {
   if (!targetWindow.isVisible()) {
     targetWindow.showInactive();
   }
+  bringPinWindowToTop();
   targetWindow.webContents.send('uxplay-control:status', getAppStatus());
   schedulePinWindowAutoHide('pin-auto-hide');
   broadcastAppEvent('pin.required', {
@@ -739,6 +797,11 @@ function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
   const normalized = nextActive === true;
   if (!normalized || options.clearPending === true) {
     clearPendingMainFrame(`casting-${reason}`);
+  }
+  if (normalized) {
+    clearFrameFallbackSuppression();
+  } else {
+    suppressFrameFallbackAfterStop(reason);
   }
   if (castingActive === normalized) {
     if (castingActive) {
@@ -2154,6 +2217,7 @@ function createWindow() {
     frame: false,
     autoHideMenuBar: true,
     show: false,
+    alwaysOnTop: true,
     fullscreen: false,
     fullscreenable: true,
     skipTaskbar: true,
@@ -2367,7 +2431,10 @@ function startBridge() {
   }
   if (!fs.existsSync(uxplayExecutable)) {
     throw new Error(
-      `UxPlay executable not found: ${uxplayExecutable}. Build UxPlay first or set UXPLAY_EXE.`,
+      `UxPlay executable not found: ${uxplayExecutable}. ` +
+        (app.isPackaged
+          ? `Bundled runtime directory: ${packagedUxplayRuntimeDir}.`
+          : 'Build UxPlay first or set UXPLAY_EXE.'),
     );
   }
 
@@ -2402,6 +2469,11 @@ function startBridge() {
     childEnv.GST_PLUGIN_SYSTEM_PATH = childEnv.GST_PLUGIN_SYSTEM_PATH || '';
     childEnv.GST_PLUGIN_SYSTEM_PATH_1_0 = childEnv.GST_PLUGIN_SYSTEM_PATH_1_0 || '';
   }
+
+  console.log(
+    `[uxplay] launching ${uxplayExecutable} ` +
+      `(cwd=${uxplayWorkdir}, packaged=${app.isPackaged})`,
+  );
 
   bridge = spawn(
     uxplayExecutable,
@@ -2467,6 +2539,7 @@ function startBridge() {
       const [sessionState, ...reasonParts] = rest;
       const reason = reasonParts.length > 0 ? reasonParts.join('\t') : 'bridge';
       if (sessionState === 'ACTIVE') {
+        clearFrameFallbackSuppression();
         setCastingActive(true, `session-active:${reason}`);
       } else if (sessionState === 'INACTIVE') {
         mirrorSessionActive = false;
@@ -2490,6 +2563,11 @@ function startBridge() {
     const height = Number(heightText);
     const timestampUs = Number(timestampText);
     if (!castingActive) {
+      if (isFrameFallbackSuppressed()) {
+        notifyBridgeRelease(frameId);
+        traceSharedTextureStats(`frame-fallback-suppressed-${frameId}`);
+        return;
+      }
       setCastingActive(true, 'frame-fallback');
     }
     framesReceived += 1;

@@ -27,6 +27,29 @@ npm start
 
 Then start AirPlay mirroring from an Apple device to the server name `UxPlay SharedTexture` or the value of `UXPLAY_SERVER_NAME`.
 
+## Package
+
+Build the Windows NSIS installer:
+
+```powershell
+cd demo/electron-sharedtexture
+npm install
+npm run installer:win
+```
+
+The installer is written to `dist/installer/UxPlaySharedTexture-Setup-<version>.exe`.
+
+The installer bundles:
+
+- Electron app files and production npm dependencies
+- `..\..\build\uxplay.exe`
+- DLLs copied from `..\..\build`
+- GStreamer plugins from `..\..\build\lib\gstreamer-1.0`
+- `gst-plugin-scanner.exe` from `${env:MSYS2_ROOT}\mingw64\libexec\gstreamer-1.0` when available
+- `..\..\bonjoursdksetup.exe`, which the NSIS installer runs silently with `/qn /norestart` unless Bonjour SDK is already installed
+
+Set `UXPLAY_BUILD_ROOT` or `MSYS2_ROOT` before packaging if your local paths differ from the defaults.
+
 ## Configure UxPlay
 
 By default the demo launches:
@@ -38,6 +61,8 @@ $env:UXPLAY_ARGS='-fs -bt709'
 $env:UXPLAY_TRACE_SHARED_TEXTURE='1'
 npm start
 ```
+
+Packaged builds launch the bundled `resources\uxplay-runtime\uxplay.exe` by default and ignore `UXPLAY_EXE` so a development-machine environment variable cannot point the installer at a debug tree. To intentionally override the bundled executable in a packaged app, set both `UXPLAY_EXE` and `UXPLAY_ALLOW_EXTERNAL_EXE=1`.
 
 `UXPLAY_ARGS` is appended after `-stpid <electronPid> -stdoutlog 0`, so avoid passing another `-stdoutlog` unless you want to change the protocol setup. If you need logs while keeping stdout clean for `READY/FRAME`, prefer adding `-logfile <path>` in `UXPLAY_ARGS`. Set `UXPLAY_TRACE_SHARED_TEXTURE=1` to print Electron-side frame/import/send/release counters.
 

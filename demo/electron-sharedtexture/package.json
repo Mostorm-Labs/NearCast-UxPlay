@@ -3,14 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "description": "Electron 40 sharedTexture demo backed by UxPlay D3D11 textures",
+  "author": "UxPlay contributors",
   "main": "main.js",
   "scripts": {
     "build:native": "powershell -ExecutionPolicy Bypass -File .\\scripts\\build-native.ps1",
+    "installer:win": "electron-builder --config .\\scripts\\electron-builder.config.cjs --win nsis --x64",
     "package:win": "powershell -ExecutionPolicy Bypass -File .\\scripts\\package-win.ps1",
     "start": "powershell -ExecutionPolicy Bypass -Command \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; electron .\""
   },
   "devDependencies": {
-    "electron": "^40.8.0"
+    "electron": "^40.8.0",
+    "electron-builder": "^26.8.1"
   },
   "dependencies": {
     "ws": "^8.20.1"
