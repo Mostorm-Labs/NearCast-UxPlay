@@ -55,6 +55,7 @@
         position: absolute;
         left: 16px;
         top: 16px;
+        display: none;
         padding: 8px 12px;
         border-radius: 999px;
         border: 1px solid var(--overlay-border);
@@ -68,32 +69,53 @@
 
       .toolbar {
         position: absolute;
-        right: 18px;
+        right: 12px;
         top: 50%;
         transform: translateY(-50%);
         display: flex;
+        align-items: center;
         flex-direction: column;
-        gap: 10px;
+        gap: 8px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: linear-gradient(90deg, rgba(0, 0, 0, 0.25), rgba(0, 0, 0, 0.6));
+        opacity: 0;
+        transition: opacity 0.16s ease;
         z-index: 12;
       }
 
+      .app-shell:hover .toolbar,
+      .toolbar.is-active {
+        opacity: 1;
+      }
+
       .tool-button {
-        width: clamp(118px, 10vw, 148px);
-        min-height: 42px;
+        width: 36px;
+        height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         border: 1px solid var(--overlay-border);
-        border-radius: 12px;
-        background: var(--button-bg);
-        color: var(--text-main);
-        font-size: 14px;
-        font-weight: 600;
-        letter-spacing: 0.01em;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.5);
+        color: rgba(255, 255, 255, 0.8);
         cursor: pointer;
-        transition: background 0.16s ease, transform 0.16s ease, opacity 0.16s ease;
+        transition:
+          background 0.16s ease,
+          border-color 0.16s ease,
+          color 0.16s ease,
+          opacity 0.16s ease,
+          transform 0.16s ease;
       }
 
       .tool-button:hover {
-        background: var(--button-hover);
-        transform: translateX(-1px);
+        border-color: rgba(255, 255, 255, 0.3);
+        background: rgba(255, 255, 255, 0.1);
+        color: #fff;
+      }
+
+      .tool-button:active {
+        transform: scale(0.95);
       }
 
       .tool-button:disabled {
@@ -101,12 +123,58 @@
         cursor: not-allowed;
       }
 
+      .tool-button.is-active {
+        border-color: rgba(255, 255, 255, 0.4);
+        background: rgba(255, 255, 255, 0.1);
+        color: #fff;
+      }
+
+      .tool-button--close:hover {
+        border-color: rgba(248, 113, 113, 0.5);
+        background: rgba(239, 68, 68, 0.2);
+        color: #f87171;
+      }
+
+      .tool-button[hidden] {
+        display: none;
+      }
+
+      .tool-button__icon {
+        width: 20px;
+        height: 20px;
+        display: block;
+      }
+
+      .mute-icon--muted {
+        display: none;
+      }
+
+      .tool-button.is-muted .mute-icon--muted {
+        display: block;
+      }
+
+      .tool-button.is-muted .mute-icon--volume {
+        display: none;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
       .feedback-stack {
         position: absolute;
         right: 170px;
         bottom: 16px;
+        display: none;
         max-width: min(44vw, 560px);
-        display: grid;
         gap: 6px;
         z-index: 11;
         pointer-events: none;
@@ -145,9 +213,8 @@
         }
 
         .tool-button {
-          width: 108px;
-          min-height: 38px;
-          font-size: 12px;
+          width: 36px;
+          height: 36px;
         }
 
         .feedback-stack {
@@ -166,10 +233,97 @@
       <div class="status-badge" id="statusBadge">未投屏</div>
 
       <nav class="toolbar" aria-label="controls">
-        <button id="pinSubmitButton" class="tool-button" type="button">刷新 PIN</button>
-        <button id="muteToggleButton" class="tool-button" type="button">音频开关</button>
-        <button id="stopCastButton" class="tool-button" type="button">停止投屏</button>
-        <button id="fullscreenToggleButton" class="tool-button" type="button">全屏切换</button>
+        <button
+          id="pinSubmitButton"
+          class="tool-button"
+          type="button"
+          aria-label="刷新 PIN"
+          hidden
+        >
+          <span class="sr-only">刷新 PIN</span>
+        </button>
+        <button
+          id="muteToggleButton"
+          class="tool-button"
+          type="button"
+          aria-label="音频开关"
+        >
+          <svg
+            class="tool-button__icon mute-icon--volume"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path
+              d="M4 9v6h4l5 4V5L8 9H4Z"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linejoin="round"
+            />
+            <path
+              d="M16 8.5c1.3 1.9 1.3 5.1 0 7"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+            <path
+              d="M19 6c2.4 3.4 2.4 8.6 0 12"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+          </svg>
+          <svg
+            class="tool-button__icon mute-icon--muted"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path
+              d="M4 9v6h4l5 4V5L8 9H4Z"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linejoin="round"
+            />
+            <path
+              d="m18 9 4 4m0-4-4 4"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+          </svg>
+          <span class="sr-only">音频开关</span>
+        </button>
+        <button
+          id="stopCastButton"
+          class="tool-button tool-button--close"
+          type="button"
+          aria-label="停止投屏"
+        >
+          <svg
+            class="tool-button__icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden="true"
+          >
+            <path
+              d="m6 6 12 12M18 6 6 18"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+          </svg>
+          <span class="sr-only">停止投屏</span>
+        </button>
+        <button
+          id="fullscreenToggleButton"
+          class="tool-button"
+          type="button"
+          aria-label="全屏切换"
+          hidden
+        >
+          <span class="sr-only">全屏切换</span>
+        </button>
       </nav>
 
       <section class="feedback-stack" aria-live="polite">

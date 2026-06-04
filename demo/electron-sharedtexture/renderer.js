@@ -9,6 +9,7 @@ if (!ipcRenderer) {
 
 const canvas = document.getElementById('videoCanvas');
 const statusBadge = document.getElementById('statusBadge');
+const toolbar = document.querySelector('.toolbar');
 const pinSubmitButton = document.getElementById('pinSubmitButton');
 const pinFeedback = document.getElementById('pinFeedback');
 const muteToggleButton = document.getElementById('muteToggleButton');
@@ -22,6 +23,7 @@ const context = canvas.getContext('2d', { alpha: false });
 if (
   !context ||
   !statusBadge ||
+  !toolbar ||
   !pinSubmitButton ||
   !pinFeedback ||
   !muteToggleButton ||
@@ -62,19 +64,24 @@ function setFeedback(element, message, tone = 'muted') {
 
 function updateMuteDisplay(muted) {
   currentMuted = typeof muted === 'boolean' ? muted : null;
+  muteToggleButton.classList.toggle('is-muted', currentMuted === true);
+  muteToggleButton.classList.toggle('is-active', currentMuted === true);
+  toolbar.classList.toggle('is-active', currentMuted === true);
+
   if (currentMuted === true) {
-    muteToggleButton.textContent = '开启音频';
+    muteToggleButton.setAttribute('aria-label', '开启音频');
     return;
   }
   if (currentMuted === false) {
-    muteToggleButton.textContent = '关闭音频';
+    muteToggleButton.setAttribute('aria-label', '关闭音频');
     return;
   }
-  muteToggleButton.textContent = '音频开关';
+  muteToggleButton.setAttribute('aria-label', '音频开关');
 }
 
 function updateWindowButtons() {
-  fullscreenToggleButton.textContent = windowFullscreen ? '退出全屏' : '进入全屏';
+  const label = windowFullscreen ? '退出全屏' : '进入全屏';
+  fullscreenToggleButton.setAttribute('aria-label', label);
   fullscreenToggleButton.disabled = !windowControlsEnabled;
 }
 
