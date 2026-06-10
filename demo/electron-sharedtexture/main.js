@@ -257,6 +257,79 @@ function getAppStatus() {
   };
 }
 
+function getCastControlStatus() {
+  const castWindowState = getCastWindowState();
+  const pinWindowState = getPinWindowState();
+  const muted = typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null;
+  const runtimeState = appReady ? 'ready' : 'starting';
+  const backendState = bridgeReady ? 'ready' : bridge ? 'starting' : 'exited';
+
+  return {
+    roles: ['receiver'],
+    activeRole: 'receiver',
+    state: castingActive ? 'casting' : backendState === 'ready' ? 'ready' : backendState,
+    protocols: ['airplay'],
+    runtime: {
+      state: runtimeState,
+      displayName: uxplayServerName,
+      controlPort: appWsEnabled ? appWsPort : null,
+      controlUrl: appWsEnabled ? getWsUrl(appWsHost, appWsPort) : null,
+      allowLan: appWsAllowLan,
+    },
+    backend: {
+      type: 'uxplay',
+      state: backendState,
+      controlPort: uxplayWsEnabled ? uxplayWsPort : null,
+      controlUrl: uxplayWsEnabled ? getWsUrl('127.0.0.1', uxplayWsPort) : null,
+      pid: bridge?.pid || null,
+    },
+    session: {
+      active: castingActive,
+      sessionId: castingActive ? 'current' : null,
+      mirrorSessionActive,
+      frameStats: getFrameStats(),
+    },
+    pinCode: {
+      required: true,
+      visible: pinWindowState.visible,
+      pinCode: currentPin,
+      updating: pinUpdateInFlight,
+    },
+    audio: {
+      enabled: mirrorAudioEnabled,
+      muted,
+      updating: mirrorAudioUpdateInFlight,
+    },
+    window: {
+      visible: castWindowState.visible,
+      fullscreen: castWindowState.fullscreen,
+      alwaysOnTop: castWindowState.alwaysOnTop,
+      pinVisible: pinWindowState.visible,
+    },
+    error: lastError,
+  };
+}
+
+function getCastSessionStatus() {
+  return getCastControlStatus().session;
+}
+
+function getCastPinCodeStatus() {
+  return getCastControlStatus().pinCode;
+}
+
+function getCastAudioStatus() {
+  return getCastControlStatus().audio;
+}
+
+function getCastRuntimeStatus() {
+  return getCastControlStatus().runtime;
+}
+
+function getCastBackendStatus() {
+  return getCastControlStatus().backend;
+}
+
 function sendJsonToWebSocket(ws, payload) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     return false;
@@ -266,7 +339,7 @@ function sendJsonToWebSocket(ws, payload) {
 }
 
 function createAppWsSessionId() {
-  return crypto.randomBytes(8).toString('hex');
+  return crypto.randomBytes(4).toString('hex');
 }
 
 function ensureAppWsSessionId(ws, sidHint = null) {
@@ -279,21 +352,22 @@ function ensureAppWsSessionId(ws, sidHint = null) {
   return ws.sessionId;
 }
 
-function makeAppWsEventPayload(ws, op, data = {}) {
+function makeAppWsEventPayload(ws, event, data = {}, intent = 1) {
   return {
     sid: ensureAppWsSessionId(ws),
     op: 6,
     d: {
-      event: op,
+      event,
+      intent,
       data,
     },
   };
 }
 
-function broadcastAppEvent(op, data = {}) {
+function broadcastAppEvent(event, data = {}, intent = 1) {
   for (const client of appWsClients) {
-    if (client.isAuthenticated) {
-      sendJsonToWebSocket(client, makeAppWsEventPayload(client, op, data));
+    if (client.isAuthenticated && client.isIdentified) {
+      sendJsonToWebSocket(client, makeAppWsEventPayload(client, event, data, intent));
     }
   }
 }
@@ -306,7 +380,7 @@ function broadcastControlStatus() {
   if (pinWindow && !pinWindow.isDestroyed()) {
     pinWindow.webContents.send('uxplay-control:status', status);
   }
-  broadcastAppEvent('status.changed', status);
+  broadcastAppEvent('cast.statusChanged', getCastControlStatus());
 }
 
 function createControlError(code, message, extras = {}) {
@@ -342,7 +416,7 @@ function updateHttpPortFromLogLine(line) {
     const changed = uxplayHttpPort !== parsedPort;
     uxplayHttpPort = parsedPort;
     if (changed) {
-      broadcastAppEvent('control.portChanged', {
+      broadcastAppEvent('cast.controlPortChanged', {
         port: uxplayHttpPort,
       });
       broadcastControlStatus();
@@ -595,7 +669,7 @@ function showCastWindow(reason = 'unspecified') {
   } else if (typeof win.moveTop === 'function') {
     win.moveTop();
   }
-  broadcastAppEvent('window.changed', {
+  broadcastAppEvent('cast.windowChanged', {
     window: 'cast',
     action: 'show',
     reason,
@@ -628,7 +702,7 @@ function hideCastWindow(reason = 'unspecified') {
   } else {
     finishHide();
   }
-  broadcastAppEvent('window.changed', {
+  broadcastAppEvent('cast.windowChanged', {
     window: 'cast',
     action: 'hide',
     reason,
@@ -710,7 +784,7 @@ function createPinWindow() {
     pinWindow.webContents.send('uxplay-control:status', getAppStatus());
   });
   pinWindow.on('show', () => {
-    broadcastAppEvent('window.changed', {
+    broadcastAppEvent('cast.windowChanged', {
       window: 'pin',
       action: 'show',
       state: getPinWindowState(),
@@ -718,13 +792,13 @@ function createPinWindow() {
     broadcastControlStatus();
   });
   pinWindow.on('hide', () => {
-    broadcastAppEvent('window.changed', {
+    broadcastAppEvent('cast.windowChanged', {
       window: 'pin',
       action: 'hide',
       state: getPinWindowState(),
     });
-    broadcastAppEvent('pin.hidden', {
-      pin: currentPin,
+    broadcastAppEvent('cast.pinCodeHidden', {
+      pinCode: currentPin,
     });
     clearPinWindowAutoHideTimer();
     broadcastControlStatus();
@@ -769,8 +843,8 @@ function showPinWindow(reason = 'unspecified') {
   bringPinWindowToTop();
   targetWindow.webContents.send('uxplay-control:status', getAppStatus());
   schedulePinWindowAutoHide('pin-auto-hide');
-  broadcastAppEvent('pin.required', {
-    pin: currentPin,
+  broadcastAppEvent('cast.pinCodeRequired', {
+    pinCode: currentPin,
     reason,
   });
   broadcastControlStatus();
@@ -817,19 +891,17 @@ function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
     mirrorSessionActive = true;
     autoPinRotatedForCastingSession = false;
     if (pinWindow && !pinWindow.isDestroyed() && pinWindow.isVisible()) {
-      broadcastAppEvent('pin.accepted', {
-        pin: currentPin,
+      broadcastAppEvent('cast.pinCodeAccepted', {
+        pinCode: currentPin,
         reason,
       });
       hidePinWindow('casting-started');
     }
     showCastWindow(reason);
-    broadcastAppEvent('casting.started', {
+    broadcastAppEvent('cast.sessionStarted', {
+      sessionId: 'current',
       reason,
-      status: getAppStatus(),
-    });
-    broadcastAppEvent('mirrorStarted', {
-      reason,
+      protocol: 'airplay',
     });
     void triggerAutoPinRotationOnMirrorStart();
   } else {
@@ -837,11 +909,8 @@ function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
     autoPinRotatedForCastingSession = false;
     clearMirrorSessionIdleTimer();
     hideCastWindow(reason);
-    broadcastAppEvent('casting.stopped', {
-      reason,
-      status: getAppStatus(),
-    });
-    broadcastAppEvent('mirrorStopped', {
+    broadcastAppEvent('cast.sessionStopped', {
+      sessionId: 'current',
       reason,
     });
   }
@@ -1174,13 +1243,10 @@ function updateCurrentPinFromUxplayEvent(rawPin, source) {
     return pin;
   }
   currentPin = pin;
-  broadcastAppEvent('pin.changed', {
+  broadcastAppEvent('cast.pinCodeChanged', {
     port: uxplayHttpPort,
-    pin,
+    pinCode: pin,
     source,
-  });
-  broadcastAppEvent('pinChanged', {
-    pin,
   });
   broadcastControlStatus();
   return pin;
@@ -1191,8 +1257,8 @@ function handleUxplayControlEvent(op, data = {}) {
     case 'pinRequired': {
       const pin = updateCurrentPinFromUxplayEvent(data?.pin, 'uxplay-pin-required');
       showPinWindow('uxplay-pin-required');
-      broadcastAppEvent('pinRequired', {
-        pin: pin || currentPin,
+      broadcastAppEvent('cast.pinCodeRequired', {
+        pinCode: pin || currentPin,
         reason: 'uxplay-event',
       });
       return;
@@ -1205,8 +1271,8 @@ function handleUxplayControlEvent(op, data = {}) {
     case 'audioChanged':
       if (typeof data?.mirrorAudio === 'boolean' && mirrorAudioEnabled !== data.mirrorAudio) {
         mirrorAudioEnabled = data.mirrorAudio;
-        broadcastAppEvent('audio.changed', {
-          mirrorAudioEnabled,
+        broadcastAppEvent('cast.audioChanged', {
+          enabled: mirrorAudioEnabled,
           muted: !mirrorAudioEnabled,
           source: 'uxplay-event',
         });
@@ -1407,12 +1473,10 @@ async function applyPinUpdate(pin) {
   const upstream = await requestUxplayPinUpdate(pin);
   persistEncryptedPin(pin, uxplayHttpPort);
   currentPin = pin;
-  broadcastAppEvent('pin.changed', {
+  broadcastAppEvent('cast.pinCodeChanged', {
     port: uxplayHttpPort,
-    pin,
-  });
-  broadcastAppEvent('pinChanged', {
-    pin,
+    pinCode: pin,
+    source: 'ws-set',
   });
   broadcastControlStatus();
   return {
@@ -1449,12 +1513,9 @@ async function applyMirrorAudioEnabled(enabled) {
     const upstream = await requestUxplayAudioUpdate(enabled);
     const applied = extractMirrorAudioEnabled(upstream.body);
     mirrorAudioEnabled = typeof applied === 'boolean' ? applied : enabled;
-    broadcastAppEvent('audio.changed', {
-      mirrorAudioEnabled,
+    broadcastAppEvent('cast.audioChanged', {
+      enabled: mirrorAudioEnabled,
       muted: !mirrorAudioEnabled,
-    });
-    broadcastAppEvent('audioChanged', {
-      mirrorAudio: mirrorAudioEnabled,
     });
     broadcastControlStatus();
     return {
@@ -1603,7 +1664,7 @@ function setCastWindowFullscreen(nextFullscreen, reason = 'manual') {
     });
   }
   win.setFullScreen(nextFullscreen);
-  broadcastAppEvent('window.changed', {
+  broadcastAppEvent('cast.windowChanged', {
     window: 'cast',
     action: 'fullscreen',
     reason,
@@ -1627,7 +1688,7 @@ function setCastWindowAlwaysOnTop(nextAlwaysOnTop, reason = 'manual') {
     });
   }
   win.setAlwaysOnTop(nextAlwaysOnTop);
-  broadcastAppEvent('window.changed', {
+  broadcastAppEvent('cast.windowChanged', {
     window: 'cast',
     action: 'always-on-top',
     reason,
@@ -1642,28 +1703,24 @@ function setCastWindowAlwaysOnTop(nextAlwaysOnTop, reason = 'manual') {
 function sendAppWsResponse(ws, requestOrId, ok, data = {}, error = null) {
   const request = requestOrId && typeof requestOrId === 'object'
     ? requestOrId
-    : { id: requestOrId, op: '' };
-  const id = typeof request.id === 'undefined' || request.id === null ? '' : String(request.id);
-  const method = typeof request.op === 'string' ? request.op : '';
+    : { id: requestOrId, method: '' };
+  const id = typeof request.id === 'undefined' ? null : request.id;
 
   const status = {
-    result: ok,
-    code: ok ? 100 : 300,
+    ok,
+    code: ok ? 0 : error?.code || 'INTERNAL_ERROR',
   };
   if (!ok) {
-    status.comment = error?.code || 'INTERNAL_ERROR';
+    status.message = error?.message || 'unknown error';
   }
   const payload = {
-    sid: ensureAppWsSessionId(ws, request.sid),
+    sid: ensureAppWsSessionId(ws),
     op: 8,
     d: {
       id,
       status,
     },
   };
-  if (method) {
-    payload.d.method = method;
-  }
   if (ok) {
     payload.d.result = data;
   }
@@ -1686,62 +1743,65 @@ function parseAppWsRequest(rawMessage) {
     });
   }
 
-  if (Number.isInteger(parsed.op)) {
-    const sid = typeof parsed.sid === 'string' ? parsed.sid : null;
-    if (parsed.op === 0) {
-      return {
-        controlOp: 'hello',
-        sid,
-      };
-    }
-    if (parsed.op === 14) {
-      return {
-        controlOp: 'bye',
-        sid,
-      };
-    }
-    if (parsed.op === 7 && parsed.d && typeof parsed.d === 'object' && typeof parsed.d.method === 'string') {
-      return {
-        sid,
-        id: parsed.d.id,
-        op: parsed.d.method,
-        data: parsed.d.params && typeof parsed.d.params === 'object' ? parsed.d.params : {},
-      };
-    }
+  if (!Number.isInteger(parsed.op)) {
+    throw createControlError('INVALID_REQUEST', 'Request must use the sid/op/d enhanced message model.', {
+      httpStatus: 400,
+    });
+  }
+
+  const sid = typeof parsed.sid === 'string' ? parsed.sid : '';
+  const d = parsed.d && typeof parsed.d === 'object' ? parsed.d : {};
+
+  if (parsed.op === 2) {
     return {
+      controlOp: 'identify',
       sid,
-      id: parsed.d && typeof parsed.d === 'object' ? parsed.d.id : undefined,
-      op: '',
-      invalidRequest: true,
+      rpcVersion: d.rpcVersion,
+      authentication: d.authentication && typeof d.authentication === 'object' ? d.authentication : null,
+      eventMasks: typeof d.eventMasks === 'string' ? d.eventMasks : '',
     };
   }
 
-  throw createControlError('INVALID_REQUEST', 'Request must use the sid/op/d enhanced message model.', {
-    httpStatus: 400,
-  });
+  if (parsed.op === 7 && typeof d.method === 'string') {
+    return {
+      sid,
+      id: d.id,
+      method: d.method,
+      data: d.params && typeof d.params === 'object' ? d.params : {},
+    };
+  }
+
+  return {
+    sid,
+    id: d.id,
+    method: '',
+    invalidRequest: true,
+  };
 }
 
-function sendAppWsHelloAck(ws, sidHint = null) {
-  const sid = ensureAppWsSessionId(ws, sidHint);
+function sendAppWsHello(ws) {
   sendJsonToWebSocket(ws, {
-    sid,
-    op: 1,
+    sid: '',
+    op: 0,
     d: {
-      protocolVersion: 2,
-      serverName: uxplayServerName,
-      capabilities: ['auth', 'request', 'event', 'bye'],
+      axtpVersion: '1.0.0',
+      rpcVersion: 1,
+      authentication: {
+        required: true,
+        types: ['token'],
+      },
       maxPayload: 64 * 1024,
     },
   });
 }
 
-function sendAppWsByeAck(ws, sidHint = null) {
-  const sid = ensureAppWsSessionId(ws, sidHint);
+function sendAppWsIdentified(ws) {
+  const sid = ensureAppWsSessionId(ws);
   sendJsonToWebSocket(ws, {
     sid,
-    op: 15,
+    op: 3,
     d: {
-      message: 'bye',
+      negotiatedRpcVersion: 1,
     },
   });
 }
@@ -1813,9 +1873,9 @@ async function applyUxplayServerName(rawName, reason = 'manual') {
   uxplayServerName = nextServerName;
   process.env.UXPLAY_SERVER_NAME = uxplayServerName;
   updateTrayMenu();
-  broadcastAppEvent('serverName.changed', {
-    serverName: uxplayServerName,
-    previousServerName,
+  broadcastAppEvent('cast.displayNameChanged', {
+    displayName: uxplayServerName,
+    previousDisplayName: previousServerName,
     reason,
   });
   broadcastControlStatus();
@@ -1839,101 +1899,34 @@ async function applyUxplayServerName(rawName, reason = 'manual') {
 async function handleAuthenticatedAppWsRequest(ws, request) {
   const data = request.data && typeof request.data === 'object' ? request.data : {};
 
-  switch (request.op) {
-    case 'getStatus':
-      return getAppStatus();
+  switch (request.method) {
+    case 'cast.getStatus':
+      return getCastControlStatus();
 
-    case 'getServerName':
+    case 'cast.getDisplayName':
       return {
-        serverName: uxplayServerName,
+        displayName: uxplayServerName,
       };
 
-    case 'setServerName':
-    case 'setUxPlayServerName': {
-      const requestedName = typeof data.serverName === 'string' ? data.serverName : data.name;
-      return applyUxplayServerName(requestedName, 'ws-command');
-    }
-
-    case 'getPin':
+    case 'cast.setDisplayName': {
+      const requestedName = typeof data.displayName === 'string' ? data.displayName : data.serverName;
+      const updated = await applyUxplayServerName(requestedName, 'ws-command');
       return {
-        pin: currentPin,
-        updating: pinUpdateInFlight,
-      };
-
-    case 'rotatePin':
-      return rotatePinRandom('ws-random');
-
-    case 'setPin': {
-      const pin = normalizePinInput(data.pin);
-      return {
-        ...(await applyPinUpdate(pin)),
-        trigger: 'ws-set',
+        displayName: updated.serverName,
+        previousDisplayName: updated.previousServerName,
+        restarted: updated.restarted,
+        status: getCastControlStatus(),
       };
     }
 
-    case 'setMuted': {
-      const muted = normalizeMutedInput(data.muted);
-      return applyMirrorAudioEnabled(!muted);
-    }
+    case 'cast.getRuntimeStatus':
+      return getCastRuntimeStatus();
 
-    case 'setAudio': {
-      if (typeof data.enabled !== 'boolean') {
-        throw createControlError('INVALID_AUDIO_VALUE', 'Audio enabled must be a boolean value.', {
-          httpStatus: 400,
-        });
-      }
-      return applyMirrorAudioEnabled(data.enabled);
-    }
+    case 'cast.restartRuntime':
+      await restartUxPlay('ws-command:runtime');
+      return getCastControlStatus();
 
-    case 'getAudio':
-      return {
-        mirrorAudioEnabled,
-        muted: typeof mirrorAudioEnabled === 'boolean' ? !mirrorAudioEnabled : null,
-        updating: mirrorAudioUpdateInFlight,
-      };
-
-    case 'stop':
-    case 'stopCasting':
-      return performStopCasting();
-
-    case 'showCastWindow':
-      showCastWindow('ws-command');
-      broadcastControlStatus();
-      return getAppStatus();
-
-    case 'hideCastWindow':
-      hideCastWindow('ws-command');
-      broadcastControlStatus();
-      return getAppStatus();
-
-    case 'setFullscreen': {
-      const fullscreen = data.fullscreen;
-      return {
-        ...setCastWindowFullscreen(fullscreen, 'ws-command'),
-        status: getAppStatus(),
-      };
-    }
-
-    case 'setAlwaysOnTop': {
-      const alwaysOnTop = data.alwaysOnTop;
-      return {
-        ...setCastWindowAlwaysOnTop(alwaysOnTop, 'ws-command'),
-        status: getAppStatus(),
-      };
-    }
-
-    case 'showPinWindow':
-      showPinWindow('ws-command');
-      return getAppStatus();
-
-    case 'hidePinWindow':
-      hidePinWindow('ws-command');
-      return getAppStatus();
-
-    case 'restartUxPlay':
-      return restartUxPlay('ws-command');
-
-    case 'quitApp':
+    case 'cast.quitRuntime':
       setImmediate(() => {
         quitApplication();
       });
@@ -1941,8 +1934,96 @@ async function handleAuthenticatedAppWsRequest(ws, request) {
         message: 'quitting',
       };
 
+    case 'cast.getBackendStatus':
+      return getCastBackendStatus();
+
+    case 'cast.restartBackend':
+      await restartUxPlay('ws-command');
+      return getCastBackendStatus();
+
+    case 'cast.getSession':
+      return getCastSessionStatus();
+
+    case 'cast.stopSession':
+      return performStopCasting();
+
+    case 'cast.getPinCode':
+      return getCastPinCodeStatus();
+
+    case 'cast.rotatePinCode':
+      {
+        const updated = await rotatePinRandom('ws-random');
+        return {
+          ...updated,
+          pinCode: updated.pin,
+          status: getCastPinCodeStatus(),
+        };
+      }
+
+    case 'cast.setPinCode': {
+      const pin = normalizePinInput(data.pinCode || data.pin);
+      return {
+        ...(await applyPinUpdate(pin)),
+        pinCode: pin,
+        status: getCastPinCodeStatus(),
+        trigger: 'ws-set',
+      };
+    }
+
+    case 'cast.showPinCode':
+      showPinWindow('ws-command');
+      return getCastPinCodeStatus();
+
+    case 'cast.hidePinCode':
+      hidePinWindow('ws-command');
+      return getCastPinCodeStatus();
+
+    case 'cast.getAudio':
+      return getCastAudioStatus();
+
+    case 'cast.setAudio': {
+      if (typeof data.enabled !== 'boolean') {
+        throw createControlError('INVALID_AUDIO_VALUE', 'Audio enabled must be a boolean value.', {
+          httpStatus: 400,
+        });
+      }
+      await applyMirrorAudioEnabled(data.enabled);
+      return getCastAudioStatus();
+    }
+
+    case 'cast.setMuted': {
+      const muted = normalizeMutedInput(data.muted);
+      await applyMirrorAudioEnabled(!muted);
+      return getCastAudioStatus();
+    }
+
+    case 'cast.getWindowState':
+      return getCastWindowState();
+
+    case 'cast.showWindow':
+      showCastWindow('ws-command');
+      broadcastControlStatus();
+      return getCastWindowState();
+
+    case 'cast.hideWindow':
+      hideCastWindow('ws-command');
+      broadcastControlStatus();
+      return getCastWindowState();
+
+    case 'cast.setFullscreen': {
+      const fullscreen = data.fullscreen;
+      setCastWindowFullscreen(fullscreen, 'ws-command');
+      return getCastWindowState();
+    }
+
+    case 'cast.setAlwaysOnTop': {
+      const alwaysOnTop = data.alwaysOnTop;
+      setCastWindowAlwaysOnTop(alwaysOnTop, 'ws-command');
+      return getCastWindowState();
+    }
+
     default:
-      throw createControlError('INVALID_OP', `Unknown operation: ${request.op}`, {
+      throw createControlError('INVALID_OP', `Unknown operation: ${request.method}`, {
         httpStatus: 400,
       });
   }
@@ -1952,18 +2033,6 @@ async function handleAppWsMessage(ws, rawMessage) {
   let request;
   try {
     request = parseAppWsRequest(rawMessage);
-    ensureAppWsSessionId(ws, request.sid);
-
-    if (request.controlOp === 'hello') {
-      sendAppWsHelloAck(ws, request.sid);
-      return;
-    }
-
-    if (request.controlOp === 'bye') {
-      sendAppWsByeAck(ws, request.sid);
-      ws.close(1000, 'bye');
-      return;
-    }
 
     if (request.invalidRequest) {
       throw createControlError('INVALID_OP', 'Unknown advanced WebSocket opcode.', {
@@ -1971,33 +2040,47 @@ async function handleAppWsMessage(ws, rawMessage) {
       });
     }
 
-    if (!ws.isAuthenticated) {
-      if (request.op !== 'auth') {
-        throw createControlError('UNAUTHORIZED', 'First request must be auth.', {
+    if (!ws.isIdentified) {
+      if (request.controlOp !== 'identify') {
+        throw createControlError('UNAUTHORIZED', 'First client message must be Identify(op=2).', {
           httpStatus: 401,
         });
       }
-      if (request.data?.token !== appWsToken) {
+      if (request.rpcVersion !== 1) {
+        throw createControlError('INVALID_PARAMS', 'Unsupported RPC version.', {
+          httpStatus: 400,
+        });
+      }
+      if (request.authentication?.token !== appWsToken) {
         throw createControlError('UNAUTHORIZED', 'Invalid WebSocket control token.', {
           httpStatus: 401,
         });
       }
       ws.isAuthenticated = true;
-      sendAppWsResponse(ws, request, true, { message: 'authenticated' });
-      broadcastAppEvent('app.ready', getAppStatus());
+      ws.isIdentified = true;
+      sendAppWsIdentified(ws);
+      broadcastAppEvent('cast.runtimeReady', getCastRuntimeStatus());
+      broadcastAppEvent('cast.backendReady', getCastBackendStatus());
       return;
     }
 
-    if (request.op === 'auth') {
-      sendAppWsResponse(ws, request, true, { message: 'authenticated' });
+    if (request.controlOp === 'identify') {
+      sendAppWsIdentified(ws);
       return;
+    }
+
+    const sid = ensureAppWsSessionId(ws);
+    if (request.sid !== sid) {
+      throw createControlError('UNAUTHORIZED', 'Request sid does not match the identified session.', {
+        httpStatus: 401,
+      });
     }
 
     const result = await handleAuthenticatedAppWsRequest(ws, request);
     sendAppWsResponse(ws, request, true, result);
   } catch (error) {
     const formatted = rememberLastError(error);
-    broadcastAppEvent('error', formatted);
+    broadcastAppEvent('cast.error', formatted);
     sendAppWsResponse(ws, request || undefined, false, {}, error);
     if (error?.code === 'UNAUTHORIZED') {
       ws.close(1008, 'unauthorized');
@@ -2018,8 +2101,10 @@ function startAppWebSocketServer() {
 
   appWsServer.on('connection', (ws) => {
     ws.isAuthenticated = false;
+    ws.isIdentified = false;
     ws.sessionId = null;
     appWsClients.add(ws);
+    sendAppWsHello(ws);
     ws.on('message', (message) => {
       void handleAppWsMessage(ws, message);
     });
@@ -2037,14 +2122,14 @@ function startAppWebSocketServer() {
 
   appWsServer.on('listening', () => {
     console.log(`Electron WebSocket control server listening on ${getWsUrl(appWsHost, appWsPort)}`);
-    broadcastAppEvent('app.ready', getAppStatus());
+    broadcastAppEvent('cast.runtimeReady', getCastRuntimeStatus());
     broadcastControlStatus();
   });
 
   appWsServer.on('error', (error) => {
     const formatted = rememberLastError(error, 'WS_SERVER_ERROR');
     console.error(`Electron WebSocket control server failed: ${formatted.message}`);
-    broadcastAppEvent('error', formatted);
+    broadcastAppEvent('cast.error', formatted);
     broadcastControlStatus();
   });
 }
@@ -2242,7 +2327,7 @@ function createWindow() {
     console.log(`[renderer:${levelOrDetails}] ${message} (${sourceId}:${line})`);
   });
   win.on('enter-full-screen', () => {
-    broadcastAppEvent('window.changed', {
+    broadcastAppEvent('cast.windowChanged', {
       window: 'cast',
       action: 'enter-fullscreen',
       state: getCastWindowState(),
@@ -2250,7 +2335,7 @@ function createWindow() {
     broadcastControlStatus();
   });
   win.on('leave-full-screen', () => {
-    broadcastAppEvent('window.changed', {
+    broadcastAppEvent('cast.windowChanged', {
       window: 'cast',
       action: 'leave-fullscreen',
       state: getCastWindowState(),
@@ -2488,7 +2573,7 @@ function startBridge() {
 
   bridge.on('error', (error) => {
     const formatted = rememberLastError(error, 'UXPLAY_START_FAILED');
-    broadcastAppEvent('error', formatted);
+    broadcastAppEvent('cast.error', formatted);
     broadcastControlStatus();
     console.error('Failed to launch UxPlay:', error);
   });
@@ -2507,7 +2592,7 @@ function startBridge() {
     setCastingActive(false, 'bridge-exit', { clearPending: true });
     mirrorSessionActive = false;
     clearMirrorSessionIdleTimer();
-    broadcastAppEvent('uxplay.exited', {
+    broadcastAppEvent('cast.backendExited', {
       code,
       signal,
     });
@@ -2526,7 +2611,7 @@ function startBridge() {
 
     if (line === 'READY') {
       bridgeReady = true;
-      broadcastAppEvent('uxplay.ready', getAppStatus());
+      broadcastAppEvent('cast.backendReady', getCastBackendStatus());
       broadcastControlStatus();
       scheduleUxplayEventWebSocketReconnect('uxplay-ready', 0);
       console.log(`UxPlay shared texture export is ready. AirPlay server name: ${uxplayServerName}`);
@@ -2573,7 +2658,7 @@ function startBridge() {
     framesReceived += 1;
     touchMirrorSessionActivity();
     if (framesReceived <= 3 || framesReceived % 60 === 0) {
-      broadcastAppEvent('casting.frameStats', getFrameStats());
+      broadcastAppEvent('cast.frameStats', getFrameStats());
     }
     if (traceSharedTexture && (framesReceived <= 5 || framesReceived % 30 === 0)) {
       traceSharedTextureStats(`recv-${frameId}`);
@@ -2639,7 +2724,7 @@ if (gotSingleInstanceLock) {
     createTray();
     appReady = true;
     startAppWebSocketServer();
-    broadcastAppEvent('app.ready', getAppStatus());
+    broadcastAppEvent('cast.runtimeReady', getCastRuntimeStatus());
     broadcastControlStatus();
     if (sendTimeoutMs > 0) {
       console.log(`sendSharedTexture watchdog timeout: ${sendTimeoutMs}ms`);
@@ -2653,7 +2738,7 @@ if (gotSingleInstanceLock) {
       } catch (error) {
         const formatted = rememberLastError(error, 'UXPLAY_START_FAILED');
         console.error(`Failed to start UxPlay bridge: ${formatted.message}`);
-        broadcastAppEvent('error', formatted);
+        broadcastAppEvent('cast.error', formatted);
         broadcastControlStatus();
       }
     });
