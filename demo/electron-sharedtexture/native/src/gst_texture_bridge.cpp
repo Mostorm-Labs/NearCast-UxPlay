@@ -21,7 +21,7 @@
 namespace {
 
 constexpr size_t kInvalidPoolIndex = std::numeric_limits<size_t>::max();
-constexpr size_t kFallbackSharedTexturePoolSize = 8;
+constexpr size_t kFallbackSharedTexturePoolSize = 16;
 
 struct FrameRecord {
   guint64 id;
@@ -292,7 +292,9 @@ class BridgeApp {
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
       for (auto &entry : frames_) {
-        gst_sample_unref(entry.second.sample);
+        if (entry.second.sample) {
+          gst_sample_unref(entry.second.sample);
+        }
       }
       frames_.clear();
 
@@ -408,9 +410,18 @@ class BridgeApp {
     }
 
     guint64 frame_id = next_frame_id_.fetch_add(1, std::memory_order_relaxed);
+    const bool uses_fallback_pool = shared_texture_pool_index != kInvalidPoolIndex;
+    GstSample *sample_to_hold = sample;
+    if (uses_fallback_pool) {
+      // Fallback frames are copied into bridge-owned textures, so holding the
+      // upstream sample until Electron releases the frame only adds pressure.
+      gst_sample_unref(sample);
+      sample_to_hold = nullptr;
+    }
+
     {
       std::lock_guard<std::mutex> lock(frame_mutex_);
-      frames_.emplace(frame_id, FrameRecord{frame_id, sample, shared_texture_pool_index,
+      frames_.emplace(frame_id, FrameRecord{frame_id, sample_to_hold, shared_texture_pool_index,
                                             shared_texture_slot_index});
     }
 
@@ -654,6 +665,8 @@ class BridgeApp {
       const D3D11_TEXTURE2D_DESC &source_desc, HANDLE *shared_handle,
       bool *close_shared_handle, size_t *shared_texture_pool_index_out,
       size_t *shared_texture_slot_index_out) {
+    (void)buffer;
+    (void)caps;
     if (!shared_handle || !close_shared_handle || !shared_texture_pool_index_out ||
         !shared_texture_slot_index_out) {
       return SharedHandleStatus::kFailure;
@@ -695,39 +708,20 @@ class BridgeApp {
       return SharedHandleStatus::kFailure;
     }
 
-    GstVideoInfo video_info = {};
-    if (!gst_video_info_from_caps(&video_info, caps)) {
-      SafeRelease(context);
-      SafeRelease(device);
-      SafeRelease(source_texture);
-      EmitError("failed to parse video info from caps for shared texture upload");
-      return SharedHandleStatus::kFailure;
-    }
-
-    GstVideoFrame video_frame;
-    if (!gst_video_frame_map(&video_frame, &video_info, buffer, GST_MAP_READ)) {
-      SafeRelease(context);
-      SafeRelease(device);
-      SafeRelease(source_texture);
-      EmitError("failed to map GstBuffer for shared texture upload");
-      return SharedHandleStatus::kFailure;
-    }
-
     ID3D11Texture2D *shared_texture = nullptr;
     const SharedHandleStatus acquire_status =
         AcquireSharedTextureSlot(device, source_desc, shared_texture_pool_index_out,
                                  shared_texture_slot_index_out, shared_handle, &shared_texture);
     if (acquire_status != SharedHandleStatus::kSuccess) {
-      gst_video_frame_unmap(&video_frame);
       SafeRelease(context);
       SafeRelease(device);
       SafeRelease(source_texture);
       return acquire_status;
     }
 
-    context->UpdateSubresource(shared_texture, 0, nullptr, GST_VIDEO_FRAME_PLANE_DATA(&video_frame, 0),
-                               GST_VIDEO_FRAME_PLANE_STRIDE(&video_frame, 0), 0);
-    gst_video_frame_unmap(&video_frame);
+    const guint source_subresource = gst_d3d11_memory_get_subresource_index(memory);
+    context->CopySubresourceRegion(shared_texture, 0, 0, 0, 0, source_texture, source_subresource,
+                                   nullptr);
     context->Flush();
 
     int remaining_shared_probes = shared_probe_frames_.load(std::memory_order_relaxed);
@@ -756,8 +750,8 @@ class BridgeApp {
   std::vector<SharedTexturePool> shared_texture_pools_;
   std::atomic<guint64> next_frame_id_{1};
   std::atomic<unsigned> dropped_pool_frames_{0};
-  std::atomic<int> source_probe_frames_{5};
-  mutable std::atomic<int> shared_probe_frames_{5};
+  std::atomic<int> source_probe_frames_{0};
+  mutable std::atomic<int> shared_probe_frames_{0};
   std::atomic<bool> stopping_{false};
   std::atomic<bool> stop_started_{false};
 };

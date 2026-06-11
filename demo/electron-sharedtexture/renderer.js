@@ -40,14 +40,30 @@ const query =
   typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
 const renderTimeoutMs = Number.parseInt(query.get('renderTimeoutMs') || '250', 10) || 0;
 const fitMode = (query.get('fit') || 'contain').toLowerCase();
+const nativeEnv = typeof process !== 'undefined' && process?.env ? process.env : {};
+const renderDprCap = parsePositiveNumber(
+  query.get('dprCap') || nativeEnv.UXPLAY_RENDER_DPR_CAP,
+  1,
+);
+const useImageBitmap = parseBoolean(
+  query.get('imageBitmap') || nativeEnv.UXPLAY_RENDER_USE_IMAGE_BITMAP,
+  true,
+);
+const cacheLastFrame = parseBoolean(
+  query.get('cacheLastFrame') || nativeEnv.UXPLAY_RENDER_CACHE_LAST_FRAME,
+  true,
+);
 
 let drawInFlight = false;
+let drainScheduled = false;
 let pendingPacket = null;
 let controlSessionToken = null;
 let currentMuted = null;
 let windowFullscreen = null;
 let windowControlsEnabled = false;
 let castingActive = false;
+let lastStatusText = '';
+let lastFrameStatusAt = 0;
 const lastFrameCanvas = document.createElement('canvas');
 const lastFrameContext = lastFrameCanvas.getContext('2d', { alpha: false });
 let lastFrameWidth = 0;
@@ -55,6 +71,34 @@ let lastFrameHeight = 0;
 
 if (!lastFrameContext) {
   throw new Error('Unable to initialize cached frame context.');
+}
+
+function parseBoolean(value, fallback) {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+function parsePositiveNumber(value, fallback) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function setStatusText(text) {
+  if (lastStatusText === text) {
+    return;
+  }
+  lastStatusText = text;
+  statusBadge.textContent = text;
 }
 
 function setFeedback(element, message, tone = 'muted') {
@@ -135,7 +179,12 @@ function drawSourceToViewport(source, width, height) {
   context.drawImage(source, offsetX, offsetY, drawWidth, drawHeight);
 }
 
-function cacheAndDrawFrameSource(source, width, height) {
+function drawFrameSource(source, width, height) {
+  if (!cacheLastFrame) {
+    drawSourceToViewport(source, width, height);
+    return;
+  }
+
   if (lastFrameCanvas.width !== width || lastFrameCanvas.height !== height) {
     lastFrameCanvas.width = width;
     lastFrameCanvas.height = height;
@@ -148,6 +197,10 @@ function cacheAndDrawFrameSource(source, width, height) {
 }
 
 function redrawFromCachedFrame() {
+  if (!cacheLastFrame) {
+    return false;
+  }
+
   if (lastFrameWidth <= 0 || lastFrameHeight <= 0) {
     return false;
   }
@@ -171,11 +224,11 @@ function setCastingState(active) {
     lastFrameWidth = 0;
     lastFrameHeight = 0;
     clearCanvasToBlack();
-    statusBadge.textContent = '未投屏';
+    setStatusText('未投屏');
     return;
   }
 
-  statusBadge.textContent = '投屏中（等待画面）';
+  setStatusText('投屏中（等待画面）');
 }
 
 function applyControlStatus(status) {
@@ -433,7 +486,8 @@ async function toggleFullscreen() {
 }
 
 function resizeCanvasToViewport() {
-  const dpr = window.devicePixelRatio || 1;
+  const nativeDpr = window.devicePixelRatio || 1;
+  const dpr = Math.max(1, Math.min(nativeDpr, renderDprCap));
   const targetWidth = Math.max(1, Math.round(window.innerWidth * dpr));
   const targetHeight = Math.max(1, Math.round(window.innerHeight * dpr));
 
@@ -444,11 +498,11 @@ function resizeCanvasToViewport() {
 }
 
 async function drawFrame(frame, width, height) {
-  if (typeof createImageBitmap === 'function') {
+  if (useImageBitmap && typeof createImageBitmap === 'function') {
     try {
       const bitmap = await createImageBitmap(frame);
       try {
-        cacheAndDrawFrameSource(bitmap, width, height);
+        drawFrameSource(bitmap, width, height);
         return;
       } finally {
         bitmap.close();
@@ -458,7 +512,7 @@ async function drawFrame(frame, width, height) {
     }
   }
 
-  cacheAndDrawFrameSource(frame, width, height);
+  drawFrameSource(frame, width, height);
 }
 
 function withTimeout(promise, timeoutMs, label) {
@@ -466,14 +520,19 @@ function withTimeout(promise, timeoutMs, label) {
     return promise;
   }
 
+  let timeoutHandle;
   return Promise.race([
     promise,
     new Promise((_, reject) => {
-      setTimeout(() => {
+      timeoutHandle = setTimeout(() => {
         reject(new Error(`${label} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
     }),
-  ]);
+  ]).finally(() => {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  });
 }
 
 function releasePacket(packet) {
@@ -493,44 +552,66 @@ async function drainFrameQueue() {
     return;
   }
 
-  drawInFlight = true;
-  while (pendingPacket) {
-    const packet = pendingPacket;
-    pendingPacket = null;
-
-    if (!castingActive) {
-      releasePacket(packet);
-      continue;
-    }
-
-    const { importedSharedTexture, info } = packet;
-    let frame;
-    try {
-      frame = importedSharedTexture.getVideoFrame();
-      await withTimeout(
-        drawFrame(frame, info.width, info.height),
-        renderTimeoutMs,
-        'drawFrame',
-      );
-
-      if (castingActive) {
-        statusBadge.textContent = `投屏中 ${info.width}x${info.height}`;
-      } else {
-        clearCanvasToBlack();
-        statusBadge.textContent = '未投屏';
-      }
-    } catch (error) {
-      console.error('Shared texture render failed:', error);
-      statusBadge.textContent = castingActive ? `渲染失败: ${error.message}` : '未投屏';
-    } finally {
-      if (frame) {
-        frame.close();
-      }
-      releasePacket(packet);
-    }
+  if (!pendingPacket) {
+    return;
   }
 
-  drawInFlight = false;
+  drawInFlight = true;
+  const packet = pendingPacket;
+  pendingPacket = null;
+
+  if (!castingActive) {
+    releasePacket(packet);
+    drawInFlight = false;
+    return;
+  }
+
+  const { importedSharedTexture, info } = packet;
+  let frame;
+  try {
+    frame = importedSharedTexture.getVideoFrame();
+    await withTimeout(
+      drawFrame(frame, info.width, info.height),
+      renderTimeoutMs,
+      'drawFrame',
+    );
+
+    if (castingActive) {
+      const now = performance.now();
+      if (now - lastFrameStatusAt > 500) {
+        lastFrameStatusAt = now;
+        setStatusText(`投屏中 ${info.width}x${info.height}`);
+      }
+    } else {
+      clearCanvasToBlack();
+      setStatusText('未投屏');
+    }
+  } catch (error) {
+    console.error('Shared texture render failed:', error);
+    setStatusText(castingActive ? `渲染失败: ${error.message}` : '未投屏');
+  } finally {
+    if (frame) {
+      frame.close();
+    }
+    releasePacket(packet);
+    drawInFlight = false;
+  }
+
+  if (pendingPacket) {
+    scheduleDrainFrameQueue();
+  }
+}
+
+function scheduleDrainFrameQueue() {
+  if (drainScheduled) {
+    return;
+  }
+
+  drainScheduled = true;
+  requestAnimationFrame(() => {
+    drainScheduled = false;
+    void drainFrameQueue();
+  });
 }
 
 sharedTexture.setSharedTextureReceiver(({ importedSharedTexture }, info) => {
@@ -545,7 +626,7 @@ sharedTexture.setSharedTextureReceiver(({ importedSharedTexture }, info) => {
   }
 
   pendingPacket = { importedSharedTexture, info };
-  void drainFrameQueue();
+  scheduleDrainFrameQueue();
 });
 
 const onControlStatus = (_event, status) => {

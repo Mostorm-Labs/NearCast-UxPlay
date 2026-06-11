@@ -381,7 +381,7 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
                 g_string_append(launch, "video/x-raw(memory:D3D11Memory),format=BGRA ! ");
                 g_string_append(launch, "appsink name=shared_texture_sink_");
                 g_string_append(launch, renderer_type[i]->codec);
-                g_string_append(launch, " max-buffers=1 drop=true");
+                g_string_append(launch, " sync=false qos=true max-buffers=1 drop=true");
             } else {
                 g_string_append(launch, converter);
                 g_string_append(launch, " ! ");

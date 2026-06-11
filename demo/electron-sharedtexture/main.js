@@ -1,10 +1,23 @@
-const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, safeStorage, screen, sharedTexture } = require('electron');
+const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, powerSaveBlocker, safeStorage, screen, sharedTexture } = require('electron');
 const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
 const WebSocket = require('ws');
+
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+app.commandLine.appendSwitch('ignore-gpu-blocklist');
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('enable-native-gpu-memory-buffers');
+app.commandLine.appendSwitch('enable-accelerated-2d-canvas');
+app.commandLine.appendSwitch('enable-accelerated-video-decode');
+app.commandLine.appendSwitch('enable-webgl');
+app.commandLine.appendSwitch('force_high_performance_gpu');
 
 // 启用调试模式
 if (process.env.NODE_ENV === 'development') {
@@ -49,6 +62,20 @@ if (app.isPackaged && requestedUxplayExecutable && !allowPackagedExternalUxplay)
 const traceSharedTexture =
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === '1' ||
   process.env.UXPLAY_TRACE_SHARED_TEXTURE === 'true';
+const priorityConstants = os.constants?.priority || {};
+const processPriorityName = (process.env.UXPLAY_PROCESS_PRIORITY || 'highest').trim().toLowerCase();
+const processPriorityEnabled =
+  process.env.UXPLAY_PROCESS_PRIORITY !== '0' &&
+  process.env.UXPLAY_PROCESS_PRIORITY !== 'false';
+const processPriorityValues = {
+  lowest: priorityConstants.PRIORITY_LOW ?? 19,
+  low: priorityConstants.PRIORITY_BELOW_NORMAL ?? 10,
+  normal: priorityConstants.PRIORITY_NORMAL ?? 0,
+  high: priorityConstants.PRIORITY_HIGH ?? -14,
+  highest: priorityConstants.PRIORITY_HIGHEST ?? -20,
+};
+const processPriorityValue =
+  processPriorityValues[processPriorityName] ?? processPriorityValues.highest;
 const sendTimeoutMs = Number.parseInt(process.env.UXPLAY_SEND_TIMEOUT_MS || '1200', 10) || 0;
 const uxplayControlTimeoutMs = Number.parseInt(process.env.UXPLAY_CONTROL_TIMEOUT_MS || '3000', 10) || 3000;
 const uxplayWsResponseLimitBytes = 16 * 1024;
@@ -62,6 +89,13 @@ const requestedAppWsHost = process.env.UXPLAY_APP_WS_HOST || '127.0.0.1';
 const appWsHost = appWsAllowLan ? requestedAppWsHost : '127.0.0.1';
 const appWsPort = Number.parseInt(process.env.UXPLAY_APP_WS_PORT || '7010', 10) || 7010;
 const mirrorSessionIdleMs = Number.parseInt(process.env.UXPLAY_MIRROR_IDLE_MS || '3000', 10) || 3000;
+const maxRendererFps = Number.parseInt(process.env.UXPLAY_MAX_RENDER_FPS || '0', 10) || 0;
+const minRendererFrameIntervalMs =
+  maxRendererFps > 0 ? Math.max(1, Math.floor(1000 / maxRendererFps)) : 0;
+const powerSaveBlockerType =
+  process.env.UXPLAY_POWER_SAVE_BLOCKER === 'prevent-display-sleep'
+    ? 'prevent-display-sleep'
+    : 'prevent-app-suspension';
 const castWindowFullscreen =
   process.env.UXPLAY_CAST_FULLSCREEN !== '0' &&
   process.env.UXPLAY_CAST_FULLSCREEN !== 'false';
@@ -76,6 +110,7 @@ let pinWindow;
 let tray;
 let isExplicitlyQuitting = false;
 let appReady = false;
+let powerSaveBlockerId = null;
 let appWsServer;
 const appWsClients = new Set();
 let lastError = null;
@@ -108,6 +143,8 @@ let frameReleases = 0;
 let importFailures = 0;
 let sendFailures = 0;
 let sendTimeouts = 0;
+let framesThrottled = 0;
+let nextRendererFrameAt = 0;
 
 if (!app || !BrowserWindow || !sharedTexture) {
   throw new Error('Electron sharedTexture API is unavailable. Use Electron 40+ and ensure ELECTRON_RUN_AS_NODE is not set.');
@@ -117,6 +154,7 @@ const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) {
   app.quit();
 }
+applyProcessPriority(process.pid, 'electron-main');
 
 function splitCommandLineArgs(text) {
   if (!text) {
@@ -134,6 +172,46 @@ function splitCommandLineArgs(text) {
 
     return part;
   });
+}
+
+function applyProcessPriority(pid, label) {
+  if (!processPriorityEnabled || !Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+
+  try {
+    os.setPriority(pid, processPriorityValue);
+    console.log(
+      `[priority] ${label} pid=${pid} set to ${processPriorityName} (${processPriorityValue})`,
+    );
+    return true;
+  } catch (error) {
+    console.warn(
+      `[priority] failed to set ${label} pid=${pid} to ${processPriorityName}: ${error.message}`,
+    );
+    return false;
+  }
+}
+
+function logGpuFeatureStatus(reason = 'unspecified') {
+  if (typeof app.getGPUFeatureStatus !== 'function') {
+    return;
+  }
+
+  const status = app.getGPUFeatureStatus();
+  console.log(`[gpu:${reason}] ${JSON.stringify(status)}`);
+}
+
+function getGpuFeatureStatus() {
+  if (!appReady || typeof app.getGPUFeatureStatus !== 'function') {
+    return null;
+  }
+
+  try {
+    return app.getGPUFeatureStatus();
+  } catch {
+    return null;
+  }
 }
 
 function getWsUrl(host, port) {
@@ -168,8 +246,10 @@ function getFrameStats() {
     importFailures,
     sendFailures,
     sendTimeouts,
+    throttled: framesThrottled,
     pending: Boolean(pendingFrame),
     sending: frameSending,
+    maxRendererFps,
   };
 }
 
@@ -186,6 +266,24 @@ function getAppStatus() {
       packaged: app.isPackaged,
       name: uxplayServerName,
       serverName: uxplayServerName,
+      priority: {
+        enabled: processPriorityEnabled,
+        name: processPriorityName,
+        value: processPriorityValue,
+      },
+      gpu: {
+        switches: [
+          'ignore-gpu-blocklist',
+          'enable-gpu-rasterization',
+          'enable-zero-copy',
+          'enable-native-gpu-memory-buffers',
+          'enable-accelerated-2d-canvas',
+          'enable-accelerated-video-decode',
+          'enable-webgl',
+          'force_high_performance_gpu',
+        ],
+        featureStatus: getGpuFeatureStatus(),
+      },
     },
     uxplay: {
       ready: bridgeReady,
@@ -772,6 +870,7 @@ function createPinWindow() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
+      backgroundThrottling: false,
     },
   });
 
@@ -867,14 +966,39 @@ function quitApplication() {
   app.quit();
 }
 
+function updatePowerSaveBlocker(active) {
+  if (!powerSaveBlocker) {
+    return;
+  }
+
+  if (active) {
+    if (powerSaveBlockerId === null || !powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+      powerSaveBlockerId = powerSaveBlocker.start(powerSaveBlockerType);
+      if (traceSharedTexture) {
+        console.log(`[power] started ${powerSaveBlockerType} blocker id=${powerSaveBlockerId}`);
+      }
+    }
+    return;
+  }
+
+  if (powerSaveBlockerId !== null && powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+    powerSaveBlocker.stop(powerSaveBlockerId);
+    if (traceSharedTexture) {
+      console.log(`[power] stopped blocker id=${powerSaveBlockerId}`);
+    }
+  }
+  powerSaveBlockerId = null;
+}
+
 function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
   const normalized = nextActive === true;
+  const wasCastingActive = castingActive;
   if (!normalized || options.clearPending === true) {
     clearPendingMainFrame(`casting-${reason}`);
   }
   if (normalized) {
     clearFrameFallbackSuppression();
-  } else {
+  } else if (wasCastingActive) {
     suppressFrameFallbackAfterStop(reason);
   }
   if (castingActive === normalized) {
@@ -887,6 +1011,10 @@ function setCastingActive(nextActive, reason = 'unspecified', options = {}) {
     return;
   }
   castingActive = normalized;
+  updatePowerSaveBlocker(castingActive);
+  if (!castingActive) {
+    nextRendererFrameAt = 0;
+  }
   if (castingActive) {
     mirrorSessionActive = true;
     autoPinRotatedForCastingSession = false;
@@ -2309,6 +2437,7 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
+      backgroundThrottling: false,
     },
   });
 
@@ -2377,7 +2506,7 @@ function traceSharedTextureStats(reason) {
   console.log(
     `[shared-texture:${reason}] received=${framesReceived} queued=${framesQueued} ` +
       `sent=${framesSent} released=${frameReleases} importFailures=${importFailures} ` +
-      `sendFailures=${sendFailures} sendTimeouts=${sendTimeouts} ` +
+      `sendFailures=${sendFailures} sendTimeouts=${sendTimeouts} throttled=${framesThrottled} ` +
       `pending=${pendingFrame ? pendingFrame.frameId : 'none'} ` +
       `sending=${frameSending}`,
   );
@@ -2426,6 +2555,20 @@ function queueFrame(frame) {
     traceSharedTextureStats(`queue-${frame.frameId}`);
   }
   void flushFrameQueue();
+}
+
+function shouldThrottleFrameForRenderer(now) {
+  if (minRendererFrameIntervalMs <= 0) {
+    return false;
+  }
+
+  if (now < nextRendererFrameAt) {
+    framesThrottled += 1;
+    return true;
+  }
+
+  nextRendererFrameAt = now + minRendererFrameIntervalMs;
+  return false;
 }
 
 async function sendFrameToRenderer(frame) {
@@ -2570,6 +2713,7 @@ function startBridge() {
       windowsHide: true,
     },
   );
+  applyProcessPriority(bridge.pid, 'uxplay-bridge');
 
   bridge.on('error', (error) => {
     const formatted = rememberLastError(error, 'UXPLAY_START_FAILED');
@@ -2647,21 +2791,11 @@ function startBridge() {
     const width = Number(widthText);
     const height = Number(heightText);
     const timestampUs = Number(timestampText);
+    const shouldDropSuppressedFrame = !castingActive && isFrameFallbackSuppressed();
     if (!castingActive) {
-      if (isFrameFallbackSuppressed()) {
-        notifyBridgeRelease(frameId);
-        traceSharedTextureStats(`frame-fallback-suppressed-${frameId}`);
-        return;
+      if (!shouldDropSuppressedFrame) {
+        setCastingActive(true, 'frame-fallback');
       }
-      setCastingActive(true, 'frame-fallback');
-    }
-    framesReceived += 1;
-    touchMirrorSessionActivity();
-    if (framesReceived <= 3 || framesReceived % 60 === 0) {
-      broadcastAppEvent('cast.frameStats', getFrameStats());
-    }
-    if (traceSharedTexture && (framesReceived <= 5 || framesReceived % 30 === 0)) {
-      traceSharedTextureStats(`recv-${frameId}`);
     }
 
     let importedSharedTexture;
@@ -2692,6 +2826,41 @@ function startBridge() {
       return;
     }
 
+    if (shouldDropSuppressedFrame) {
+      releasePendingFrame(
+        {
+          frameId,
+          importedSharedTexture,
+        },
+        { notifyRelease: true },
+      );
+      traceSharedTextureStats(`frame-fallback-suppressed-${frameId}`);
+      return;
+    }
+
+    framesReceived += 1;
+    touchMirrorSessionActivity();
+    if (framesReceived <= 3 || framesReceived % 60 === 0) {
+      broadcastAppEvent('cast.frameStats', getFrameStats());
+    }
+    if (traceSharedTexture && (framesReceived <= 5 || framesReceived % 30 === 0)) {
+      traceSharedTextureStats(`recv-${frameId}`);
+    }
+
+    if (shouldThrottleFrameForRenderer(Date.now())) {
+      releasePendingFrame(
+        {
+          frameId,
+          importedSharedTexture,
+        },
+        { notifyRelease: true },
+      );
+      if (traceSharedTexture && (framesThrottled <= 5 || framesThrottled % 60 === 0)) {
+        traceSharedTextureStats(`throttle-${frameId}`);
+      }
+      return;
+    }
+
     queueFrame({
       frameId,
       width,
@@ -2717,6 +2886,7 @@ if (gotSingleInstanceLock) {
   });
 
   app.whenReady().then(() => {
+    logGpuFeatureStatus('app-ready');
     restorePersistedPin();
     setupIpcHandlers();
     createWindow();
@@ -2731,6 +2901,11 @@ if (gotSingleInstanceLock) {
     } else {
       console.log('sendSharedTexture watchdog disabled');
     }
+    console.log(
+      minRendererFrameIntervalMs > 0
+        ? `Renderer frame cap: ${maxRendererFps} fps`
+        : 'Renderer frame cap disabled',
+    );
 
     win.webContents.once('did-finish-load', () => {
       try {
@@ -2754,6 +2929,7 @@ if (gotSingleInstanceLock) {
     isExplicitlyQuitting = true;
     stopAppWebSocketServer();
     closeUxplayEventWebSocket('app-quitting');
+    updatePowerSaveBlocker(false);
     if (bridge && bridge.stdin.writable) {
       bridge.stdin.write('STOP\n');
     }
