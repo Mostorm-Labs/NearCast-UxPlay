@@ -49,6 +49,7 @@ add_library( renderers
              STATIC
              audio_renderer.c
 	     video_renderer.c
+             native_window.cpp
              shared_texture_bridge.cpp )
 
 target_link_libraries ( renderers PUBLIC airplay )
@@ -101,7 +102,5 @@ if (GST_D3D11_FOUND)
 endif()
 
 if (WIN32 AND GST_D3D11_FOUND)
-  target_link_libraries(renderers PUBLIC d3d11 dxgi)
+  target_link_libraries(renderers PUBLIC d3d11 dxgi user32 gdi32 ole32)
 endif()
-
-

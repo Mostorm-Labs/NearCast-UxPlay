@@ -25,6 +25,10 @@
 #include <gst/app/gstappsink.h>
 #include "video_renderer.h"
 #include "shared_texture_bridge.h"
+#include "native_window.h"
+#ifdef _WIN32
+#include <gst/video/videooverlay.h>
+#endif
 
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
@@ -118,6 +122,9 @@ static int n_renderers = NCODECS;
 static GMutex renderer_mutex;
 static bool renderers_started = false;
 static shared_texture_bridge_t *shared_texture_bridge = NULL;
+#ifdef _WIN32
+static bool use_native_window = false;
+#endif
 static char h264[] = "h264";
 static char h265[] = "h265";
 static char hls[] = "hls";
@@ -133,6 +140,38 @@ static GstFlowReturn on_shared_texture_sample(GstAppSink *sink, gpointer user_da
     }
     return shared_texture_bridge_on_new_sample(shared_texture_bridge, sink);
 }
+
+#ifdef _WIN32
+static void bind_native_window_to_sink(video_renderer_t *renderer_instance, const char *videosink) {
+    if (!use_native_window || !renderer_instance || !renderer_instance->pipeline || !videosink) {
+        return;
+    }
+
+    uintptr_t video_handle = native_window_get_video_handle();
+    if (!video_handle) {
+        logger_log(logger, LOGGER_WARNING, "native window video handle is not available");
+        return;
+    }
+
+    gchar *sink_name = g_strdup_printf("%s_%s", videosink, renderer_instance->codec);
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(renderer_instance->pipeline), sink_name);
+    if (!sink) {
+        logger_log(logger, LOGGER_WARNING, "native window could not find video sink \"%s\"", sink_name);
+        g_free(sink_name);
+        return;
+    }
+
+    if (GST_IS_VIDEO_OVERLAY(sink)) {
+        gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(sink), (guintptr) video_handle);
+        logger_log(logger, LOGGER_DEBUG, "bound \"%s\" to native video window handle", sink_name);
+    } else {
+        logger_log(logger, LOGGER_WARNING, "video sink \"%s\" does not implement GstVideoOverlay", sink_name);
+    }
+
+    gst_object_unref(sink);
+    g_free(sink_name);
+}
+#endif
 
 static void append_videoflip (GString *launch, const videoflip_t *flip, const videoflip_t *rot) {
     /* videoflip image transform */
@@ -314,6 +353,15 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
         }
     }
 
+#ifdef _WIN32
+    use_native_window = native_window_should_embed(videosink, videosink_options, hls_video,
+                                                  shared_texture_target_pid);
+    if (use_native_window &&
+        !native_window_create(logger, server_name, initial_fullscreen)) {
+        use_native_window = false;
+    }
+#endif
+
     g_assert (n_renderers <= NCODECS);
     for (int i = 0; i < n_renderers; i++) {
         g_assert (i < 2);
@@ -435,6 +483,10 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
             renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "video_source");
             g_assert(renderer_type[i]->appsrc);
             renderer_type[i]->shared_texture_sink = NULL;
+
+#ifdef _WIN32
+            bind_native_window_to_sink(renderer_type[i], videosink);
+#endif
 
             if (shared_texture_bridge) {
                 gchar *shared_texture_sink_name =
@@ -799,6 +851,12 @@ void video_renderer_destroy() {
         shared_texture_bridge_destroy(shared_texture_bridge);
         shared_texture_bridge = NULL;
     }
+#ifdef _WIN32
+    if (use_native_window) {
+        native_window_destroy();
+        use_native_window = false;
+    }
+#endif
     g_mutex_unlock(&renderer_mutex);
 }
 
@@ -1083,6 +1141,11 @@ int video_renderer_choose_codec (bool video_is_h265) {
         g_mutex_unlock(&renderer_mutex);
         return -1;
     } else if (renderer_used == renderer) {
+#ifdef _WIN32
+        if (use_native_window) {
+            native_window_show();
+        }
+#endif
         g_mutex_unlock(&renderer_mutex);
         return 0;
     } else if (renderer) {
@@ -1118,6 +1181,11 @@ int video_renderer_choose_codec (bool video_is_h265) {
     if (renderer == renderer_type[1]) {
         logger_log(logger, LOGGER_INFO, "*** video format is h265 high definition (HD/4K) video %dx%d", width, height);
     }
+#ifdef _WIN32
+    if (use_native_window) {
+        native_window_show();
+    }
+#endif
     if (renderer_unused) {
         for (int i = 0; i < n_renderers; i++) {
             if (renderer_type[i] != renderer_unused) {

@@ -306,6 +306,10 @@ static void native_window_control_action(const char *action, void *userdata) {
     if (!strcmp(action, "stop") && raop) {
         LOGI("native window requested stop casting");
         raop_control_stop(raop);
+    } else if (!strcmp(action, "toggle-audio") && raop) {
+        bool enabled = raop_control_get_mirror_audio(raop);
+        LOGI("native window requested %s mirror audio", enabled ? "mute" : "unmute");
+        raop_control_set_mirror_audio(raop, !enabled);
     }
 }
 #endif
@@ -2503,6 +2507,9 @@ extern "C" int video_set_codec(void *cls, video_codec_t codec) {
 }
 
 extern "C" void display_pin(void *cls, char *pin) {
+#ifdef _WIN32
+    native_window_set_pin(pin, true);
+#endif
     int margin = 10;
     int spacing = 3;
     char *image = create_pin_display(pin, margin, spacing);
@@ -2966,11 +2973,19 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
 extern "C" void control_pin_changed(void *cls, unsigned short pin) {
     char data[32];
     snprintf(data, sizeof(data), "{\"pin\":\"%04u\"}", pin % 10000);
+#ifdef _WIN32
+    char pin_text[5];
+    snprintf(pin_text, sizeof(pin_text), "%04u", pin % 10000);
+    native_window_set_pin(pin_text, false);
+#endif
     ws_control_queue_event("pinChanged", data);
 }
 
 extern "C" void control_pin_required(void *cls, char *pin) {
     (void) cls;
+#ifdef _WIN32
+    native_window_set_pin(pin, true);
+#endif
     std::string pin_value = pin ? pin : "";
     std::string data = "{\"pin\":" + json_string_or_null(pin_value) + "}";
     ws_control_queue_event("pinRequired", data);
