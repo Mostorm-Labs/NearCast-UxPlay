@@ -42,6 +42,11 @@ const UINT_PTR kPinAutoHideTimer = 1;
 const UINT kPinAutoHideMs = 6000;
 const UINT kNativeWindowDestroyMessage = WM_APP + 64;
 const UINT kNativeWindowPinMessage = WM_APP + 65;
+const UINT kDefaultDpi = 96;
+
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
 
 struct NativeWindowState {
     logger_t *logger = nullptr;
@@ -69,6 +74,7 @@ struct NativeWindowState {
     bool pin_webview_ready = false;
     bool web_message_token_valid = false;
     bool pin_visible = false;
+    UINT dpi = kDefaultDpi;
     RECT restore_rect = {};
     LONG_PTR restore_style = 0;
     LONG_PTR restore_ex_style = 0;
@@ -100,6 +106,89 @@ void LogHresult(int level, const char *message, HRESULT hr) {
     char buffer[256] = {};
     snprintf(buffer, sizeof(buffer), "%s (hr=0x%08lx)", message, static_cast<unsigned long>(hr));
     Log(level, buffer);
+}
+
+void EnableProcessDpiAwareness() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) {
+        return;
+    }
+
+    typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(HANDLE);
+    auto set_awareness_context = reinterpret_cast<SetProcessDpiAwarenessContextFn>(
+        GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+    if (set_awareness_context) {
+        if (set_awareness_context(reinterpret_cast<HANDLE>(-4))) {
+            return;
+        }
+        if (set_awareness_context(reinterpret_cast<HANDLE>(-3))) {
+            return;
+        }
+    }
+
+    typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
+    auto set_process_dpi_aware = reinterpret_cast<SetProcessDPIAwareFn>(
+        GetProcAddress(user32, "SetProcessDPIAware"));
+    if (set_process_dpi_aware) {
+        set_process_dpi_aware();
+    }
+}
+
+UINT GetSystemDpiValue() {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef UINT (WINAPI *GetDpiForSystemFn)(void);
+        auto get_dpi_for_system = reinterpret_cast<GetDpiForSystemFn>(
+            GetProcAddress(user32, "GetDpiForSystem"));
+        if (get_dpi_for_system) {
+            UINT dpi = get_dpi_for_system();
+            if (dpi > 0) {
+                return dpi;
+            }
+        }
+    }
+
+    HDC hdc = GetDC(nullptr);
+    if (!hdc) {
+        return kDefaultDpi;
+    }
+    int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(nullptr, hdc);
+    return dpi > 0 ? static_cast<UINT>(dpi) : kDefaultDpi;
+}
+
+UINT GetWindowDpiValue(HWND hwnd) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+        auto get_dpi_for_window = reinterpret_cast<GetDpiForWindowFn>(
+            GetProcAddress(user32, "GetDpiForWindow"));
+        if (get_dpi_for_window && hwnd) {
+            UINT dpi = get_dpi_for_window(hwnd);
+            if (dpi > 0) {
+                return dpi;
+            }
+        }
+    }
+    return g_state.dpi > 0 ? g_state.dpi : GetSystemDpiValue();
+}
+
+int ScaleForDpi(int value, UINT dpi) {
+    return MulDiv(value, static_cast<int>(dpi > 0 ? dpi : kDefaultDpi), static_cast<int>(kDefaultDpi));
+}
+
+RECT AdjustWindowRectForDpi(RECT rect, DWORD style, DWORD ex_style, UINT dpi) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        typedef BOOL (WINAPI *AdjustWindowRectExForDpiFn)(LPRECT, DWORD, BOOL, DWORD, UINT);
+        auto adjust_for_dpi = reinterpret_cast<AdjustWindowRectExForDpiFn>(
+            GetProcAddress(user32, "AdjustWindowRectExForDpi"));
+        if (adjust_for_dpi && adjust_for_dpi(&rect, style, FALSE, ex_style, dpi)) {
+            return rect;
+        }
+    }
+    AdjustWindowRectEx(&rect, style, FALSE, ex_style);
+    return rect;
 }
 
 template <typename T>
@@ -141,13 +230,19 @@ std::wstring BuildWebViewUserDataFolder() {
 RECT GetWebViewBounds(HWND hwnd) {
     RECT client = {};
     GetClientRect(hwnd, &client);
-    int width = kToolButtonSize + kToolbarPaddingX * 2;
-    int height = kToolButtonSize * kToolButtonCount +
-                 kToolButtonGap * (kToolButtonCount - 1) +
-                 kToolbarPaddingY * 2;
+    UINT dpi = GetWindowDpiValue(hwnd);
+    int button_size = ScaleForDpi(kToolButtonSize, dpi);
+    int button_gap = ScaleForDpi(kToolButtonGap, dpi);
+    int padding_x = ScaleForDpi(kToolbarPaddingX, dpi);
+    int padding_y = ScaleForDpi(kToolbarPaddingY, dpi);
+    int margin_right = ScaleForDpi(kToolbarMarginRight, dpi);
+    int width = button_size + padding_x * 2;
+    int height = button_size * kToolButtonCount +
+                 button_gap * (kToolButtonCount - 1) +
+                 padding_y * 2;
     int client_width = static_cast<int>(client.right - client.left);
     int client_height = static_cast<int>(client.bottom - client.top);
-    int left = std::max(0, client_width - kToolbarMarginRight - width);
+    int left = std::max(0, client_width - margin_right - width);
     int top = std::max(0, (client_height - height) / 2);
     return RECT{left, top, left + width, top + height};
 }
@@ -169,25 +264,35 @@ RECT GetPinWindowBounds() {
         work = RECT{0, 0, kInitialWindowWidth, kInitialWindowHeight};
     }
 
+    UINT dpi = GetWindowDpiValue(g_state.main_hwnd);
+    int pin_width = ScaleForDpi(kPinWindowWidth, dpi);
+    int pin_height = ScaleForDpi(kPinWindowHeight, dpi);
+    int pin_top = ScaleForDpi(kPinWindowTop, dpi);
     int work_width = static_cast<int>(work.right - work.left);
-    int left = static_cast<int>(work.left) + std::max(0, (work_width - kPinWindowWidth) / 2);
-    int top = static_cast<int>(work.top) + kPinWindowTop;
-    return RECT{left, top, left + kPinWindowWidth, top + kPinWindowHeight};
+    int left = static_cast<int>(work.left) + std::max(0, (work_width - pin_width) / 2);
+    int top = static_cast<int>(work.top) + pin_top;
+    return RECT{left, top, left + pin_width, top + pin_height};
 }
 
 RECT GetButtonRect(HWND hwnd, int index) {
     RECT client = {};
     GetClientRect(hwnd, &client);
+    UINT dpi = GetWindowDpiValue(hwnd);
+    int button_size = ScaleForDpi(kToolButtonSize, dpi);
+    int button_gap = ScaleForDpi(kToolButtonGap, dpi);
+    int padding_x = ScaleForDpi(kToolbarPaddingX, dpi);
+    int padding_y = ScaleForDpi(kToolbarPaddingY, dpi);
+    int margin_right = ScaleForDpi(kToolbarMarginRight, dpi);
     int client_width = static_cast<int>(client.right - client.left);
     int client_height = static_cast<int>(client.bottom - client.top);
-    int width = kToolButtonSize + kToolbarPaddingX * 2;
-    int height = kToolButtonSize * kToolButtonCount +
-                 kToolButtonGap * (kToolButtonCount - 1) +
-                 kToolbarPaddingY * 2;
-    int left = std::max(0, client_width - kToolbarMarginRight - width + kToolbarPaddingX);
-    int top = std::max(0, (client_height - height) / 2 + kToolbarPaddingY);
-    top += index * (kToolButtonSize + kToolButtonGap);
-    return RECT{left, top, left + kToolButtonSize, top + kToolButtonSize};
+    int width = button_size + padding_x * 2;
+    int height = button_size * kToolButtonCount +
+                 button_gap * (kToolButtonCount - 1) +
+                 padding_y * 2;
+    int left = std::max(0, client_width - margin_right - width + padding_x);
+    int top = std::max(0, (client_height - height) / 2 + padding_y);
+    top += index * (button_size + button_gap);
+    return RECT{left, top, left + button_size, top + button_size};
 }
 
 bool PointInRect(const RECT &rect, POINT pt) {
@@ -1007,7 +1112,8 @@ void PaintButton(HDC hdc, const RECT &rect, const wchar_t *label, bool hot) {
     HPEN pen = CreatePen(PS_SOLID, 1, RGB(96, 96, 96));
     HGDIOBJ old_brush = SelectObject(hdc, brush);
     HGDIOBJ old_pen = SelectObject(hdc, pen);
-    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 18, 18);
+    int radius = std::max(1, static_cast<int>(rect.bottom - rect.top) / 2);
+    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
     SelectObject(hdc, old_pen);
     SelectObject(hdc, old_brush);
     DeleteObject(pen);
@@ -1133,6 +1239,20 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     case WM_SIZE:
         ResizeChildren(hwnd);
         return 0;
+    case WM_DPICHANGED: {
+        g_state.dpi = HIWORD(wparam);
+        const RECT *suggested = reinterpret_cast<const RECT *>(lparam);
+        if (suggested) {
+            SetWindowPos(hwnd, nullptr,
+                         suggested->left, suggested->top,
+                         suggested->right - suggested->left,
+                         suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        ResizeChildren(hwnd);
+        PositionPinWindow();
+        return 0;
+    }
     case WM_CLOSE:
         ShowWindow(hwnd, SW_HIDE);
         return 0;
@@ -1227,6 +1347,8 @@ void NotifyReady(bool failed) {
 }
 
 void WindowThread() {
+    EnableProcessDpiAwareness();
+
     HRESULT co_hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_state.com_initialized = SUCCEEDED(co_hr);
     if (FAILED(co_hr)) {
@@ -1241,10 +1363,14 @@ void WindowThread() {
     }
 
     DWORD style = WS_OVERLAPPEDWINDOW;
-    RECT rect = {0, 0, kInitialWindowWidth, kInitialWindowHeight};
-    AdjustWindowRect(&rect, style, FALSE);
+    DWORD ex_style = 0;
+    g_state.dpi = GetSystemDpiValue();
+    RECT rect = {0, 0,
+                 ScaleForDpi(kInitialWindowWidth, g_state.dpi),
+                 ScaleForDpi(kInitialWindowHeight, g_state.dpi)};
+    rect = AdjustWindowRectForDpi(rect, style, ex_style, g_state.dpi);
 
-    g_state.main_hwnd = CreateWindowExW(0, kMainWindowClass, g_state.title.c_str(), style,
+    g_state.main_hwnd = CreateWindowExW(ex_style, kMainWindowClass, g_state.title.c_str(), style,
                                         CW_USEDEFAULT, CW_USEDEFAULT,
                                         rect.right - rect.left, rect.bottom - rect.top,
                                         nullptr, nullptr, g_state.instance, nullptr);
@@ -1256,11 +1382,15 @@ void WindowThread() {
 
     g_state.video_hwnd = CreateWindowExW(0, L"STATIC", nullptr,
                                          WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
-                                         0, 0, kInitialWindowWidth, kInitialWindowHeight,
+                                         0, 0,
+                                         ScaleForDpi(kInitialWindowWidth, g_state.dpi),
+                                         ScaleForDpi(kInitialWindowHeight, g_state.dpi),
                                          g_state.main_hwnd, nullptr, g_state.instance, nullptr);
     g_state.overlay_hwnd = CreateWindowExW(WS_EX_TRANSPARENT, kOverlayWindowClass, nullptr,
                                            WS_CHILD | WS_VISIBLE,
-                                           0, 0, kInitialWindowWidth, kInitialWindowHeight,
+                                           0, 0,
+                                           ScaleForDpi(kInitialWindowWidth, g_state.dpi),
+                                           ScaleForDpi(kInitialWindowHeight, g_state.dpi),
                                            g_state.main_hwnd, nullptr, g_state.instance, nullptr);
 
     if (!g_state.video_hwnd || !g_state.overlay_hwnd) {
