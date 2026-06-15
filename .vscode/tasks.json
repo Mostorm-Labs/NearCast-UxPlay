@@ -66,6 +66,74 @@
       ]
     },
     {
+      "label": "CMake: configure (ucrt64)",
+      "type": "shell",
+      "command": "D:/msys64/msys2_shell.cmd",
+      "args": [
+        "-ucrt64",
+        "-defterm",
+        "-no-start",
+        "-here",
+        "-c",
+        "cmake -B build-ucrt64 -G Ninja -DCMAKE_BUILD_TYPE=Debug"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "Setup: configure MSYS2_ROOT"
+      ],
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
+    },
+    {
+      "label": "CMake: build (ucrt64)",
+      "type": "shell",
+      "command": "D:/msys64/msys2_shell.cmd",
+      "args": [
+        "-ucrt64",
+        "-defterm",
+        "-no-start",
+        "-here",
+        "-c",
+        "cmake --build build-ucrt64 --config Debug -- -j 4 && cp -u /ucrt64/bin/*.dll build-ucrt64/"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$gcc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "dependsOn": [
+        "CMake: configure (ucrt64)"
+      ]
+    },
+    {
+      "label": "CMake: clean (ucrt64)",
+      "type": "shell",
+      "command": "D:/msys64/msys2_shell.cmd",
+      "args": [
+        "-ucrt64",
+        "-defterm",
+        "-no-start",
+        "-here",
+        "-c",
+        "cmake --build build-ucrt64 --target clean"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "CMake: clean",
       "type": "shell",
       "command": "${env:MSYS2_ROOT}/msys2_shell.cmd",

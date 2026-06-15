@@ -67,6 +67,7 @@
 #include "lib/threads.h"
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
+#include "renderers/native_window.h"
 #include "mongoose.h"
 
 #define VERSION "1.72"
@@ -295,6 +296,19 @@ static void log(int level, const char* format, ...) {
 #define LOGI(...) log(LOGGER_INFO, __VA_ARGS__)
 #define LOGW(...) log(LOGGER_WARNING, __VA_ARGS__)
 #define LOGE(...) log(LOGGER_ERR, __VA_ARGS__)
+
+#ifdef _WIN32
+static void native_window_control_action(const char *action, void *userdata) {
+    (void) userdata;
+    if (!action) {
+        return;
+    }
+    if (!strcmp(action, "stop") && raop) {
+        LOGI("native window requested stop casting");
+        raop_control_stop(raop);
+    }
+}
+#endif
 
 static std::string json_escape(const std::string &value) {
     std::string escaped;
@@ -3305,12 +3319,7 @@ int main (int argc, char *argv[]) {
     }
 
     if (videosink == "d3d11videosink"  && videosink_options.empty() && use_video && !shared_texture_export_only) {
-        if (fullscreen) {
-            videosink_options.append(" fullscreen-toggle-mode=GST_D3D11_WINDOW_FULLSCREEN_TOGGLE_MODE_PROPERTY fullscreen=TRUE");
-        } else {
-            videosink_options.append(" fullscreen-toggle-mode=GST_D3D11_WINDOW_FULLSCREEN_TOGGLE_MODE_ALT_ENTER ");
-            LOGI("Use Alt-Enter key combination to toggle into/out of full-screen mode");
-        }
+        LOGI("Using native Windows video window; use F11, Alt-Enter, or the overlay button to toggle full-screen mode");
     }
 
     if (shared_texture_target_pid != 0) {
@@ -3397,6 +3406,9 @@ int main (int argc, char *argv[]) {
     render_logger = logger_init();
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
+#ifdef _WIN32
+    native_window_set_action_callback(native_window_control_action, NULL);
+#endif
 
     if (mirror_audio_is_enabled()) {
       audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);

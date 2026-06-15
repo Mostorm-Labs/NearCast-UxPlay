@@ -11,7 +11,8 @@ function Test-Msys2Root([string]$RootPath) {
 
   $shellCmd = Join-Path $RootPath "msys2_shell.cmd"
   $mingwGdb = Join-Path $RootPath "mingw64\bin\gdb.exe"
-  return (Test-Path $shellCmd) -and (Test-Path $mingwGdb)
+  $ucrtGdb = Join-Path $RootPath "ucrt64\bin\gdb.exe"
+  return (Test-Path $shellCmd) -and ((Test-Path $mingwGdb) -or (Test-Path $ucrtGdb))
 }
 
 function Resolve-Msys2Root {
@@ -44,7 +45,7 @@ function Resolve-Msys2Root {
     return (Resolve-Path $manual).Path
   }
 
-  throw "Invalid MSYS2 root: '$manual'. Expected msys2_shell.cmd and mingw64\bin\gdb.exe under this folder."
+  throw "Invalid MSYS2 root: '$manual'. Expected msys2_shell.cmd and mingw64\bin\gdb.exe or ucrt64\bin\gdb.exe under this folder."
 }
 
 $resolvedRoot = Resolve-Msys2Root -InputRoot $Msys2Root
