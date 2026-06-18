@@ -376,6 +376,8 @@ static void ws_control_queue_event(const std::string &op, const std::string &dat
     MUTEX_UNLOCK(ws_control_mutex);
 }
 
+static void ws_queue_status_changed_event();
+
 static void control_state_get_snapshot(unsigned int *connections, bool *mirroring,
                                        std::string *client, std::string *model,
                                        std::string *device_id) {
@@ -416,11 +418,12 @@ static void control_state_note_client(const char *name, const char *model, const
     }
 
     if (should_announce) {
-        std::string data = "{\"device\":" + json_string_or_null(event_client) +
+        std::string data = "{\"sessionId\":\"current\",\"source\":{\"device\":" + json_string_or_null(event_client) +
                            ",\"model\":" + json_string_or_null(event_model) +
                            ",\"deviceId\":" + json_string_or_null(event_device_id) +
-                           ",\"ip\":null}";
-        ws_control_queue_event("mirrorStarted", data);
+                           ",\"ip\":null},\"protocol\":\"airplay\"}";
+        ws_control_queue_event("cast.sessionStarted", data);
+        ws_queue_status_changed_event();
     }
 }
 
@@ -543,7 +546,7 @@ static void ws_connection_set_authenticated(struct mg_connection *c, bool authen
 }
 
 static std::string generate_ws_session_id() {
-    unsigned char bytes[8];
+    unsigned char bytes[4];
     bool have_random = mg_random(bytes, sizeof(bytes));
     if (!have_random) {
         std::random_device rd;
@@ -551,12 +554,20 @@ static std::string generate_ws_session_id() {
             bytes[i] = (unsigned char) rd();
         }
     }
-    char sid[17];
+    char sid[9];
     for (size_t i = 0; i < sizeof(bytes); i++) {
         snprintf(sid + (2 * i), 3, "%02x", bytes[i]);
     }
-    sid[16] = '\0';
+    sid[8] = '\0';
     return std::string(sid);
+}
+
+static bool ws_connection_identified(struct mg_connection *c) {
+    return c->data[1] == 1;
+}
+
+static void ws_connection_set_identified(struct mg_connection *c, bool identified) {
+    c->data[1] = identified ? 1 : 0;
 }
 
 static std::string ws_connection_sid(struct mg_connection *c) {
@@ -584,25 +595,26 @@ static std::string ws_advanced_event_json(struct mg_connection *c, const std::st
                                           const std::string &data_json) {
     return "{\"sid\":\"" + json_escape(ws_connection_sid(c)) +
            "\",\"op\":6,\"d\":{\"event\":\"" + json_escape(op) +
-           "\",\"data\":" + (data_json.empty() ? "{}" : data_json) + "}}";
+           "\",\"intent\":1,\"data\":" + (data_json.empty() ? "{}" : data_json) + "}}";
 }
 
 static void ws_send_response(struct mg_connection *c, const std::string &id,
                              const std::string &method, bool ok,
                              const std::string &data_json, const std::string &error) {
     std::string message = "{\"sid\":\"" + json_escape(ws_connection_sid(c)) +
-                          "\",\"op\":8,\"d\":{\"id\":\"" + json_escape(id) + "\"";
+                          "\",\"op\":8,\"d\":{\"id\":";
+    message.append(id.empty() ? "null" : id);
     if (!method.empty()) {
         message.append(",\"method\":\"");
         message.append(json_escape(method));
         message.append("\"");
     }
-    message.append(",\"status\":{\"result\":");
+    message.append(",\"status\":{\"ok\":");
     message.append(ok ? "true" : "false");
     message.append(",\"code\":");
-    message.append(ok ? "100" : "300");
+    message.append(ok ? "0" : ("\"" + json_escape(error.empty() ? "INTERNAL_ERROR" : error) + "\""));
     if (!ok) {
-        message.append(",\"comment\":\"");
+        message.append(",\"message\":\"");
         message.append(json_escape(error.empty() ? "INTERNAL_ERROR" : error));
         message.append("\"");
     }
@@ -620,19 +632,18 @@ static void ws_send_response(struct mg_connection *c, const std::string &id, boo
     ws_send_response(c, id, "", ok, data_json, error);
 }
 
-static void ws_send_hello_ack(struct mg_connection *c) {
-    std::string sid = ws_connection_sid(c);
-    std::string message = "{\"sid\":\"" + json_escape(sid) +
-                          "\",\"op\":1,\"d\":{\"protocolVersion\":2,"
-                          "\"serverName\":\"UxPlay\","
-                          "\"capabilities\":[\"auth\",\"request\",\"event\",\"bye\"],"
-                          "\"maxPayload\":16384}}";
+static void ws_send_hello(struct mg_connection *c) {
+    std::string message = "{\"sid\":\"\",\"op\":0,\"d\":{"
+                          "\"axtpVersion\":\"1.0.0\","
+                          "\"rpcVersion\":1,"
+                          "\"authentication\":{\"required\":true,\"types\":[\"token\"]},"
+                          "\"maxPayload\":65536}}";
     ws_send_text(c, message);
 }
 
-static void ws_send_bye_ack(struct mg_connection *c) {
+static void ws_send_identified(struct mg_connection *c) {
     std::string message = "{\"sid\":\"" + json_escape(ws_connection_sid(c)) +
-                          "\",\"op\":15,\"d\":{\"message\":\"bye\"}}";
+                          "\",\"op\":3,\"d\":{\"negotiatedRpcVersion\":1}}";
     ws_send_text(c, message);
 }
 
@@ -688,135 +699,351 @@ static std::string ws_status_json() {
     return data;
 }
 
+static std::string ws_json_fragment_or_null(struct mg_str body, const char *path) {
+    int len = 0;
+    int off = mg_json_get(body, path, &len);
+    if (off < 0 || len <= 0) {
+        return "null";
+    }
+    return std::string(body.buf + off, (size_t) len);
+}
+
+static std::string ws_control_url_json() {
+    char url[64];
+    snprintf(url, sizeof(url), "ws://127.0.0.1:%hu/", ws_control_port);
+    return json_string_or_null(url);
+}
+
+static std::string ws_runtime_status_json() {
+    std::string data = "{\"state\":\"ready\",\"displayName\":";
+    data.append(json_string_or_null(server_name));
+    data.append(",\"controlPort\":");
+    data.append(std::to_string(ws_control_port));
+    data.append(",\"controlUrl\":");
+    data.append(ws_control_url_json());
+    data.append(",\"allowLan\":false}");
+    return data;
+}
+
+static std::string ws_backend_status_json() {
+    std::string data = "{\"type\":\"uxplay\",\"state\":\"";
+    data.append(raop ? "ready" : "starting");
+    data.append("\",\"controlPort\":");
+    data.append(std::to_string(ws_control_port));
+    data.append(",\"controlUrl\":");
+    data.append(ws_control_url_json());
+    data.append("}");
+    return data;
+}
+
+static std::string ws_session_status_json() {
+    unsigned int connections = 0;
+    bool mirroring = false;
+    std::string client;
+    std::string model;
+    std::string device_id;
+    control_state_get_snapshot(&connections, &mirroring, &client, &model, &device_id);
+
+    std::string data = "{\"active\":";
+    data.append(mirroring ? "true" : "false");
+    data.append(",\"sessionId\":");
+    data.append(mirroring ? "\"current\"" : "null");
+    data.append(",\"mirrorSessionActive\":");
+    data.append(mirroring ? "true" : "false");
+    data.append(",\"source\":{\"device\":");
+    data.append(json_string_or_null(client));
+    data.append(",\"model\":");
+    data.append(json_string_or_null(model));
+    data.append(",\"deviceId\":");
+    data.append(json_string_or_null(device_id));
+    data.append(",\"ip\":null},\"protocol\":\"airplay\",\"connections\":");
+    data.append(std::to_string(connections));
+    data.append("}");
+    return data;
+}
+
+static std::string ws_pin_code_status_json() {
+    unsigned short current_pin = 0;
+    bool use_pin_now = false;
+    if (raop) {
+        raop_control_get_pin(raop, &current_pin, &use_pin_now);
+    }
+    char pin_json[32];
+    if (use_pin_now) {
+        snprintf(pin_json, sizeof(pin_json), "\"%04u\"", current_pin % 10000);
+    } else {
+        strncpy(pin_json, "null", sizeof(pin_json));
+        pin_json[sizeof(pin_json) - 1] = '\0';
+    }
+
+    std::string data = "{\"required\":";
+    data.append(pin_pw ? "true" : "false");
+    data.append(",\"visible\":false,\"pinCode\":");
+    data.append(pin_json);
+    data.append(",\"updating\":false}");
+    return data;
+}
+
+static std::string ws_audio_status_json() {
+    bool enabled = raop && raop_control_get_mirror_audio(raop);
+    std::string data = "{\"enabled\":";
+    data.append(enabled ? "true" : "false");
+    data.append(",\"muted\":");
+    data.append(enabled ? "false" : "true");
+    data.append(",\"updating\":false}");
+    return data;
+}
+
+static std::string ws_window_status_json() {
+    std::string data = "{\"visible\":false,\"fullscreen\":";
+    data.append(fullscreen ? "true" : "false");
+    data.append(",\"alwaysOnTop\":false,\"pinVisible\":false}");
+    return data;
+}
+
+static std::string ws_cast_status_json() {
+    unsigned int connections = 0;
+    bool mirroring = false;
+    control_state_get_snapshot(&connections, &mirroring, NULL, NULL, NULL);
+
+    std::string data = "{\"roles\":[\"receiver\"],\"activeRole\":\"receiver\",\"state\":\"";
+    data.append(mirroring ? "casting" : (raop ? "ready" : "starting"));
+    data.append("\",\"protocols\":[\"airplay\"],\"runtime\":");
+    data.append(ws_runtime_status_json());
+    data.append(",\"backend\":");
+    data.append(ws_backend_status_json());
+    data.append(",\"session\":");
+    data.append(ws_session_status_json());
+    data.append(",\"pinCode\":");
+    data.append(ws_pin_code_status_json());
+    data.append(",\"audio\":");
+    data.append(ws_audio_status_json());
+    data.append(",\"window\":");
+    data.append(ws_window_status_json());
+    data.append(",\"error\":null}");
+    return data;
+}
+
+static void ws_queue_status_changed_event() {
+    ws_control_queue_event("cast.statusChanged", ws_cast_status_json());
+}
+
 static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
     long envelope_op = mg_json_get_long(body, "$.op", -1);
-    if (envelope_op == 0) {
-        char *sid_raw = mg_json_get_str(body, "$.sid");
-        ws_connection_set_sid(c, sid_raw ? sid_raw : "");
-        if (sid_raw) mg_free(sid_raw);
-        ws_send_hello_ack(c);
+    std::string id = ws_json_fragment_or_null(body, "$.d.id");
+
+    if (!ws_connection_identified(c)) {
+        if (envelope_op != 2) {
+            ws_send_response(c, id, false, "{}", "UNAUTHORIZED");
+            c->is_draining = 1;
+            return;
+        }
+
+        long rpc_version = mg_json_get_long(body, "$.d.rpcVersion", -1);
+        if (rpc_version != 1) {
+            ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
+            return;
+        }
+
+        char *token_raw = mg_json_get_str(body, "$.d.authentication.token");
+        bool ok = token_raw && !ws_control_token.empty() && ws_control_token == token_raw;
+        if (token_raw) mg_free(token_raw);
+        if (!ok) {
+            ws_send_response(c, id, false, "{}", "UNAUTHORIZED");
+            c->is_draining = 1;
+            return;
+        }
+
+        (void) ws_connection_sid(c);
+        ws_connection_set_authenticated(c, true);
+        ws_connection_set_identified(c, true);
+        ws_send_identified(c);
+        ws_send_text(c, ws_advanced_event_json(c, "cast.runtimeReady", ws_runtime_status_json()));
+        ws_send_text(c, ws_advanced_event_json(c, "cast.backendReady", ws_backend_status_json()));
         return;
     }
-    if (envelope_op == 14) {
-        char *sid_raw = mg_json_get_str(body, "$.sid");
-        ws_connection_set_sid(c, sid_raw ? sid_raw : "");
-        if (sid_raw) mg_free(sid_raw);
-        ws_send_bye_ack(c);
-        c->is_draining = 1;
+
+    if (envelope_op == 2) {
+        ws_send_identified(c);
         return;
     }
+
     if (envelope_op != 7) {
-        char *sid_raw = mg_json_get_str(body, "$.sid");
-        char *id_raw = mg_json_get_str(body, "$.d.id");
-        ws_connection_set_sid(c, sid_raw ? sid_raw : "");
-        ws_send_response(c, id_raw ? id_raw : "", "", false, "{}", "INVALID_OP");
-        if (sid_raw) mg_free(sid_raw);
-        if (id_raw) mg_free(id_raw);
+        ws_send_response(c, id, false, "{}", "INVALID_OP");
         return;
     }
 
     char *sid_raw = mg_json_get_str(body, "$.sid");
-    ws_connection_set_sid(c, sid_raw ? sid_raw : "");
+    std::string sid = sid_raw ? sid_raw : "";
     if (sid_raw) mg_free(sid_raw);
+    if (sid != ws_connection_sid(c)) {
+        ws_send_response(c, id, false, "{}", "UNAUTHORIZED");
+        c->is_draining = 1;
+        return;
+    }
 
-    char *id_raw = mg_json_get_str(body, "$.d.id");
     char *op_raw = mg_json_get_str(body, "$.d.method");
-    std::string id = id_raw ? id_raw : "";
     std::string op = op_raw ? op_raw : "";
-
-    if (id_raw) mg_free(id_raw);
     if (op_raw) mg_free(op_raw);
 
     if (op.empty()) {
-        ws_send_response(c, id, op, false, "{}", "INVALID_PARAMS");
+        ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
         return;
     }
 
-    if (!ws_connection_authenticated(c) && op != "auth") {
-        ws_send_response(c, id, op, false, "{}", "UNAUTHORIZED");
+    if (op == "getStatus") op = "cast.getStatus";
+    else if (op == "getPin") op = "cast.getPinCode";
+    else if (op == "setPin") op = "cast.setPinCode";
+    else if (op == "setAudio") op = "cast.setAudio";
+    else if (op == "getAudio") op = "cast.getAudio";
+    else if (op == "stop") op = "cast.stopSession";
+
+    if (op == "cast.getStatus") {
+        ws_send_response(c, id, true, ws_cast_status_json(), "");
         return;
     }
 
-    if (op == "auth") {
-        char *token_raw = mg_json_get_str(body, "$.d.params.token");
-        bool ok = token_raw && !ws_control_token.empty() && ws_control_token == token_raw;
-        if (token_raw) mg_free(token_raw);
-        if (!ok) {
-            ws_send_response(c, id, op, false, "{}", "UNAUTHORIZED");
-            return;
-        }
-        ws_connection_set_authenticated(c, true);
-        ws_send_response(c, id, op, true, "{\"message\":\"authenticated\"}", "");
+    if (op == "cast.getDisplayName") {
+        std::string data = "{\"displayName\":" + json_string_or_null(server_name) + "}";
+        ws_send_response(c, id, true, data, "");
+        return;
+    }
+
+    if (op == "cast.setDisplayName" || op == "cast.restartRuntime" ||
+        op == "cast.quitRuntime" || op == "cast.restartBackend") {
+        ws_send_response(c, id, false, "{}", "INVALID_STATE");
+        return;
+    }
+
+    if (op == "cast.getRuntimeStatus") {
+        ws_send_response(c, id, true, ws_runtime_status_json(), "");
+        return;
+    }
+
+    if (op == "cast.getBackendStatus") {
+        ws_send_response(c, id, true, ws_backend_status_json(), "");
+        return;
+    }
+
+    if (op == "cast.getSession") {
+        ws_send_response(c, id, true, ws_session_status_json(), "");
+        return;
+    }
+
+    if (op == "cast.getPinCode") {
+        ws_send_response(c, id, true, ws_pin_code_status_json(), "");
+        return;
+    }
+
+    if (op == "cast.getAudio") {
+        ws_send_response(c, id, true, ws_audio_status_json(), "");
+        return;
+    }
+
+    if (op == "cast.getWindowState") {
+        ws_send_response(c, id, true, ws_window_status_json(), "");
+        return;
+    }
+
+    if (op == "cast.showWindow" || op == "cast.hideWindow" ||
+        op == "cast.setFullscreen" || op == "cast.setAlwaysOnTop") {
+        ws_send_response(c, id, false, "{}", "CAST_WINDOW_NOT_AVAILABLE");
+        return;
+    }
+
+    if (op == "cast.showPinCode" || op == "cast.hidePinCode") {
+        ws_send_response(c, id, true, ws_pin_code_status_json(), "");
         return;
     }
 
     if (!raop) {
-        ws_send_response(c, id, op, false, "{}", "INVALID_STATE");
+        ws_send_response(c, id, false, "{}", "INVALID_STATE");
         return;
     }
 
-    if (op == "setPin") {
-        char *pin_raw = mg_json_get_str(body, "$.d.params.pin");
+    if (op == "cast.setPinCode") {
+        char *pin_raw = mg_json_get_str(body, "$.d.params.pinCode");
+        if (!pin_raw) {
+            pin_raw = mg_json_get_str(body, "$.d.params.pin");
+        }
         unsigned short new_pin = 0;
         bool valid = parse_four_digit_pin(pin_raw, &new_pin);
         if (pin_raw) mg_free(pin_raw);
         if (!valid || raop_control_set_pin(raop, new_pin)) {
-            ws_send_response(c, id, op, false, "{}", "INVALID_PARAMS");
+            ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
             return;
         }
-        char data[32];
-        snprintf(data, sizeof(data), "{\"pin\":\"%04u\"}", new_pin);
-        ws_send_response(c, id, op, true, data, "");
+        std::string data = "{\"pin\":\"";
+        char pin_text[5];
+        snprintf(pin_text, sizeof(pin_text), "%04u", new_pin);
+        data.append(pin_text);
+        data.append("\",\"pinCode\":\"");
+        data.append(pin_text);
+        data.append("\",\"status\":");
+        data.append(ws_pin_code_status_json());
+        data.append(",\"trigger\":\"ws-set\"}");
+        ws_send_response(c, id, true, data, "");
         return;
     }
 
-    if (op == "getPin") {
+    if (op == "cast.rotatePinCode") {
         unsigned short current_pin = 0;
         bool use_pin_now = false;
         raop_control_get_pin(raop, &current_pin, &use_pin_now);
-        char data[32];
-        if (use_pin_now) {
-            snprintf(data, sizeof(data), "{\"pin\":\"%04u\"}", current_pin % 10000);
-        } else {
-            strncpy(data, "{\"pin\":null}", sizeof(data));
-            data[sizeof(data) - 1] = '\0';
+        unsigned short new_pin = 0;
+        std::random_device rd;
+        for (int attempt = 0; attempt < 6; attempt++) {
+            new_pin = (unsigned short) (rd() % 10000);
+            if (!use_pin_now || new_pin != current_pin) {
+                break;
+            }
         }
-        ws_send_response(c, id, op, true, data, "");
+        if (raop_control_set_pin(raop, new_pin)) {
+            ws_send_response(c, id, false, "{}", "INVALID_STATE");
+            return;
+        }
+        char pin_text[5];
+        snprintf(pin_text, sizeof(pin_text), "%04u", new_pin);
+        std::string data = "{\"pin\":\"";
+        data.append(pin_text);
+        data.append("\",\"pinCode\":\"");
+        data.append(pin_text);
+        data.append("\",\"status\":");
+        data.append(ws_pin_code_status_json());
+        data.append("}");
+        ws_send_response(c, id, true, data, "");
         return;
     }
 
-    if (op == "setAudio") {
+    if (op == "cast.setAudio") {
         bool enabled = false;
         if (!mg_json_get_bool(body, "$.d.params.enabled", &enabled)) {
-            ws_send_response(c, id, op, false, "{}", "INVALID_PARAMS");
+            ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
             return;
         }
         raop_control_set_mirror_audio(raop, enabled);
-        ws_send_response(c, id, op, true,
-                         raop_control_get_mirror_audio(raop) ?
-                         "{\"mirrorAudio\":true}" : "{\"mirrorAudio\":false}", "");
+        ws_send_response(c, id, true, ws_audio_status_json(), "");
         return;
     }
 
-    if (op == "getAudio") {
-        ws_send_response(c, id, op, true,
-                         raop_control_get_mirror_audio(raop) ?
-                         "{\"mirrorAudio\":true}" : "{\"mirrorAudio\":false}", "");
+    if (op == "cast.setMuted") {
+        bool muted = false;
+        if (!mg_json_get_bool(body, "$.d.params.muted", &muted)) {
+            ws_send_response(c, id, false, "{}", "INVALID_PARAMS");
+            return;
+        }
+        raop_control_set_mirror_audio(raop, !muted);
+        ws_send_response(c, id, true, ws_audio_status_json(), "");
         return;
     }
 
-    if (op == "stop") {
+    if (op == "cast.stopSession") {
         raop_control_stop(raop);
-        ws_send_response(c, id, op, true, "{\"message\":\"casting stopped\"}", "");
+        ws_send_response(c, id, true, "{\"message\":\"casting stopped\"}", "");
         return;
     }
 
-    if (op == "getStatus") {
-        ws_send_response(c, id, op, true, ws_status_json(), "");
-        return;
-    }
-
-    ws_send_response(c, id, op, false, "{}", "INVALID_OP");
+    ws_send_response(c, id, false, "{}", "INVALID_OP");
 }
 
 static void ws_control_event_handler(struct mg_connection *c, int ev, void *ev_data) {
@@ -836,6 +1063,8 @@ static void ws_control_event_handler(struct mg_connection *c, int ev, void *ev_d
     } else if (ev == MG_EV_WS_OPEN) {
         memset(c->data, 0, MG_DATA_SIZE);
         ws_connection_set_authenticated(c, false);
+        ws_connection_set_identified(c, false);
+        ws_send_hello(c);
     } else if (ev == MG_EV_WS_MSG) {
         struct mg_ws_message *wm = (struct mg_ws_message *) ev_data;
         int op = wm->flags & 0x0f;
@@ -846,6 +1075,7 @@ static void ws_control_event_handler(struct mg_connection *c, int ev, void *ev_d
         ws_handle_request(c, wm->data);
     } else if (ev == MG_EV_CLOSE) {
         ws_connection_set_authenticated(c, false);
+        ws_connection_set_identified(c, false);
     }
 }
 
@@ -867,7 +1097,7 @@ static void ws_control_broadcast_queued_events(struct mg_mgr *mgr) {
 
     for (const WsControlEvent &event : events) {
         for (struct mg_connection *c = mgr->conns; c != NULL; c = c->next) {
-            if (c->is_websocket && ws_connection_authenticated(c)) {
+            if (c->is_websocket && ws_connection_authenticated(c) && ws_connection_identified(c)) {
                 ws_send_text(c, ws_advanced_event_json(c, event.op, event.data_json));
             }
         }
@@ -2498,7 +2728,8 @@ extern "C" void handoff_start(void *cls) {
     (void) cls;
     fprintf(stdout, "HANDOFF\tSTART\tnohold\n");
     fflush(stdout);
-    ws_control_queue_event("handoffStarted", "{\"reason\":\"nohold\"}");
+    ws_control_queue_event("cast.backendChanged", "{\"reason\":\"nohold\",\"handoff\":true}");
+    ws_queue_status_changed_event();
 }
 
 extern "C" int video_set_codec(void *cls, video_codec_t codec) {
@@ -2568,7 +2799,8 @@ extern "C" void conn_destroy (void *cls) {
         }    
     }
     if (stopped) {
-        ws_control_queue_event("mirrorStopped", "{}");
+        ws_control_queue_event("cast.sessionStopped", "{\"sessionId\":\"current\",\"reason\":\"connection_closed\"}");
+        ws_queue_status_changed_event();
     }
 }
 
@@ -2600,7 +2832,8 @@ extern "C" void conn_reset (void *cls, int reason) {
 extern "C" void conn_teardown(void *cls, bool *teardown_96, bool *teardown_110) {
     if (*teardown_110) {
         control_state_mirror_stopped();
-        ws_control_queue_event("mirrorStopped", "{\"reason\":\"teardown\"}");
+        ws_control_queue_event("cast.sessionStopped", "{\"sessionId\":\"current\",\"reason\":\"teardown\"}");
+        ws_queue_status_changed_event();
     }
     if (*teardown_110 && close_window) {
         relaunch_video = true;
@@ -2971,14 +3204,15 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
 }
 
 extern "C" void control_pin_changed(void *cls, unsigned short pin) {
-    char data[32];
-    snprintf(data, sizeof(data), "{\"pin\":\"%04u\"}", pin % 10000);
+    char data[64];
+    snprintf(data, sizeof(data), "{\"pinCode\":\"%04u\",\"source\":\"backend\"}", pin % 10000);
 #ifdef _WIN32
     char pin_text[5];
     snprintf(pin_text, sizeof(pin_text), "%04u", pin % 10000);
     native_window_set_pin(pin_text, false);
 #endif
-    ws_control_queue_event("pinChanged", data);
+    ws_control_queue_event("cast.pinCodeChanged", data);
+    ws_queue_status_changed_event();
 }
 
 extern "C" void control_pin_required(void *cls, char *pin) {
@@ -2987,12 +3221,17 @@ extern "C" void control_pin_required(void *cls, char *pin) {
     native_window_set_pin(pin, true);
 #endif
     std::string pin_value = pin ? pin : "";
-    std::string data = "{\"pin\":" + json_string_or_null(pin_value) + "}";
-    ws_control_queue_event("pinRequired", data);
+    std::string data = "{\"pinCode\":" + json_string_or_null(pin_value) +
+                       ",\"reason\":\"airplay_pairing\"}";
+    ws_control_queue_event("cast.pinCodeRequired", data);
+    ws_queue_status_changed_event();
 }
 
 extern "C" void control_audio_changed(void *cls, bool enabled) {
-    ws_control_queue_event("audioChanged", enabled ? "{\"mirrorAudio\":true}" : "{\"mirrorAudio\":false}");
+    ws_control_queue_event("cast.audioChanged",
+                           enabled ? "{\"enabled\":true,\"muted\":false,\"source\":\"backend\"}"
+                                   : "{\"enabled\":false,\"muted\":true,\"source\":\"backend\"}");
+    ws_queue_status_changed_event();
 }
 
 extern "C" void log_callback (void *cls, int level, const char *msg) {

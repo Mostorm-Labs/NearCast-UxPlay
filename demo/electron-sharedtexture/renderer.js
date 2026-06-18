@@ -43,7 +43,7 @@ const fitMode = (query.get('fit') || 'contain').toLowerCase();
 const nativeEnv = typeof process !== 'undefined' && process?.env ? process.env : {};
 const renderDprCap = parsePositiveNumber(
   query.get('dprCap') || nativeEnv.UXPLAY_RENDER_DPR_CAP,
-  1,
+  2,
 );
 const useImageBitmap = parseBoolean(
   query.get('imageBitmap') || nativeEnv.UXPLAY_RENDER_USE_IMAGE_BITMAP,
