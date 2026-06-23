@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <stdarg.h>
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -36,12 +37,17 @@
 #include "dnssd.h"
 #include "global.h"
 #include "compat.h"
+#include "logger.h"
 #include "utils.h"
 
+#ifdef DNSSD_API
+#undef DNSSD_API
+#endif
 #include <dns_sd.h>
 
 #define MAX_DEVICEID 18
 #define MAX_SERVNAME 256
+#define MAX_DNSSD_MODULE_PATH 1024
 
 #if defined(HAVE_LIBDL) && !defined(__APPLE__)
 # define USE_LIBDL 1
@@ -101,6 +107,8 @@ typedef DNSServiceErrorType (DNSSD_STDCALL *DNSServiceRegister_t)
                 void                                *context
         );
 typedef void (DNSSD_STDCALL *DNSServiceRefDeallocate_t)(DNSServiceRef sdRef);
+typedef int (DNSSD_STDCALL *DNSServiceRefSockFD_t)(DNSServiceRef sdRef);
+typedef DNSServiceErrorType (DNSSD_STDCALL *DNSServiceProcessResult_t)(DNSServiceRef sdRef);
 typedef void (DNSSD_STDCALL *TXTRecordCreate_t)
         (
                 TXTRecordRef     *txtRecord,
@@ -128,6 +136,8 @@ struct dnssd_s {
 
     DNSServiceRegister_t       DNSServiceRegister;
     DNSServiceRefDeallocate_t  DNSServiceRefDeallocate;
+    DNSServiceRefSockFD_t      DNSServiceRefSockFD;
+    DNSServiceProcessResult_t  DNSServiceProcessResult;
     TXTRecordCreate_t          TXTRecordCreate;
     TXTRecordSetValue_t        TXTRecordSetValue;
     TXTRecordGetLength_t       TXTRecordGetLength;
@@ -147,15 +157,96 @@ struct dnssd_s {
     int hw_addr_len;
 
     char *pk;
+    char module_path[MAX_DNSSD_MODULE_PATH];
 
     uint32_t features1;
     uint32_t features2;
 
     unsigned char pin_pw;
+    logger_t *logger;
 
     unsigned short raop_port;
     unsigned short airplay_port;
 };
+
+static void dnssd_log(dnssd_t *dnssd, int level, const char *fmt, ...);
+
+static void
+dnssd_process_registration_result(dnssd_t *dnssd, DNSServiceRef service, const char *label)
+{
+    int fd;
+    fd_set readfds;
+    struct timeval tv;
+    int ret;
+    DNSServiceErrorType error;
+
+    if (!dnssd->DNSServiceRefSockFD || !dnssd->DNSServiceProcessResult) {
+        dnssd_log(dnssd, LOGGER_WARNING, "dnssd: %s registration callback pump unavailable", label);
+        return;
+    }
+
+    fd = dnssd->DNSServiceRefSockFD(service);
+    if (fd < 0) {
+        dnssd_log(dnssd, LOGGER_WARNING, "dnssd: %s registration callback socket unavailable", label);
+        return;
+    }
+
+    FD_ZERO(&readfds);
+#ifdef WIN32
+    FD_SET((SOCKET) fd, &readfds);
+#else
+    FD_SET(fd, &readfds);
+#endif
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+
+    ret = select(fd + 1, &readfds, NULL, NULL, &tv);
+    if (ret > 0) {
+        error = dnssd->DNSServiceProcessResult(service);
+        if (error != kDNSServiceErr_NoError) {
+            dnssd_log(dnssd, LOGGER_ERR, "dnssd: %s registration callback processing error %d", label, error);
+        }
+    } else if (ret == 0) {
+        dnssd_log(dnssd, LOGGER_WARNING, "dnssd: %s registration callback pending after 1s", label);
+    } else {
+        dnssd_log(dnssd, LOGGER_ERR, "dnssd: %s registration callback select failed", label);
+    }
+}
+
+static void
+dnssd_log(dnssd_t *dnssd, int level, const char *fmt, ...)
+{
+    char buffer[1024];
+    va_list ap;
+
+    buffer[sizeof(buffer) - 1] = '\0';
+    va_start(ap, fmt);
+    vsnprintf(buffer, sizeof(buffer) - 1, fmt, ap);
+    va_end(ap);
+
+    if (dnssd && dnssd->logger) {
+        logger_log(dnssd->logger, level, "%s", buffer);
+    } else {
+        fprintf(stderr, "%s\n", buffer);
+    }
+}
+
+void
+dnssd_set_logger(dnssd_t *dnssd, logger_t *logger)
+{
+    if (dnssd) {
+        dnssd->logger = logger;
+    }
+}
+
+const char *
+dnssd_get_module_path(dnssd_t *dnssd)
+{
+    if (!dnssd || !dnssd->module_path[0]) {
+        return NULL;
+    }
+    return dnssd->module_path;
+}
 
 
 
@@ -197,14 +288,23 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
     dnssd->features2 = (uint32_t) features;
 
 #ifdef WIN32
-    dnssd->module = LoadLibraryA("dnssd.dll");
+    const char *dnssd_dll_path = getenv("NEARCAST_DNSSD_DLL");
+    if (dnssd_dll_path && dnssd_dll_path[0]) {
+        dnssd->module = LoadLibraryA(dnssd_dll_path);
+    }
+    if (!dnssd->module) {
+        dnssd->module = LoadLibraryA("dnssd.dll");
+    }
 	if (!dnssd->module) {
 		if (error) *error = DNSSD_ERROR_LIBNOTFOUND;
 		free(dnssd);
 		return NULL;
 	}
+    GetModuleFileNameA(dnssd->module, dnssd->module_path, sizeof(dnssd->module_path) - 1);
 	dnssd->DNSServiceRegister = (DNSServiceRegister_t)GetProcAddress(dnssd->module, "DNSServiceRegister");
 	dnssd->DNSServiceRefDeallocate = (DNSServiceRefDeallocate_t)GetProcAddress(dnssd->module, "DNSServiceRefDeallocate");
+	dnssd->DNSServiceRefSockFD = (DNSServiceRefSockFD_t)GetProcAddress(dnssd->module, "DNSServiceRefSockFD");
+	dnssd->DNSServiceProcessResult = (DNSServiceProcessResult_t)GetProcAddress(dnssd->module, "DNSServiceProcessResult");
 	dnssd->TXTRecordCreate = (TXTRecordCreate_t)GetProcAddress(dnssd->module, "TXTRecordCreate");
 	dnssd->TXTRecordSetValue = (TXTRecordSetValue_t)GetProcAddress(dnssd->module, "TXTRecordSetValue");
 	dnssd->TXTRecordGetLength = (TXTRecordGetLength_t)GetProcAddress(dnssd->module, "TXTRecordGetLength");
@@ -228,6 +328,8 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
 	}
 	dnssd->DNSServiceRegister = (DNSServiceRegister_t)dlsym(dnssd->module, "DNSServiceRegister");
 	dnssd->DNSServiceRefDeallocate = (DNSServiceRefDeallocate_t)dlsym(dnssd->module, "DNSServiceRefDeallocate");
+	dnssd->DNSServiceRefSockFD = (DNSServiceRefSockFD_t)dlsym(dnssd->module, "DNSServiceRefSockFD");
+	dnssd->DNSServiceProcessResult = (DNSServiceProcessResult_t)dlsym(dnssd->module, "DNSServiceProcessResult");
 	dnssd->TXTRecordCreate = (TXTRecordCreate_t)dlsym(dnssd->module, "TXTRecordCreate");
 	dnssd->TXTRecordSetValue = (TXTRecordSetValue_t)dlsym(dnssd->module, "TXTRecordSetValue");
 	dnssd->TXTRecordGetLength = (TXTRecordGetLength_t)dlsym(dnssd->module, "TXTRecordGetLength");
@@ -242,14 +344,18 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
 		free(dnssd);
 		return NULL;
 	}
+    snprintf(dnssd->module_path, sizeof(dnssd->module_path), "%s", "libdns_sd.so");
 #else
     dnssd->DNSServiceRegister = &DNSServiceRegister;
     dnssd->DNSServiceRefDeallocate = &DNSServiceRefDeallocate;
+    dnssd->DNSServiceRefSockFD = &DNSServiceRefSockFD;
+    dnssd->DNSServiceProcessResult = &DNSServiceProcessResult;
     dnssd->TXTRecordCreate = &TXTRecordCreate;
     dnssd->TXTRecordSetValue = &TXTRecordSetValue;
     dnssd->TXTRecordGetLength = &TXTRecordGetLength;
     dnssd->TXTRecordGetBytesPtr = &TXTRecordGetBytesPtr;
     dnssd->TXTRecordDeallocate = &TXTRecordDeallocate;
+    snprintf(dnssd->module_path, sizeof(dnssd->module_path), "%s", "linked dns_sd");
 #endif
 
     dnssd->name_len = name_len;
@@ -301,14 +407,14 @@ static void DNSSD_STDCALL raop_register_reply(
 {
     dnssd_t *dnssd = (dnssd_t *) context;
     if (errorCode == kDNSServiceErr_NoError) {
-        fprintf(stderr, "dnssd: RAOP service \"%s\" registered successfully\n", name);
+        dnssd_log(dnssd, LOGGER_INFO, "dnssd: RAOP service \"%s\" registered successfully", name);
     } else if (errorCode == kDNSServiceErr_NameConflict) {
-        fprintf(stderr, "dnssd: RAOP name conflict, re-registering...\n");
+        dnssd_log(dnssd, LOGGER_WARNING, "dnssd: RAOP name conflict, re-registering...");
         dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
         dnssd->raop_service = NULL;
         dnssd_register_raop(dnssd, dnssd->raop_port);
     } else {
-        fprintf(stderr, "dnssd: RAOP registration error %d, re-registering...\n", errorCode);
+        dnssd_log(dnssd, LOGGER_ERR, "dnssd: RAOP registration error %d, re-registering...", errorCode);
         dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
         dnssd->raop_service = NULL;
         dnssd_register_raop(dnssd, dnssd->raop_port);
@@ -326,14 +432,14 @@ static void DNSSD_STDCALL airplay_register_reply(
 {
     dnssd_t *dnssd = (dnssd_t *) context;
     if (errorCode == kDNSServiceErr_NoError) {
-        fprintf(stderr, "dnssd: AirPlay service \"%s\" registered successfully\n", name);
+        dnssd_log(dnssd, LOGGER_INFO, "dnssd: AirPlay service \"%s\" registered successfully", name);
     } else if (errorCode == kDNSServiceErr_NameConflict) {
-        fprintf(stderr, "dnssd: AirPlay name conflict, re-registering...\n");
+        dnssd_log(dnssd, LOGGER_WARNING, "dnssd: AirPlay name conflict, re-registering...");
         dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
         dnssd->airplay_service = NULL;
         dnssd_register_airplay(dnssd, dnssd->airplay_port);
     } else {
-        fprintf(stderr, "dnssd: AirPlay registration error %d, re-registering...\n", errorCode);
+        dnssd_log(dnssd, LOGGER_ERR, "dnssd: AirPlay registration error %d, re-registering...", errorCode);
         dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
         dnssd->airplay_service = NULL;
         dnssd_register_airplay(dnssd, dnssd->airplay_port);
@@ -410,6 +516,9 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
                               dnssd->TXTRecordGetLength(&dnssd->raop_record),
                               dnssd->TXTRecordGetBytesPtr(&dnssd->raop_record),
                               raop_register_reply, dnssd);
+    if (retval == kDNSServiceErr_NoError) {
+        dnssd_process_registration_result(dnssd, dnssd->raop_service, "RAOP");
+    }
 
     return (int) retval;   /* error codes are listed in Apple's dns_sd.h */
 }
@@ -465,6 +574,9 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
                               dnssd->TXTRecordGetLength(&dnssd->airplay_record),
                               dnssd->TXTRecordGetBytesPtr(&dnssd->airplay_record),
                               airplay_register_reply, dnssd);
+    if (retval == kDNSServiceErr_NoError) {
+        dnssd_process_registration_result(dnssd, dnssd->airplay_service, "AirPlay");
+    }
 
     return (int) retval;   /* error codes are listed in Apple's dns_sd.h */
 }

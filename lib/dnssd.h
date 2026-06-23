@@ -34,8 +34,11 @@ extern "C" {
 #define DNSSD_ERROR_BADFEATURES   5
 
 typedef struct dnssd_s dnssd_t;
+typedef struct logger_s logger_t;
 
 DNSSD_API dnssd_t *dnssd_init(const char *name, int name_len, const char *hw_addr, int hw_addr_len, int *error, unsigned char pin_pw);
+DNSSD_API void dnssd_set_logger(dnssd_t *dnssd, logger_t *logger);
+DNSSD_API const char *dnssd_get_module_path(dnssd_t *dnssd);
 
 DNSSD_API int dnssd_register_raop(dnssd_t *dnssd, unsigned short port);
 DNSSD_API int dnssd_register_airplay(dnssd_t *dnssd, unsigned short port);

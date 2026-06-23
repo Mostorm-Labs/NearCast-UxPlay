@@ -163,7 +163,7 @@ static void bind_native_window_to_sink(video_renderer_t *renderer_instance, cons
 
     if (GST_IS_VIDEO_OVERLAY(sink)) {
         gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(sink), (guintptr) video_handle);
-        logger_log(logger, LOGGER_DEBUG, "bound \"%s\" to native video window handle", sink_name);
+        logger_log(logger, LOGGER_INFO, "bound \"%s\" to native video window handle %p", sink_name, (void *) video_handle);
     } else {
         logger_log(logger, LOGGER_WARNING, "video sink \"%s\" does not implement GstVideoOverlay", sink_name);
     }

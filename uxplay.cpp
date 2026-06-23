@@ -2575,6 +2575,7 @@ static int register_dnssd() {
 
     LOGD("register_dnssd: advertised AirPlay service with \"Features\" code = 0x%llX",
          dnssd_get_airplay_features(dnssd));
+    LOGI("DNSSD registration requested: RAOP port=%hu AirPlay port=%hu", raop_port, airplay_port);
     return 0;
 }
 
@@ -2611,6 +2612,10 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
         LOGE("Could not initialize dnssd library!: error %d", dnssd_error);
         return 1;
     }
+    dnssd_set_logger(dnssd, render_logger);
+    const char *dnssd_module_path = dnssd_get_module_path(dnssd);
+    LOGI("DNSSD initialized for AirPlay receiver \"%s\" using %s",
+         name.c_str(), dnssd_module_path ? dnssd_module_path : "unknown dnssd module");
 
     /* after dnssd starts, reset the default feature set here 
      * (overwrites features set in dnssdint.h)
