@@ -3258,6 +3258,7 @@ extern "C" void control_pin_changed(void *cls, unsigned short pin) {
     native_window_set_pin(pin_text, false);
 #endif
     ws_control_queue_event("cast.pinCodeChanged", data);
+    embedded_emit_event("cast.pinCodeChanged", data);
     ws_queue_status_changed_event();
 }
 
@@ -3270,6 +3271,7 @@ extern "C" void control_pin_required(void *cls, char *pin) {
     std::string data = "{\"pinCode\":" + json_string_or_null(pin_value) +
                        ",\"reason\":\"airplay_pairing\"}";
     ws_control_queue_event("cast.pinCodeRequired", data);
+    embedded_emit_event("cast.pinCodeRequired", data.c_str());
     ws_queue_status_changed_event();
 }
 
