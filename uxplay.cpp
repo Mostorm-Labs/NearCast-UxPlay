@@ -94,6 +94,12 @@ static std::string server_name = DEFAULT_NAME;
 static dnssd_t *dnssd = NULL;
 static raop_t *raop = NULL;
 static logger_t *render_logger = NULL;
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+typedef void (*uxplay_embedded_log_callback_t)(void *userdata, int level, const char *message);
+static uxplay_embedded_log_callback_t embedded_log_callback = NULL;
+static void *embedded_log_userdata = NULL;
+static GMainLoop *embedded_main_loop = NULL;
+#endif
 static bool audio_sync = false;
 static bool video_sync = true;
 static int64_t audio_delay_alac = 0;
@@ -276,6 +282,11 @@ static void log(int level, const char* format, ...) {
     buf[sizeof(buf) - 1] = '\0';
     va_end(vargs);
 
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+    if (embedded_log_callback) {
+        embedded_log_callback(embedded_log_userdata, level, buf);
+    }
+#endif
     if (level <= stdout_log_level) {
         /* stdout output */
         if (prefix) printf("%s", prefix);
@@ -1432,6 +1443,9 @@ static void main_loop()  {
     guint gst_bus_watch_id[2] = { 0 };
     g_assert(n_renderers <= 2);
     GMainLoop *loop = g_main_loop_new(NULL,FALSE);
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+    embedded_main_loop = loop;
+#endif
     relaunch_video = false;
     reset_loop = false;
     reset_httpd = false;
@@ -1455,8 +1469,12 @@ static void main_loop()  {
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
     guint video_reset_watch_id = g_timeout_add(100, (GSourceFunc) video_reset_callback, (gpointer) loop);
-    guint sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
-    guint sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
+    guint sigterm_watch_id = 0;
+    guint sigint_watch_id = 0;
+#ifndef UXPLAY_EMBEDDED_RUNTIME
+    sigterm_watch_id = g_unix_signal_add(SIGTERM, (GSourceFunc) sigterm_callback, (gpointer) loop);
+    sigint_watch_id = g_unix_signal_add(SIGINT, (GSourceFunc) sigint_callback, (gpointer) loop);
+#endif
     g_main_loop_run(loop);
 
     for (int i = 0; i < n_renderers; i++) {
@@ -1468,6 +1486,9 @@ static void main_loop()  {
     if (reset_watch_id > 0) g_source_remove(reset_watch_id);
     if (video_reset_watch_id > 0) g_source_remove(video_reset_watch_id);
     if (feedback_watch_id > 0) g_source_remove(feedback_watch_id);
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+    embedded_main_loop = NULL;
+#endif
     g_main_loop_unref(loop);
 }    
 
@@ -3414,20 +3435,41 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
         free (argv);
     }
 }
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+extern "C" void uxplay_embedded_set_log_callback(uxplay_embedded_log_callback_t callback, void *userdata) {
+    embedded_log_callback = callback;
+    embedded_log_userdata = userdata;
+}
+
+extern "C" void uxplay_embedded_request_stop(void) {
+    relaunch_video = false;
+    reset_loop = true;
+    if (embedded_main_loop) {
+        g_main_loop_quit(embedded_main_loop);
+    }
+}
+#endif
+
 #ifdef GST_MACOS
 /* workaround for GStreamer >= 1.22 "Official Builds" on macOS */
 #include <TargetConditionals.h>
 #include <gst/gstmacos.h>
 void real_main (int argc, char *argv[]);
 
+#ifndef UXPLAY_EMBEDDED_RUNTIME
 int main (int argc, char *argv[]) {
     LOGI("*=== Using gst_macos_main wrapper for GStreamer >= 1.22 on macOS ===*");
     return  gst_macos_main ((GstMainFunc) real_main, argc, argv , NULL);
 }
+#endif
 
 void real_main (int argc, char *argv[]) {
 #else
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+extern "C" int uxplay_embedded_main(int argc, char *argv[]) {
+#else
 int main (int argc, char *argv[]) {
+#endif
 #endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";
@@ -3446,6 +3488,7 @@ int main (int argc, char *argv[]) {
 #endif
 
     char *rcfile = NULL;
+#ifndef UXPLAY_EMBEDDED_RUNTIME
     /* see if option -rc was given */
     for (int i = 1; i < argc ; i++) {
         std::string arg(argv[i]);
@@ -3471,6 +3514,7 @@ int main (int argc, char *argv[]) {
     if (config_file.length()) {
         read_config_file(config_file.c_str(), argv[0]);
     }
+#endif
     parse_arguments (argc, argv);
 
     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
@@ -3821,4 +3865,7 @@ int main (int argc, char *argv[]) {
         control_state_mutex_initialized = false;
         MUTEX_DESTROY(control_state_mutex);
     }
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+    return 0;
+#endif
 }
