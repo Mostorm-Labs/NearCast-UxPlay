@@ -97,8 +97,11 @@ static raop_t *raop = NULL;
 static logger_t *render_logger = NULL;
 #ifdef UXPLAY_EMBEDDED_RUNTIME
 typedef void (*uxplay_embedded_log_callback_t)(void *userdata, int level, const char *message);
+typedef void (*uxplay_embedded_event_callback_t)(void *userdata, const char *event_name, const char *payload_json);
 static uxplay_embedded_log_callback_t embedded_log_callback = NULL;
 static void *embedded_log_userdata = NULL;
+static uxplay_embedded_event_callback_t embedded_event_callback = NULL;
+static void *embedded_event_userdata = NULL;
 static GMainLoop *embedded_main_loop = NULL;
 #endif
 static bool audio_sync = false;
@@ -304,6 +307,17 @@ static void log(int level, const char* format, ...) {
     }
 }
 
+static void embedded_emit_event(const char *event_name, const char *payload_json) {
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+    if (embedded_event_callback) {
+        embedded_event_callback(embedded_event_userdata, event_name, payload_json);
+    }
+#else
+    (void) event_name;
+    (void) payload_json;
+#endif
+}
+
 #define LOGD(...) log(LOGGER_DEBUG, __VA_ARGS__)
 #define LOGI(...) log(LOGGER_INFO, __VA_ARGS__)
 #define LOGW(...) log(LOGGER_WARNING, __VA_ARGS__)
@@ -435,6 +449,7 @@ static void control_state_note_client(const char *name, const char *model, const
                            ",\"deviceId\":" + json_string_or_null(event_device_id) +
                            ",\"ip\":null},\"protocol\":\"airplay\"}";
         ws_control_queue_event("cast.sessionStarted", data);
+        embedded_emit_event("cast.sessionStarted", data.c_str());
         ws_queue_status_changed_event();
     }
 }
@@ -2826,7 +2841,9 @@ extern "C" void conn_destroy (void *cls) {
         }    
     }
     if (stopped) {
-        ws_control_queue_event("cast.sessionStopped", "{\"sessionId\":\"current\",\"reason\":\"connection_closed\"}");
+        const char *payload = "{\"sessionId\":\"current\",\"reason\":\"connection_closed\"}";
+        ws_control_queue_event("cast.sessionStopped", payload);
+        embedded_emit_event("cast.sessionStopped", payload);
         ws_queue_status_changed_event();
     }
 }
@@ -2859,7 +2876,9 @@ extern "C" void conn_reset (void *cls, int reason) {
 extern "C" void conn_teardown(void *cls, bool *teardown_96, bool *teardown_110) {
     if (*teardown_110) {
         control_state_mirror_stopped();
-        ws_control_queue_event("cast.sessionStopped", "{\"sessionId\":\"current\",\"reason\":\"teardown\"}");
+        const char *payload = "{\"sessionId\":\"current\",\"reason\":\"teardown\"}";
+        ws_control_queue_event("cast.sessionStopped", payload);
+        embedded_emit_event("cast.sessionStopped", payload);
         ws_queue_status_changed_event();
     }
     if (*teardown_110 && close_window) {
@@ -3447,11 +3466,22 @@ extern "C" void uxplay_embedded_set_log_callback(uxplay_embedded_log_callback_t 
     embedded_log_userdata = userdata;
 }
 
+extern "C" void uxplay_embedded_set_event_callback(uxplay_embedded_event_callback_t callback, void *userdata) {
+    embedded_event_callback = callback;
+    embedded_event_userdata = userdata;
+}
+
 extern "C" void uxplay_embedded_request_stop(void) {
     relaunch_video = false;
     reset_loop = true;
     if (embedded_main_loop) {
         g_main_loop_quit(embedded_main_loop);
+    }
+}
+
+extern "C" void uxplay_embedded_stop_current_session(void) {
+    if (raop) {
+        raop_control_stop(raop);
     }
 }
 #endif
