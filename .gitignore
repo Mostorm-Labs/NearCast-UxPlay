@@ -1,3 +1,6 @@
 build/
 dist/
 /demo/electron-sharedtexture/native/build/gst_texture_bridge.exe
+/build-ucrt64
+/.trae
+/.claude
