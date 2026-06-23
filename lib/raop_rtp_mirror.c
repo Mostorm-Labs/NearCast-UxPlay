@@ -42,6 +42,9 @@
 
 #ifdef _WIN32
 #define CAST (char *)
+#ifndef SOL_TCP
+#define SOL_TCP IPPROTO_TCP
+#endif
 /* are these keepalive settings for WIN32 correct? */
 /* (taken from https://github.com/wegank/ludimus)  */
 #define TCP_KEEPALIVE 3

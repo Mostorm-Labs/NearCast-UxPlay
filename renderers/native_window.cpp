@@ -11,6 +11,8 @@
 #endif
 #include <windows.h>
 #include <windowsx.h>
+#include <objbase.h>
+#include <unknwn.h>
 #include <WebView2.h>
 
 #include <atomic>

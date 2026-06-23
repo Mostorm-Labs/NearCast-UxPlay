@@ -40,6 +40,7 @@
 
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
+#include <io.h>
 #include <unordered_map>
 #include <winsock2.h>
 #include <iphlpapi.h>
