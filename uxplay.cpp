@@ -217,6 +217,7 @@ static std::deque<WsControlEvent> ws_control_event_queue;
 static mutex_handle_t control_state_mutex;
 static bool control_state_mutex_initialized = false;
 static bool control_mirror_started_announced = false;
+static bool control_pin_prompt_announced = false;
 static std::string control_client_name = "";
 static std::string control_client_model = "";
 static std::string control_client_device_id = "";
@@ -492,6 +493,16 @@ static void control_state_note_client(const char *name, const char *model, const
     }
 }
 
+static void control_state_note_pin_prompt() {
+    if (control_state_mutex_initialized) {
+        MUTEX_LOCK(control_state_mutex);
+    }
+    control_pin_prompt_announced = true;
+    if (control_state_mutex_initialized) {
+        MUTEX_UNLOCK(control_state_mutex);
+    }
+}
+
 static bool control_state_connection_opened() {
     bool first_connection = false;
     if (control_state_mutex_initialized) {
@@ -516,8 +527,9 @@ static bool control_state_connection_closed() {
     }
     if (open_connections == 0) {
         all_connections_closed = true;
-        stopped = control_mirror_started_announced;
+        stopped = control_mirror_started_announced || control_pin_prompt_announced;
         control_mirror_started_announced = false;
+        control_pin_prompt_announced = false;
         control_client_name.clear();
         control_client_model.clear();
         control_client_device_id.clear();
@@ -538,6 +550,7 @@ static bool control_state_mirror_stopped() {
     }
     stopped = control_mirror_started_announced;
     control_mirror_started_announced = false;
+    control_pin_prompt_announced = false;
     if (open_connections == 0) {
         control_client_name.clear();
         control_client_model.clear();
@@ -3320,6 +3333,7 @@ extern "C" void control_pin_required(void *cls, char *pin) {
 #ifdef _WIN32
     native_window_set_pin(pin, true);
 #endif
+    control_state_note_pin_prompt();
     std::string pin_value = pin ? pin : "";
     std::string data = "{\"pinCode\":" + json_string_or_null(pin_value) +
                        ",\"reason\":\"airplay_pairing\"}";

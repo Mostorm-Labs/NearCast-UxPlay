@@ -62,6 +62,8 @@ struct httpd_s {
     int joined;
     thread_handle_t thread;
     mutex_handle_t run_mutex;
+    httpd_deferred_callback_t deferred_callback;
+    void *deferred_opaque;
 
     /* Server fds for accepting connections */
     int server_fd4;
@@ -335,6 +337,16 @@ httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type) {
     }
 }
 
+void
+httpd_request_deferred_callback(httpd_t *httpd, httpd_deferred_callback_t callback, void *opaque) {
+    assert(httpd);
+
+    MUTEX_LOCK(httpd->run_mutex);
+    httpd->deferred_callback = callback;
+    httpd->deferred_opaque = opaque;
+    MUTEX_UNLOCK(httpd->run_mutex);
+}
+
 static THREAD_RETVAL
 httpd_thread(void *arg)
 {
@@ -347,6 +359,8 @@ httpd_thread(void *arg)
     assert(httpd);
 
     while (1) {
+        httpd_deferred_callback_t deferred_callback = NULL;
+        void *deferred_opaque = NULL;
         fd_set rfds;
         struct timeval tv;
         int nfds=0;
@@ -358,7 +372,18 @@ httpd_thread(void *arg)
             MUTEX_UNLOCK(httpd->run_mutex);
             break;
         }
+        if (httpd->deferred_callback) {
+            deferred_callback = httpd->deferred_callback;
+            deferred_opaque = httpd->deferred_opaque;
+            httpd->deferred_callback = NULL;
+            httpd->deferred_opaque = NULL;
+        }
         MUTEX_UNLOCK(httpd->run_mutex);
+
+        if (deferred_callback) {
+            deferred_callback(deferred_opaque);
+            continue;
+        }
 
         /* Set timeout value to 5ms */
         tv.tv_sec = 1;

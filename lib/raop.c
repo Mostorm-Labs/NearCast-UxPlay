@@ -893,9 +893,13 @@ raop_control_set_mirror_audio(raop_t *raop, bool enabled) {
     return 0;
 }
 
-void
-raop_control_stop(raop_t *raop) {
-    assert(raop);
+static void
+raop_control_stop_on_httpd_thread(void *opaque) {
+    raop_t *raop = opaque;
+    if (!raop || !raop->httpd) {
+        return;
+    }
+
     logger_log(raop->logger, LOGGER_INFO, "control requested stop casting");
     if (raop->callbacks.on_video_stop) {
         raop->callbacks.on_video_stop(raop->callbacks.cls);
@@ -904,6 +908,17 @@ raop_control_stop(raop_t *raop) {
         raop->callbacks.video_reset(raop->callbacks.cls);
     }
     httpd_remove_known_connections(raop->httpd);
+}
+
+void
+raop_control_stop(raop_t *raop) {
+    assert(raop);
+    if (raop->httpd && httpd_is_running(raop->httpd)) {
+        logger_log(raop->logger, LOGGER_INFO, "control queued stop casting on httpd thread");
+        httpd_request_deferred_callback(raop->httpd, raop_control_stop_on_httpd_thread, raop);
+        return;
+    }
+    raop_control_stop_on_httpd_thread(raop);
 }
 
 void

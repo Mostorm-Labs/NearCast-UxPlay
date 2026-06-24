@@ -38,10 +38,13 @@ struct httpd_callbacks_s {
     void  (*conn_destroy)(void *ptr);
 };
 typedef struct httpd_callbacks_s httpd_callbacks_t;
+typedef void (*httpd_deferred_callback_t)(void *opaque);
+
 bool httpd_nohold(httpd_t *httpd);
 void httpd_remove_known_connections(httpd_t *httpd);
 void httpd_remove_known_connections_except(httpd_t *httpd, void *user_data);
 void httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type);
+void httpd_request_deferred_callback(httpd_t *httpd, httpd_deferred_callback_t callback, void *opaque);
 
 int httpd_set_connection_type (httpd_t *http, void *user_data, connection_type_t type);
 int httpd_count_connection_type (httpd_t *http, connection_type_t type);
