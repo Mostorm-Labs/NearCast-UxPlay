@@ -1371,6 +1371,40 @@ void NotifyReady(bool failed) {
     g_state.ready_cv.notify_all();
 }
 
+void JoinWindowThread(std::thread thread_to_join) {
+    if (thread_to_join.joinable()) {
+        thread_to_join.join();
+    }
+}
+
+void JoinFinishedWindowThreadBeforeCreate(std::unique_lock<std::mutex> &lock) {
+    if (!g_state.window_thread.joinable() || g_state.running) {
+        return;
+    }
+    std::thread thread_to_join = std::move(g_state.window_thread);
+    lock.unlock();
+    JoinWindowThread(std::move(thread_to_join));
+    lock.lock();
+}
+
+void StopWindowThread(HWND hwnd) {
+    std::thread thread_to_join;
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        if (g_state.window_thread.joinable()) {
+            if (g_state.window_thread.get_id() == std::this_thread::get_id()) {
+                g_state.window_thread.detach();
+            } else {
+                thread_to_join = std::move(g_state.window_thread);
+            }
+        }
+    }
+    if (hwnd) {
+        PostMessageW(hwnd, kNativeWindowDestroyMessage, 0, 0);
+    }
+    JoinWindowThread(std::move(thread_to_join));
+}
+
 void WindowThread() {
     EnableProcessDpiAwareness();
 
@@ -1475,8 +1509,13 @@ extern "C" bool native_window_should_embed(const char *videosink, const char *vi
 
 extern "C" bool native_window_create(logger_t *logger, const char *title, bool fullscreen) {
     std::unique_lock<std::mutex> lock(g_state.mutex);
+    JoinFinishedWindowThreadBeforeCreate(lock);
     if (g_state.running && g_state.video_hwnd) {
         return true;
+    }
+    if (g_state.running) {
+        Log(LOGGER_WARNING, "native Windows video window creation is already in progress");
+        return false;
     }
 
     g_state.logger = logger;
@@ -1530,10 +1569,10 @@ extern "C" void native_window_set_muted(bool muted) {
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         hwnd = g_state.main_hwnd;
-    }
-    if (!hwnd) {
-        g_state.muted = muted;
-        return;
+        if (!hwnd) {
+            g_state.muted = muted;
+            return;
+        }
     }
     PostMessageW(hwnd, kNativeWindowMutedMessage, muted ? 1 : 0, 0);
 }
@@ -1575,13 +1614,7 @@ extern "C" void native_window_destroy(void) {
         std::lock_guard<std::mutex> lock(g_state.mutex);
         hwnd = g_state.main_hwnd;
     }
-    if (hwnd) {
-        PostMessageW(hwnd, kNativeWindowDestroyMessage, 0, 0);
-    }
-    if (g_state.window_thread.joinable() &&
-        g_state.window_thread.get_id() != std::this_thread::get_id()) {
-        g_state.window_thread.join();
-    }
+    StopWindowThread(hwnd);
 }
 
 #else

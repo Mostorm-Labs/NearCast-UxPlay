@@ -232,6 +232,19 @@ static bool mirror_audio_is_enabled() {
     return enabled;
 }
 
+static bool mirror_audio_set_requested_if_changed(bool enabled) {
+    if (!audio_control_mutex_initialized) {
+        bool changed = (use_audio != enabled);
+        use_audio = enabled;
+        return changed;
+    }
+    MUTEX_LOCK(audio_control_mutex);
+    bool changed = (use_audio != enabled);
+    use_audio = enabled;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return changed;
+}
+
 static void mirror_audio_set_requested(bool enabled) {
     if (!audio_control_mutex_initialized) {
         use_audio = enabled;
@@ -418,11 +431,14 @@ static void publish_mirror_audio_state(bool enabled) {
 }
 
 static void reset_mirror_audio_to_default_mute(const char *reason) {
-    if (!default_mirror_audio_muted || !raop) {
+    if (!default_mirror_audio_muted) {
         return;
     }
-    LOGI("mirror audio reset to muted for AirPlay session boundary: %s", reason ? reason : "unknown");
-    raop_control_set_mirror_audio(raop, false);
+    bool changed = mirror_audio_set_requested_if_changed(false);
+    LOGI("mirror audio reset to muted for AirPlay session boundary: %s%s",
+         reason ? reason : "unknown",
+         changed ? "" : " (already muted)");
+    publish_mirror_audio_state(false);
 }
 
 static void control_state_get_snapshot(unsigned int *connections, bool *mirroring,
