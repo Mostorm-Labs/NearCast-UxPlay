@@ -119,6 +119,7 @@ static unsigned char compression_type = 0;
 static std::string audiosink = "autoaudiosink";
 static int  audiodelay = -1;
 static bool use_audio = true;
+static bool default_mirror_audio_muted = false;
 static bool audio_renderer_initialized = false;
 static bool audio_renderer_running = false;
 static mutex_handle_t audio_control_mutex;
@@ -404,6 +405,26 @@ static void ws_control_queue_event(const std::string &op, const std::string &dat
 
 static void ws_queue_status_changed_event();
 
+static void publish_mirror_audio_state(bool enabled) {
+#ifdef _WIN32
+    native_window_set_muted(!enabled);
+#endif
+    const char *payload = enabled
+        ? "{\"enabled\":true,\"muted\":false,\"source\":\"backend\"}"
+        : "{\"enabled\":false,\"muted\":true,\"source\":\"backend\"}";
+    ws_control_queue_event("cast.audioChanged", payload);
+    embedded_emit_event("cast.audioChanged", payload);
+    ws_queue_status_changed_event();
+}
+
+static void reset_mirror_audio_to_default_mute(const char *reason) {
+    if (!default_mirror_audio_muted || !raop) {
+        return;
+    }
+    LOGI("mirror audio reset to muted for AirPlay session boundary: %s", reason ? reason : "unknown");
+    raop_control_set_mirror_audio(raop, false);
+}
+
 static void control_state_get_snapshot(unsigned int *connections, bool *mirroring,
                                        std::string *client, std::string *model,
                                        std::string *device_id) {
@@ -444,6 +465,7 @@ static void control_state_note_client(const char *name, const char *model, const
     }
 
     if (should_announce) {
+        reset_mirror_audio_to_default_mute("session-started");
         std::string data = "{\"sessionId\":\"current\",\"source\":{\"device\":" + json_string_or_null(event_client) +
                            ",\"model\":" + json_string_or_null(event_model) +
                            ",\"deviceId\":" + json_string_or_null(event_device_id) +
@@ -454,18 +476,22 @@ static void control_state_note_client(const char *name, const char *model, const
     }
 }
 
-static void control_state_connection_opened() {
+static bool control_state_connection_opened() {
+    bool first_connection = false;
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
     open_connections++;
+    first_connection = (open_connections == 1);
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
+    return first_connection;
 }
 
 static bool control_state_connection_closed() {
     bool stopped = false;
+    bool all_connections_closed = false;
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
@@ -473,6 +499,7 @@ static bool control_state_connection_closed() {
         open_connections--;
     }
     if (open_connections == 0) {
+        all_connections_closed = true;
         stopped = control_mirror_started_announced;
         control_mirror_started_announced = false;
         control_client_name.clear();
@@ -481,6 +508,9 @@ static bool control_state_connection_closed() {
     }
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
+    }
+    if (all_connections_closed) {
+        reset_mirror_audio_to_default_mute("all-connections-closed");
     }
     return stopped;
 }
@@ -1722,6 +1752,7 @@ static void print_info (char *name) {
     printf("          some choices:pulsesink,alsasink,pipewiresink,jackaudiosink,\n");
     printf("          osssink,oss4sink,osxaudiosink,wasapisink,directsoundsink.\n");
     printf("-as 0     (or -a)  Turn audio off, streamed video only\n");
+    printf("-amute    Start each AirPlay mirroring session with mirror audio muted\n");
     printf("-al x     Audio latency in seconds (default 0.25) reported to client.\n");
     printf("-ca <fn>  In Airplay Audio (ALAC) mode, write cover-art to file <fn>\n");
     printf("-md <fn>  In Airplay Audio (ALAC) mode, write metadata text to file <fn>\n");
@@ -2059,6 +2090,8 @@ static void parse_arguments (int argc, char *argv[]) {
             }
         } else if (arg == "-a") {
             use_audio = false;
+        } else if (arg == "-amute") {
+            default_mirror_audio_muted = true;
         } else if (arg == "-logfile") {
             if (i < argc - 1 && argv[i+1][0] != '-') {
                 log_filename = argv[++i];
@@ -2816,7 +2849,10 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
 }
 
 extern "C" void conn_init (void *cls) {
-    control_state_connection_opened();
+    const bool first_connection = control_state_connection_opened();
+    if (first_connection) {
+        reset_mirror_audio_to_default_mute("first-connection-opened");
+    }
     unsigned int connections = 0;
     control_state_get_snapshot(&connections, NULL, NULL, NULL, NULL);
     LOGD("Open connections: %i", connections);
@@ -2903,6 +2939,7 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
         LOGI("*** attempt to connect by blocked client (clientID %s): DENIED\n", deviceid);
     }
     if (*admit) {
+        reset_mirror_audio_to_default_mute("client-admitted");
         control_state_note_client(name, model, deviceid);
     }
 }
@@ -3276,10 +3313,7 @@ extern "C" void control_pin_required(void *cls, char *pin) {
 }
 
 extern "C" void control_audio_changed(void *cls, bool enabled) {
-    ws_control_queue_event("cast.audioChanged",
-                           enabled ? "{\"enabled\":true,\"muted\":false,\"source\":\"backend\"}"
-                                   : "{\"enabled\":false,\"muted\":true,\"source\":\"backend\"}");
-    ws_queue_status_changed_event();
+    publish_mirror_audio_state(enabled);
 }
 
 extern "C" void log_callback (void *cls, int level, const char *msg) {
@@ -3749,6 +3783,11 @@ int main (int argc, char *argv[]) {
     if (mirror_audio_is_enabled()) {
       audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);
       audio_renderer_initialized = true;
+      if (default_mirror_audio_muted) {
+          mirror_audio_set_requested(false);
+          publish_mirror_audio_state(false);
+          LOGI("mirror audio starts muted by default");
+      }
     } else {
         audio_renderer_initialized = false;
         LOGI("audio_disabled");

@@ -44,6 +44,7 @@ const UINT_PTR kPinAutoHideTimer = 1;
 const UINT kPinAutoHideMs = 6000;
 const UINT kNativeWindowDestroyMessage = WM_APP + 64;
 const UINT kNativeWindowPinMessage = WM_APP + 65;
+const UINT kNativeWindowMutedMessage = WM_APP + 66;
 const UINT kDefaultDpi = 96;
 
 #ifndef WM_DPICHANGED
@@ -76,6 +77,7 @@ struct NativeWindowState {
     bool pin_webview_ready = false;
     bool web_message_token_valid = false;
     bool pin_visible = false;
+    bool muted = false;
     UINT dpi = kDefaultDpi;
     RECT restore_rect = {};
     LONG_PTR restore_style = 0;
@@ -338,6 +340,23 @@ void PostFullscreenStateToWebView() {
     g_state.webview->PostWebMessageAsJson(g_state.fullscreen ?
                                           L"{\"type\":\"fullscreen\",\"enabled\":true}" :
                                           L"{\"type\":\"fullscreen\",\"enabled\":false}");
+}
+
+void PostMutedStateToWebView() {
+    if (!g_state.webview) {
+        return;
+    }
+    g_state.webview->PostWebMessageAsJson(g_state.muted ?
+                                          L"{\"type\":\"muted\",\"enabled\":true}" :
+                                          L"{\"type\":\"muted\",\"enabled\":false}");
+}
+
+void ApplyMutedState(bool muted) {
+    g_state.muted = muted;
+    PostMutedStateToWebView();
+    if (g_state.overlay_hwnd) {
+        InvalidateRect(g_state.overlay_hwnd, nullptr, TRUE);
+    }
 }
 
 bool IsFourDigitPin(const std::wstring &pin) {
@@ -901,6 +920,7 @@ public:
 
         g_state.webview_ready = true;
         PostFullscreenStateToWebView();
+        PostMutedStateToWebView();
         InvalidateRect(g_state.overlay_hwnd, nullptr, TRUE);
         Log(LOGGER_INFO, "created WebView2 HTML/CSS overlay controls");
         return S_OK;
@@ -1270,6 +1290,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         }
         return 0;
     }
+    case kNativeWindowMutedMessage:
+        ApplyMutedState(wparam != 0);
+        return 0;
     case WM_KEYDOWN:
         if (wparam == VK_F11 || (wparam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000))) {
             ToggleFullscreen();
@@ -1502,6 +1525,19 @@ extern "C" void native_window_show(void) {
     }
 }
 
+extern "C" void native_window_set_muted(bool muted) {
+    HWND hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        hwnd = g_state.main_hwnd;
+    }
+    if (!hwnd) {
+        g_state.muted = muted;
+        return;
+    }
+    PostMessageW(hwnd, kNativeWindowMutedMessage, muted ? 1 : 0, 0);
+}
+
 extern "C" void native_window_set_pin(const char *pin, bool show) {
     HWND hwnd = nullptr;
     {
@@ -1576,6 +1612,10 @@ extern "C" uintptr_t native_window_get_video_handle(void) {
 }
 
 extern "C" void native_window_show(void) {
+}
+
+extern "C" void native_window_set_muted(bool muted) {
+    (void) muted;
 }
 
 extern "C" void native_window_set_pin(const char *pin, bool show) {
