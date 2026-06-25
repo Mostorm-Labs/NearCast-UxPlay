@@ -477,6 +477,21 @@ void ToggleFullscreen() {
     SetFullscreen(!g_state.fullscreen);
 }
 
+void RaiseWindowOnce(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+    BringWindowToTop(hwnd);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetForegroundWindow(hwnd);
+}
+
 void DispatchAction(const char *action) {
     native_window_action_callback_t callback = nullptr;
     void *userdata = nullptr;
@@ -1560,7 +1575,7 @@ extern "C" void native_window_show(void) {
     }
     if (hwnd) {
         ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        RaiseWindowOnce(hwnd);
     }
 }
 
