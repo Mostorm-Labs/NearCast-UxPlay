@@ -221,6 +221,8 @@ static bool control_pin_prompt_announced = false;
 static std::string control_client_name = "";
 static std::string control_client_model = "";
 static std::string control_client_device_id = "";
+static void ws_control_queue_event(const std::string &op, const std::string &data_json);
+static void ws_queue_status_changed_event();
 
 static bool mirror_audio_is_enabled() {
     if (!audio_control_mutex_initialized) {
@@ -333,6 +335,14 @@ static void embedded_emit_event(const char *event_name, const char *payload_json
 #endif
 }
 
+static void embedded_emit_session_teardown_complete(const char *reason) {
+    const std::string payload = std::string("{\"sessionId\":\"current\",\"reason\":\"") +
+        (reason ? reason : "teardown-complete") + "\"}";
+    ws_control_queue_event("cast.sessionTeardownComplete", payload.c_str());
+    embedded_emit_event("cast.sessionTeardownComplete", payload.c_str());
+    ws_queue_status_changed_event();
+}
+
 #define LOGD(...) log(LOGGER_DEBUG, __VA_ARGS__)
 #define LOGI(...) log(LOGGER_INFO, __VA_ARGS__)
 #define LOGW(...) log(LOGGER_WARNING, __VA_ARGS__)
@@ -416,8 +426,6 @@ static void ws_control_queue_event(const std::string &op, const std::string &dat
     }
     MUTEX_UNLOCK(ws_control_mutex);
 }
-
-static void ws_queue_status_changed_event();
 
 static void publish_mirror_audio_state(bool enabled) {
 #ifdef _WIN32
@@ -3911,7 +3919,6 @@ int main (int argc, char *argv[]) {
             if (!preserve_connections && connections == 0) {
                 raop_destroy_airplay_video(raop);
                 url.erase();
-                raop_remove_known_connections(raop);
             }
 	    const char *uri = (url.empty() ? NULL : url.c_str());
             video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
@@ -3925,6 +3932,7 @@ int main (int argc, char *argv[]) {
             raop_start_httpd(raop, &port);
             raop_set_port(raop, port);
         }
+        embedded_emit_session_teardown_complete("renderer-relaunched");
         goto reconnect;
     } else {
         LOGI("Stopping RAOP Server...");
