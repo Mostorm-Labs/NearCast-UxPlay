@@ -2811,29 +2811,53 @@ static int parse_dmap_header(const unsigned char *metadata, char *tag, int *len)
     return 0;
 }
 
+static const char *dns_sd_error_name(int error) {
+    switch (error) {
+    case -65537:
+        return "kDNSServiceErr_Unknown";
+    case -65548:
+        return "kDNSServiceErr_NameConflict";
+    case -65550:
+        return "kDNSServiceErr_Firewall";
+    case -65551:
+        return "kDNSServiceErr_Incompatible";
+    case -65562:
+        return "kDNSServiceErr_Transient";
+    case -65563:
+        return "kDNSServiceErr_ServiceNotRunning";
+    case -65568:
+        return "kDNSServiceErr_Timeout";
+    default:
+        return "unknown DNS-SD error";
+    }
+}
+
+static void log_dnssd_register_failure(const char *service, int error) {
+    LOGE("%s DNS-SD registration failed: %s (%d)", service, dns_sd_error_name(error), error);
+    if (error == -65563) {
+        LOGE("Bonjour/mDNSResponder service is not running or unavailable; AirPlay will not be discoverable until that service is installed and running.");
+    } else if (error == -65537) {
+        LOGE("No DNS-SD Server found (DNSServiceRegister call returned kDNSServiceErr_Unknown)");
+    } else if (error == -65548) {
+        LOGE("DNSServiceRegister call returned kDNSServiceErr_NameConflict");
+        LOGI("Is another instance of %s running with the same DeviceID (MAC address) or using same network ports?",
+             DEFAULT_NAME);
+        LOGI("Use options -m ... and -p ... to allow multiple instances of %s to run concurrently", DEFAULT_NAME);
+    } else {
+        LOGE("mDNS Error codes are in range FFFE FF00 (-65792) to FFFE FFFF (-65537) (see Apple's dns_sd.h)");
+    }
+}
+
 static int register_dnssd() {
     int dnssd_error;
     uint64_t features;
     
     if ((dnssd_error = dnssd_register_raop(dnssd, raop_port))) {
-        if (dnssd_error == -65537) {
-             LOGE("No DNS-SD Server found (DNSServiceRegister call returned kDNSServiceErr_Unknown)");
-        } else if (dnssd_error == -65548) {
-            LOGE("DNSServiceRegister call returned kDNSServiceErr_NameConflict");
-            LOGI("Is another instance of %s running with the same DeviceID (MAC address) or using same network ports?",
-                 DEFAULT_NAME);
-            LOGI("Use options -m ... and -p ... to allow multiple instances of %s to run concurrently", DEFAULT_NAME); 
-        } else {
-             LOGE("dnssd_register_raop failed with error code %d\n"
-                  "mDNS Error codes are in range FFFE FF00 (-65792) to FFFE FFFF (-65537) "
-                  "(see Apple's dns_sd.h)", dnssd_error);
-        }
+        log_dnssd_register_failure("RAOP", dnssd_error);
         return -3;
     }
     if ((dnssd_error = dnssd_register_airplay(dnssd, airplay_port))) {
-        LOGE("dnssd_register_airplay failed with error code %d\n"
-             "mDNS Error codes are in range FFFE FF00 (-65792) to FFFE FFFF (-65537) "
-             "(see Apple's dns_sd.h)", dnssd_error);
+        log_dnssd_register_failure("AirPlay", dnssd_error);
         return -4;
     }
 
