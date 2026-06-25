@@ -122,6 +122,10 @@ static bool use_audio = true;
 static bool default_mirror_audio_muted = false;
 static bool audio_renderer_initialized = false;
 static bool audio_renderer_running = false;
+static bool audio_renderer_stop_pending = false;
+static thread_handle_t audio_renderer_stop_thread;
+static bool audio_renderer_stop_thread_started = false;
+static bool audio_renderer_stop_thread_finished = false;
 static mutex_handle_t audio_control_mutex;
 static bool audio_control_mutex_initialized = false;
 #if __APPLE__
@@ -223,6 +227,7 @@ static std::string control_client_model = "";
 static std::string control_client_device_id = "";
 static void ws_control_queue_event(const std::string &op, const std::string &data_json);
 static void ws_queue_status_changed_event();
+static void log(int level, const char* format, ...);
 
 static bool mirror_audio_is_enabled() {
     if (!audio_control_mutex_initialized) {
@@ -277,6 +282,167 @@ static void audio_renderer_set_running(bool running) {
     MUTEX_LOCK(audio_control_mutex);
     audio_renderer_running = running;
     MUTEX_UNLOCK(audio_control_mutex);
+}
+
+static bool audio_renderer_stop_is_pending() {
+    if (!audio_control_mutex_initialized) {
+        return audio_renderer_stop_pending;
+    }
+    bool pending;
+    MUTEX_LOCK(audio_control_mutex);
+    pending = audio_renderer_stop_pending;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return pending;
+}
+
+static void audio_renderer_request_async_stop(const char *reason) {
+    if (!audio_renderer_initialized) {
+        return;
+    }
+
+    bool queued = false;
+    if (!audio_control_mutex_initialized) {
+        queued = audio_renderer_running || audio_renderer_stop_pending;
+        if (queued) {
+            audio_renderer_running = false;
+            audio_renderer_stop_pending = true;
+        }
+    } else {
+        MUTEX_LOCK(audio_control_mutex);
+        queued = audio_renderer_running || audio_renderer_stop_pending;
+        if (queued) {
+            audio_renderer_running = false;
+            audio_renderer_stop_pending = true;
+        }
+        MUTEX_UNLOCK(audio_control_mutex);
+    }
+
+    if (queued) {
+        log(LOGGER_INFO, "audio renderer async stop queued: %s", reason ? reason : "unknown");
+    }
+}
+
+static bool audio_renderer_stop_thread_is_started() {
+    if (!audio_control_mutex_initialized) {
+        return audio_renderer_stop_thread_started;
+    }
+    bool started;
+    MUTEX_LOCK(audio_control_mutex);
+    started = audio_renderer_stop_thread_started;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return started;
+}
+
+static bool audio_renderer_stop_thread_is_finished() {
+    if (!audio_control_mutex_initialized) {
+        return audio_renderer_stop_thread_finished;
+    }
+    bool finished;
+    MUTEX_LOCK(audio_control_mutex);
+    finished = audio_renderer_stop_thread_finished;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return finished;
+}
+
+static void audio_renderer_clear_stop_thread_state() {
+    if (!audio_control_mutex_initialized) {
+        audio_renderer_stop_thread_started = false;
+        audio_renderer_stop_thread_finished = false;
+        return;
+    }
+    MUTEX_LOCK(audio_control_mutex);
+    audio_renderer_stop_thread_started = false;
+    audio_renderer_stop_thread_finished = false;
+    MUTEX_UNLOCK(audio_control_mutex);
+}
+
+static THREAD_RETVAL audio_renderer_stop_thread_main(void *arg) {
+    (void) arg;
+    log(LOGGER_DEBUG, "audio renderer async stop begin");
+    audio_renderer_stop();
+    if (!audio_control_mutex_initialized) {
+        audio_renderer_running = false;
+        audio_renderer_stop_pending = false;
+        audio_renderer_stop_thread_finished = true;
+    } else {
+        MUTEX_LOCK(audio_control_mutex);
+        audio_renderer_running = false;
+        audio_renderer_stop_pending = false;
+        audio_renderer_stop_thread_finished = true;
+        MUTEX_UNLOCK(audio_control_mutex);
+    }
+    log(LOGGER_DEBUG, "audio renderer async stop complete");
+    return 0;
+}
+
+static void audio_renderer_start_stop_worker(const char *reason) {
+    if (!audio_renderer_initialized || audio_renderer_stop_thread_is_started()) {
+        return;
+    }
+    audio_renderer_request_async_stop(reason);
+    if (!audio_renderer_stop_is_pending()) {
+        return;
+    }
+    if (!audio_control_mutex_initialized) {
+        audio_renderer_stop_thread_started = true;
+        audio_renderer_stop_thread_finished = false;
+    } else {
+        MUTEX_LOCK(audio_control_mutex);
+        audio_renderer_stop_thread_started = true;
+        audio_renderer_stop_thread_finished = false;
+        MUTEX_UNLOCK(audio_control_mutex);
+    }
+    THREAD_CREATE(audio_renderer_stop_thread, audio_renderer_stop_thread_main, NULL);
+    if (!audio_renderer_stop_thread) {
+        audio_renderer_clear_stop_thread_state();
+        log(LOGGER_WARNING, "audio renderer async stop worker could not start; stopping inline");
+        audio_renderer_stop();
+        if (!audio_control_mutex_initialized) {
+            audio_renderer_running = false;
+            audio_renderer_stop_pending = false;
+        } else {
+            MUTEX_LOCK(audio_control_mutex);
+            audio_renderer_running = false;
+            audio_renderer_stop_pending = false;
+            MUTEX_UNLOCK(audio_control_mutex);
+        }
+    }
+}
+
+static void audio_renderer_join_stop_worker_if_started() {
+    if (!audio_renderer_stop_thread_is_started()) {
+        return;
+    }
+    THREAD_JOIN(audio_renderer_stop_thread);
+    audio_renderer_clear_stop_thread_state();
+}
+
+static void audio_renderer_stop_now(const char *reason) {
+    if (!audio_renderer_initialized) {
+        return;
+    }
+    audio_renderer_join_stop_worker_if_started();
+    if (!audio_control_mutex_initialized) {
+        audio_renderer_running = false;
+        audio_renderer_stop_pending = true;
+    } else {
+        MUTEX_LOCK(audio_control_mutex);
+        audio_renderer_running = false;
+        audio_renderer_stop_pending = true;
+        MUTEX_UNLOCK(audio_control_mutex);
+    }
+    log(LOGGER_DEBUG, "audio renderer stop begin: %s", reason ? reason : "unknown");
+    audio_renderer_stop();
+    if (!audio_control_mutex_initialized) {
+        audio_renderer_running = false;
+        audio_renderer_stop_pending = false;
+    } else {
+        MUTEX_LOCK(audio_control_mutex);
+        audio_renderer_running = false;
+        audio_renderer_stop_pending = false;
+        MUTEX_UNLOCK(audio_control_mutex);
+    }
+    log(LOGGER_DEBUG, "audio renderer stop complete: %s", reason ? reason : "unknown");
 }
 /* logging */
 
@@ -1479,6 +1645,17 @@ static gboolean reset_callback(gpointer loop) {
     return TRUE;
 }
 
+static gboolean audio_stop_callback(gpointer loop) {
+    (void) loop;
+    if (audio_renderer_stop_thread_is_finished()) {
+        audio_renderer_join_stop_worker_if_started();
+    }
+    if (audio_renderer_stop_is_pending()) {
+        audio_renderer_start_stop_worker("async-session-boundary");
+    }
+    return TRUE;
+}
+
 static gboolean x11_window_callback(gpointer loop) {
     /* called while trying to find an x11 window used by playbin (HLS mode) */
     if (waiting_for_x11_window()) {
@@ -1551,6 +1728,7 @@ static void main_loop()  {
     missed_feedback = 0;
     guint feedback_watch_id = g_timeout_add_seconds(1, (GSourceFunc) feedback_callback, (gpointer) loop);
     guint reset_watch_id = g_timeout_add(100, (GSourceFunc) reset_callback, (gpointer) loop);
+    guint audio_stop_watch_id = g_timeout_add(50, (GSourceFunc) audio_stop_callback, (gpointer) loop);
     guint video_reset_watch_id = g_timeout_add(100, (GSourceFunc) video_reset_callback, (gpointer) loop);
     guint sigterm_watch_id = 0;
     guint sigint_watch_id = 0;
@@ -1567,6 +1745,7 @@ static void main_loop()  {
     if (sigint_watch_id > 0) g_source_remove(sigint_watch_id);
     if (sigterm_watch_id > 0) g_source_remove(sigterm_watch_id);
     if (reset_watch_id > 0) g_source_remove(reset_watch_id);
+    if (audio_stop_watch_id > 0) g_source_remove(audio_stop_watch_id);
     if (video_reset_watch_id > 0) g_source_remove(video_reset_watch_id);
     if (feedback_watch_id > 0) g_source_remove(feedback_watch_id);
 #ifdef UXPLAY_EMBEDDED_RUNTIME
@@ -2906,8 +3085,7 @@ extern "C" void conn_destroy (void *cls) {
         remote_clock_offset = 0;
         compression_type = 0;
         if (audio_renderer_initialized) {
-            audio_renderer_stop();
-            audio_renderer_set_running(false);
+            audio_renderer_request_async_stop("last-connection-closed");
         }
         if (dacpfile.length()) {
             remove (dacpfile.c_str());
@@ -2986,10 +3164,9 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         dump_audio_to_file(data->data, data->data_len, (data->data)[0] & 0xf0);
     }
     if (!mirror_audio_is_enabled()) {
-        if (audio_renderer_initialized && audio_renderer_is_running()) {
-            audio_renderer_stop();
-            audio_renderer_set_running(false);
-        }
+        return;
+    }
+    if (audio_renderer_stop_is_pending()) {
         return;
     }
     if (audio_renderer_initialized && !audio_renderer_is_running() && data->ct) {
@@ -3088,9 +3265,9 @@ extern "C" void mirror_audio_set_enabled(void *cls, bool enabled) {
     /*
      * This callback runs in the single httpd thread, which also receives the
      * client's once-per-second /feedback requests.  Avoid GStreamer state
-     * changes here; they can occasionally block long enough for the feedback
-     * watchdog to reset an otherwise healthy session.  The RTP audio thread
-     * lazily starts the renderer when audio is enabled again.
+     * changes here; they can block long enough for senders to hide this
+     * receiver. Muted sessions simply drop incoming audio frames; the pipeline
+     * is released asynchronously when the AirPlay connection closes.
      */
     LOGI("HTTP control mirror audio %s", (enabled ? "enabled" : "disabled"));
 }
@@ -3660,6 +3837,10 @@ int main (int argc, char *argv[]) {
 
     MUTEX_CREATE(audio_control_mutex);
     audio_control_mutex_initialized = true;
+    audio_renderer_running = false;
+    audio_renderer_stop_pending = false;
+    audio_renderer_stop_thread_started = false;
+    audio_renderer_stop_thread_finished = false;
     MUTEX_CREATE(control_state_mutex);
     control_state_mutex_initialized = true;
     MUTEX_CREATE(ws_control_mutex);
@@ -3909,8 +4090,7 @@ int main (int argc, char *argv[]) {
             raop_stop_httpd(raop);
         }
         if (audio_renderer_initialized) {
-            audio_renderer_stop();
-            audio_renderer_set_running(false);
+            audio_renderer_stop_now("renderer-relaunch");
         }
         if (use_video && (close_window || preserve_connections)) {
             video_renderer_destroy();
@@ -3943,6 +4123,7 @@ int main (int argc, char *argv[]) {
     cleanup:
     stop_ws_control_server();
     if (audio_renderer_initialized) {
+        audio_renderer_stop_now("runtime-cleanup");
         audio_renderer_destroy();
         audio_renderer_set_running(false);
     }
