@@ -641,6 +641,9 @@ raop_handler_setup(raop_conn_t *conn,
 	    if (len && !conn->authenticated) {
  	        if (len == -1) {
                     password = (const char *) conn->raop->random_pw;
+                    if (conn->raop->random_pw && !conn->pin_required_announced) {
+                        raop_report_pin_required(conn, conn->raop->random_pw);
+                    }
                 }
                 char nonce_string[33] = { '\0' };
                 //bool stale = false;  //not implemented
