@@ -37,6 +37,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include <random>
+#include <atomic>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
@@ -175,6 +176,7 @@ static bool nofreeze = false;
 static unsigned short raop_port;
 static unsigned short airplay_port;
 static uint64_t remote_clock_offset = 0;
+static std::atomic_bool media_handoff_in_progress{false};
 static std::vector<std::string> allowed_clients;
 static std::vector<std::string> blocked_clients;
 static bool restrict_clients;
@@ -443,6 +445,29 @@ static void audio_renderer_stop_now(const char *reason) {
         MUTEX_UNLOCK(audio_control_mutex);
     }
     log(LOGGER_DEBUG, "audio renderer stop complete: %s", reason ? reason : "unknown");
+}
+
+static void begin_media_handoff_boundary(const char *reason) {
+    media_handoff_in_progress.store(true, std::memory_order_release);
+    remote_clock_offset = 0;
+    compression_type = 0;
+    if (audio_renderer_initialized) {
+        audio_renderer_stop_now(reason ? reason : "handoff-boundary");
+    }
+    log(LOGGER_INFO, "media handoff boundary started: %s", reason ? reason : "unknown");
+}
+
+static void end_media_handoff_boundary(const char *reason) {
+    remote_clock_offset = 0;
+    compression_type = 0;
+    const bool was_active = media_handoff_in_progress.exchange(false, std::memory_order_acq_rel);
+    if (was_active) {
+        log(LOGGER_INFO, "media handoff boundary ended: %s", reason ? reason : "unknown");
+    }
+}
+
+static bool media_handoff_blocks_legacy_packets() {
+    return media_handoff_in_progress.load(std::memory_order_acquire);
 }
 /* logging */
 
@@ -3041,6 +3066,7 @@ extern "C" void video_reset(void *cls) {
 
 extern "C" void handoff_start(void *cls) {
     (void) cls;
+    begin_media_handoff_boundary("nohold");
     fprintf(stdout, "HANDOFF\tSTART\tnohold\n");
     fflush(stdout);
     ws_control_queue_event("cast.backendChanged", "{\"reason\":\"nohold\",\"handoff\":true}");
@@ -3106,6 +3132,7 @@ extern "C" void conn_destroy (void *cls) {
     control_state_get_snapshot(&connections, NULL, NULL, NULL, NULL);
     LOGD("Open connections: %i", connections);
     if (connections == 0) {
+        end_media_handoff_boundary("all-connections-closed");
         remote_clock_offset = 0;
         compression_type = 0;
         if (audio_renderer_initialized) {
@@ -3178,14 +3205,20 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
         LOGI("*** attempt to connect by blocked client (clientID %s): DENIED\n", deviceid);
     }
     if (*admit) {
+        end_media_handoff_boundary("client-admitted");
         reset_mirror_audio_to_default_mute("client-admitted");
         control_state_note_client(name, model, deviceid);
+    } else {
+        end_media_handoff_boundary("client-denied");
     }
 }
 
 extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
     if (dump_audio) {
         dump_audio_to_file(data->data, data->data_len, (data->data)[0] & 0xf0);
+    }
+    if (media_handoff_blocks_legacy_packets()) {
+        return;
     }
     if (!mirror_audio_is_enabled()) {
         return;
@@ -3224,6 +3257,9 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
     if (dump_video) {
         dump_video_to_file(data->data, data->data_len);
+    }
+    if (media_handoff_blocks_legacy_packets()) {
+        return;
     }
     if (use_video) {
         if (!remote_clock_offset) {
