@@ -41,10 +41,13 @@ const int kPinWindowWidth = 260;
 const int kPinWindowHeight = 70;
 const int kPinWindowTop = 24;
 const UINT_PTR kPinAutoHideTimer = 1;
+const UINT_PTR kClearRaiseTopmostTimer = 2;
 const UINT kPinAutoHideMs = 6000;
+const UINT kRaiseTopmostHoldMs = 350;
 const UINT kNativeWindowDestroyMessage = WM_APP + 64;
 const UINT kNativeWindowPinMessage = WM_APP + 65;
 const UINT kNativeWindowMutedMessage = WM_APP + 66;
+const UINT kNativeWindowRaiseOnceMessage = WM_APP + 67;
 const UINT kDefaultDpi = 96;
 
 #ifndef WM_DPICHANGED
@@ -487,9 +490,17 @@ void RaiseWindowOnce(HWND hwnd) {
     BringWindowToTop(hwnd);
     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     SetForegroundWindow(hwnd);
+    SetTimer(hwnd, kClearRaiseTopmostTimer, kRaiseTopmostHoldMs, nullptr);
+}
+
+void ClearRaiseTopmost(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+    KillTimer(hwnd, kClearRaiseTopmostTimer);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
 }
 
 void DispatchAction(const char *action) {
@@ -1308,6 +1319,15 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     case kNativeWindowMutedMessage:
         ApplyMutedState(wparam != 0);
         return 0;
+    case kNativeWindowRaiseOnceMessage:
+        RaiseWindowOnce(hwnd);
+        return 0;
+    case WM_TIMER:
+        if (wparam == kClearRaiseTopmostTimer) {
+            ClearRaiseTopmost(hwnd);
+            return 0;
+        }
+        break;
     case WM_KEYDOWN:
         if (wparam == VK_F11 || (wparam == VK_RETURN && (GetKeyState(VK_MENU) & 0x8000))) {
             ToggleFullscreen();
@@ -1315,6 +1335,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         }
         break;
     case WM_DESTROY:
+        KillTimer(hwnd, kClearRaiseTopmostTimer);
         if (g_state.pin_hwnd) {
             DestroyWindow(g_state.pin_hwnd);
             g_state.pin_hwnd = nullptr;
@@ -1579,6 +1600,17 @@ extern "C" void native_window_show(void) {
     }
 }
 
+extern "C" void native_window_raise_once(void) {
+    HWND hwnd = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_state.mutex);
+        hwnd = g_state.main_hwnd;
+    }
+    if (hwnd) {
+        PostMessageW(hwnd, kNativeWindowRaiseOnceMessage, 0, 0);
+    }
+}
+
 extern "C" void native_window_set_muted(bool muted) {
     HWND hwnd = nullptr;
     {
@@ -1648,6 +1680,9 @@ extern "C" bool native_window_create(logger_t *logger, const char *title, bool f
     (void) title;
     (void) fullscreen;
     return false;
+}
+
+extern "C" void native_window_raise_once(void) {
 }
 
 extern "C" void native_window_set_action_callback(native_window_action_callback_t callback, void *userdata) {

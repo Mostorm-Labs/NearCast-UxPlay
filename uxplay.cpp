@@ -3795,6 +3795,10 @@ extern "C" void uxplay_embedded_stop_current_session(void) {
         raop_control_stop(raop);
     }
 }
+
+extern "C" void uxplay_embedded_raise_window_once(void) {
+    native_window_raise_once();
+}
 #endif
 
 #ifdef GST_MACOS
