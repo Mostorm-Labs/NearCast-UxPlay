@@ -231,6 +231,25 @@ static void ws_control_queue_event(const std::string &op, const std::string &dat
 static void ws_queue_status_changed_event();
 static void log(int level, const char* format, ...);
 
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+static void reset_embedded_runtime_audio_defaults() {
+    audio_sync = false;
+    audio_delay_alac = 0;
+    audio_delay_aac = 0;
+    audiosink = "autoaudiosink";
+    audiodelay = -1;
+    use_audio = true;
+    default_mirror_audio_muted = false;
+    audio_renderer_initialized = false;
+    audio_renderer_running = false;
+    audio_renderer_stop_pending = false;
+    audio_renderer_stop_thread_started = false;
+    audio_renderer_stop_thread_finished = false;
+    dump_audio = false;
+    previous_audio_type = 0x00;
+}
+#endif
+
 static bool mirror_audio_is_enabled() {
     if (!audio_control_mutex_initialized) {
         return use_audio;
@@ -3866,6 +3885,9 @@ int main (int argc, char *argv[]) {
         read_config_file(config_file.c_str(), argv[0]);
     }
 #endif
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+    reset_embedded_runtime_audio_defaults();
+#endif
     parse_arguments (argc, argv);
 
     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
@@ -4190,6 +4212,7 @@ int main (int argc, char *argv[]) {
         audio_renderer_stop_now("runtime-cleanup");
         audio_renderer_destroy();
         audio_renderer_set_running(false);
+        audio_renderer_initialized = false;
     }
     if (use_video)  {
         video_renderer_destroy();
