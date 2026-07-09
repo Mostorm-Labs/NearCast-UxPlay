@@ -610,24 +610,25 @@ raop_handler_setup(raop_conn_t *conn,
             int len;
             const char *password = conn->raop->callbacks.passwd(conn->raop->callbacks.cls, &len);
             // len = -1 means use a random password for this connection
+            bool rotate_pin = false;
             if (len == -1 && conn->raop->random_pw && conn->raop->auth_fail_count >= 5) {
                 // change random_pw after 5 failed authentication attempts
                 logger_log(conn->raop->logger, LOGGER_INFO, "Too many authentication failures: generate new random password");
                 free(conn->raop->random_pw);
                 conn->raop->random_pw = NULL;
+                rotate_pin = true;
             }
             if (len == -1 && !conn->raop->random_pw) {
                 int pin_4;
-                if (conn->raop->use_pin && conn->raop->pin > 0) {
+                if (conn->raop->use_pin && conn->raop->pin > 0 && !rotate_pin) {
                     pin_4 = conn->raop->pin % 10000;
                 } else {
                     // get and store 4 random digits
-                    pin_4  = random_pin();
-                    if (pin_4 < 0) {
+                    if (raop_rotate_pin(conn->raop, "auth-retry")) {
                         logger_log(conn->raop->logger, LOGGER_ERR, "Failed to generate random pin");
                         pin_4 = 1234;
                     } else {
-                        conn->raop->pin = (unsigned short) (pin_4 % 10000);
+                        pin_4 = conn->raop->pin % 10000;
                     }
                 }
 		size_t len = 4;

@@ -215,6 +215,7 @@ static bool ws_control_thread_started = false;
 static bool ws_control_running = false;
 static mutex_handle_t ws_control_mutex;
 static bool ws_control_mutex_initialized = false;
+static bool auto_rotate_pin_enabled = false;
 struct WsControlEvent {
     std::string op;
     std::string data_json;
@@ -676,7 +677,7 @@ static void control_state_get_snapshot(unsigned int *connections, bool *mirrorin
     }
 }
 
-static void control_state_note_client(const char *name, const char *model, const char *device_id) {
+static bool control_state_note_client(const char *name, const char *model, const char *device_id) {
     bool should_announce = false;
     std::string event_client;
     std::string event_model;
@@ -707,8 +708,12 @@ static void control_state_note_client(const char *name, const char *model, const
                            ",\"ip\":null},\"protocol\":\"airplay\"}";
         ws_control_queue_event("cast.sessionStarted", data);
         embedded_emit_event("cast.sessionStarted", data.c_str());
+        if (auto_rotate_pin_enabled && raop) {
+            raop_rotate_pin(raop, "session-started");
+        }
         ws_queue_status_changed_event();
     }
+    return should_announce;
 }
 
 static void control_state_note_pin_prompt() {
@@ -1291,21 +1296,13 @@ static void ws_handle_request(struct mg_connection *c, struct mg_str body) {
     }
 
     if (op == "cast.rotatePinCode") {
-        unsigned short current_pin = 0;
-        bool use_pin_now = false;
-        raop_control_get_pin(raop, &current_pin, &use_pin_now);
-        unsigned short new_pin = 0;
-        std::random_device rd;
-        for (int attempt = 0; attempt < 6; attempt++) {
-            new_pin = (unsigned short) (rd() % 10000);
-            if (!use_pin_now || new_pin != current_pin) {
-                break;
-            }
-        }
-        if (raop_control_set_pin(raop, new_pin)) {
+        if (raop_control_rotate_pin(raop)) {
             ws_send_response(c, id, false, "{}", "INVALID_STATE");
             return;
         }
+        unsigned short new_pin = 0;
+        bool use_pin_now = false;
+        raop_control_get_pin(raop, &new_pin, &use_pin_now);
         char pin_text[5];
         snprintf(pin_text, sizeof(pin_text), "%04u", new_pin);
         std::string data = "{\"pin\":\"";
@@ -3226,7 +3223,10 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
     if (*admit) {
         end_media_handoff_boundary("client-admitted");
         reset_mirror_audio_to_default_mute("client-admitted");
-        control_state_note_client(name, model, deviceid);
+        const bool announced_session_started = control_state_note_client(name, model, deviceid);
+        if (auto_rotate_pin_enabled && raop && !announced_session_started) {
+            raop_rotate_pin(raop, "client-admitted");
+        }
     } else {
         end_media_handoff_boundary("client-denied");
     }
@@ -3579,9 +3579,13 @@ extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *play
     }
 }
 
-extern "C" void control_pin_changed(void *cls, unsigned short pin) {
-    char data[64];
-    snprintf(data, sizeof(data), "{\"pinCode\":\"%04u\",\"source\":\"backend\"}", pin % 10000);
+extern "C" void control_pin_changed(void *cls, unsigned short pin, const char *source, const char *reason) {
+    char data[160];
+    snprintf(data, sizeof(data),
+             "{\"pinCode\":\"%04u\",\"source\":\"%s\",\"reason\":\"%s\"}",
+             pin % 10000,
+             source ? source : "backend",
+             reason ? reason : "unknown");
 #ifdef _WIN32
     char pin_text[5];
     snprintf(pin_text, sizeof(pin_text), "%04u", pin % 10000);
@@ -3681,7 +3685,12 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
 
     if (show_client_FPS_data) raop_set_plist(raop, "clientFPSdata", 1);
     if (audiodelay >= 0) raop_set_plist(raop, "audio_delay_micros", audiodelay);
-    if (pin_pw == 1) raop_set_plist(raop, "pin", (int) pin);
+    auto_rotate_pin_enabled = (pin_pw == 3);
+    if (pin_pw == 1) {
+        raop_set_plist(raop, "pin", (int) pin);
+    } else if (auto_rotate_pin_enabled) {
+        raop_rotate_pin(raop, "startup");
+    }
     if (hls_support) raop_set_plist(raop, "hls", 1);
 
     /* network port selection (ports listed as "0" will be dynamically assigned) */

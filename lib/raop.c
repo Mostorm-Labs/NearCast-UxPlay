@@ -847,8 +847,8 @@ raop_control_get_pin(raop_t *raop, unsigned short *pin_out, bool *use_pin_out) {
     return 0;
 }
 
-int
-raop_control_set_pin(raop_t *raop, unsigned short pin) {
+static int
+raop_set_pin_internal(raop_t *raop, unsigned short pin, const char *source, const char *reason) {
     assert(raop);
     if (pin > 9999) {
         return -1;
@@ -861,11 +861,54 @@ raop_control_set_pin(raop_t *raop, unsigned short pin) {
     if (raop->callbacks.display_pin) {
         raop->callbacks.display_pin(raop->callbacks.cls, pin_str);
     }
-    logger_log(raop->logger, LOGGER_INFO, "control updated pin to %s", pin_str);
+    logger_log(raop->logger, LOGGER_INFO, "%s updated pin reason=%s pin=%s",
+               source ? source : "control",
+               reason ? reason : "unknown",
+               pin_str);
     if (raop->callbacks.control_pin_changed) {
-        raop->callbacks.control_pin_changed(raop->callbacks.cls, pin);
+        raop->callbacks.control_pin_changed(raop->callbacks.cls,
+                                            pin,
+                                            source ? source : "control",
+                                            reason ? reason : "unknown");
     }
     return 0;
+}
+
+int
+raop_control_set_pin(raop_t *raop, unsigned short pin) {
+    return raop_set_pin_internal(raop, pin, "control", "set-pin");
+}
+
+int
+raop_control_rotate_pin(raop_t *raop) {
+    assert(raop);
+    int pin_4 = random_pin();
+    if (pin_4 < 0) {
+        logger_log(raop->logger, LOGGER_WARNING, "control pin rotation failed");
+        return -1;
+    }
+    return raop_set_pin_internal(raop, (unsigned short) (pin_4 % 10000), "control", "rotate-pin");
+}
+
+int
+raop_rotate_pin(raop_t *raop, const char *reason) {
+    assert(raop);
+    int pin_4 = random_pin();
+    if (pin_4 < 0) {
+        logger_log(raop->logger, LOGGER_WARNING, "automatic pin rotation failed for reason=%s", reason ? reason : "unknown");
+        return -1;
+    }
+
+    if (raop->random_pw) {
+        free(raop->random_pw);
+        raop->random_pw = NULL;
+    }
+    raop->auth_fail_count = 0;
+
+    return raop_set_pin_internal(raop,
+                                 (unsigned short) (pin_4 % 10000),
+                                 "auto-rotate",
+                                 reason ? reason : "unknown");
 }
 
 bool
