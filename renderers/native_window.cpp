@@ -436,6 +436,47 @@ void ApplyPinState(bool visible, const std::wstring &pin) {
     }
 }
 
+bool GetMonitorRectForWindow(HWND hwnd, RECT *rect) {
+    if (!hwnd || !rect) {
+        return false;
+    }
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info = {};
+    monitor_info.cbSize = sizeof(monitor_info);
+    if (!GetMonitorInfo(monitor, &monitor_info)) {
+        return false;
+    }
+    *rect = monitor_info.rcMonitor;
+    return true;
+}
+
+void ApplyFullscreenRaiseOnce(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+    KillTimer(hwnd, kClearRaiseTopmostTimer);
+
+    RECT monitor_rect = {};
+    if (!GetMonitorRectForWindow(hwnd, &monitor_rect)) {
+        ShowWindow(hwnd, SW_SHOW);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(hwnd);
+        SetTimer(hwnd, kClearRaiseTopmostTimer, kRaiseTopmostHoldMs, nullptr);
+        return;
+    }
+
+    BringWindowToTop(hwnd);
+    SetWindowPos(hwnd, HWND_TOPMOST,
+                 monitor_rect.left, monitor_rect.top,
+                 monitor_rect.right - monitor_rect.left,
+                 monitor_rect.bottom - monitor_rect.top,
+                 SWP_NOOWNERZORDER | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    SetForegroundWindow(hwnd);
+    SetTimer(hwnd, kClearRaiseTopmostTimer, kRaiseTopmostHoldMs, nullptr);
+    ResizeChildren(hwnd);
+}
+
 void SetFullscreen(bool enabled) {
     if (!g_state.main_hwnd || g_state.fullscreen == enabled) {
         return;
@@ -446,29 +487,20 @@ void SetFullscreen(bool enabled) {
         g_state.restore_ex_style = GetWindowLongPtr(g_state.main_hwnd, GWL_EXSTYLE);
         GetWindowRect(g_state.main_hwnd, &g_state.restore_rect);
 
-        HMONITOR monitor = MonitorFromWindow(g_state.main_hwnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO monitor_info = {};
-        monitor_info.cbSize = sizeof(monitor_info);
-        GetMonitorInfo(monitor, &monitor_info);
-
         SetWindowLongPtr(g_state.main_hwnd, GWL_STYLE,
                          g_state.restore_style & ~(WS_CAPTION | WS_THICKFRAME));
         SetWindowLongPtr(g_state.main_hwnd, GWL_EXSTYLE,
                          g_state.restore_ex_style & ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE |
                                                       WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
-        SetWindowPos(g_state.main_hwnd, HWND_TOP,
-                     monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
-                     monitor_info.rcMonitor.right - monitor_info.rcMonitor.left,
-                     monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top,
-                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        ApplyFullscreenRaiseOnce(g_state.main_hwnd);
     } else {
         SetWindowLongPtr(g_state.main_hwnd, GWL_STYLE, g_state.restore_style);
         SetWindowLongPtr(g_state.main_hwnd, GWL_EXSTYLE, g_state.restore_ex_style);
-        SetWindowPos(g_state.main_hwnd, nullptr,
+        SetWindowPos(g_state.main_hwnd, HWND_NOTOPMOST,
                      g_state.restore_rect.left, g_state.restore_rect.top,
                      g_state.restore_rect.right - g_state.restore_rect.left,
                      g_state.restore_rect.bottom - g_state.restore_rect.top,
-                     SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_FRAMECHANGED);
+                     SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
 
     g_state.fullscreen = enabled;
@@ -482,6 +514,10 @@ void ToggleFullscreen() {
 
 void RaiseWindowOnce(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+    if (g_state.fullscreen) {
+        ApplyFullscreenRaiseOnce(hwnd);
         return;
     }
     if (IsIconic(hwnd)) {
@@ -1595,8 +1631,12 @@ extern "C" void native_window_show(void) {
         hwnd = g_state.main_hwnd;
     }
     if (hwnd) {
-        ShowWindow(hwnd, SW_SHOW);
-        RaiseWindowOnce(hwnd);
+        if (g_state.fullscreen) {
+            ApplyFullscreenRaiseOnce(hwnd);
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+            RaiseWindowOnce(hwnd);
+        }
     }
 }
 
