@@ -104,6 +104,7 @@ static void *embedded_log_userdata = NULL;
 static uxplay_embedded_event_callback_t embedded_event_callback = NULL;
 static void *embedded_event_userdata = NULL;
 static GMainLoop *embedded_main_loop = NULL;
+static std::atomic_bool embedded_refresh_airplay_dnssd_requested{false};
 #endif
 static bool audio_sync = false;
 static bool video_sync = true;
@@ -700,6 +701,9 @@ static bool control_state_note_client(const char *name, const char *model, const
         MUTEX_UNLOCK(control_state_mutex);
     }
 
+#ifdef _WIN32
+    native_window_set_pin(NULL, false);
+#endif
     if (should_announce) {
         reset_mirror_audio_to_default_mute("session-started");
         std::string data = "{\"sessionId\":\"current\",\"source\":{\"device\":" + json_string_or_null(event_client) +
@@ -2916,6 +2920,23 @@ static void unregister_dnssd() {
     return;
 }
 
+static int refresh_airplay_dnssd() {
+    if (!dnssd) {
+        LOGE("Cannot refresh AirPlay DNS-SD registration: DNSSD is not initialized");
+        return -1;
+    }
+
+    LOGI("Refreshing AirPlay DNS-SD registration after embedded session stop");
+    dnssd_unregister_airplay(dnssd);
+    const int error = dnssd_register_airplay(dnssd, airplay_port);
+    if (error) {
+        log_dnssd_register_failure("AirPlay refresh", error);
+        return error;
+    }
+    LOGI("AirPlay DNS-SD registration refresh completed on port %hu", airplay_port);
+    return 0;
+}
+
 static void stop_dnssd() {
     if (dnssd) {
         unregister_dnssd();
@@ -3820,6 +3841,7 @@ extern "C" void uxplay_embedded_request_stop(void) {
 
 extern "C" void uxplay_embedded_stop_current_session(void) {
     if (raop) {
+        embedded_refresh_airplay_dnssd_requested.store(true);
         raop_control_stop(raop);
     }
 }
@@ -3849,6 +3871,9 @@ extern "C" int uxplay_embedded_main(int argc, char *argv[]) {
 #else
 int main (int argc, char *argv[]) {
 #endif
+#endif
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+    embedded_refresh_airplay_dnssd_requested.store(false);
 #endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";
@@ -4207,6 +4232,11 @@ int main (int argc, char *argv[]) {
             raop_start_httpd(raop, &port);
             raop_set_port(raop, port);
         }
+#ifdef UXPLAY_EMBEDDED_RUNTIME
+        if (embedded_refresh_airplay_dnssd_requested.exchange(false)) {
+            (void) refresh_airplay_dnssd();
+        }
+#endif
         embedded_emit_session_teardown_complete("renderer-relaunched");
         goto reconnect;
     } else {

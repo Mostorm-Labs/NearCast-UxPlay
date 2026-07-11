@@ -858,9 +858,6 @@ raop_set_pin_internal(raop_t *raop, unsigned short pin, const char *source, cons
 
     char pin_str[6];
     snprintf(pin_str, sizeof(pin_str), "%04u", pin);
-    if (raop->callbacks.display_pin) {
-        raop->callbacks.display_pin(raop->callbacks.cls, pin_str);
-    }
     logger_log(raop->logger, LOGGER_INFO, "%s updated pin reason=%s pin=%s",
                source ? source : "control",
                reason ? reason : "unknown",

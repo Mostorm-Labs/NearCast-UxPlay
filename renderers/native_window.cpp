@@ -450,6 +450,23 @@ bool GetMonitorRectForWindow(HWND hwnd, RECT *rect) {
     return true;
 }
 
+void ApplyFullscreenLayoutWithoutShowing(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return;
+    }
+
+    RECT monitor_rect = {};
+    if (!GetMonitorRectForWindow(hwnd, &monitor_rect)) {
+        return;
+    }
+
+    SetWindowPos(hwnd, nullptr,
+                 monitor_rect.left, monitor_rect.top,
+                 monitor_rect.right - monitor_rect.left,
+                 monitor_rect.bottom - monitor_rect.top,
+                 SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 void ApplyFullscreenRaiseOnce(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) {
         return;
@@ -483,6 +500,7 @@ void SetFullscreen(bool enabled) {
     }
 
     if (enabled) {
+        const bool was_visible = IsWindowVisible(g_state.main_hwnd) != FALSE;
         g_state.restore_style = GetWindowLongPtr(g_state.main_hwnd, GWL_STYLE);
         g_state.restore_ex_style = GetWindowLongPtr(g_state.main_hwnd, GWL_EXSTYLE);
         GetWindowRect(g_state.main_hwnd, &g_state.restore_rect);
@@ -492,7 +510,13 @@ void SetFullscreen(bool enabled) {
         SetWindowLongPtr(g_state.main_hwnd, GWL_EXSTYLE,
                          g_state.restore_ex_style & ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE |
                                                       WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
-        ApplyFullscreenRaiseOnce(g_state.main_hwnd);
+        // The renderer window is created before an AirPlay stream exists. Keep it hidden
+        // while preconfiguring fullscreen geometry; native_window_show() raises it later.
+        if (was_visible) {
+            ApplyFullscreenRaiseOnce(g_state.main_hwnd);
+        } else {
+            ApplyFullscreenLayoutWithoutShowing(g_state.main_hwnd);
+        }
     } else {
         SetWindowLongPtr(g_state.main_hwnd, GWL_STYLE, g_state.restore_style);
         SetWindowLongPtr(g_state.main_hwnd, GWL_EXSTYLE, g_state.restore_ex_style);
@@ -1346,8 +1370,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
     case kNativeWindowPinMessage: {
         PinUpdate *update = reinterpret_cast<PinUpdate *>(lparam);
         if (update) {
-            bool next_visible = update->show || g_state.pin_visible;
-            ApplyPinState(next_visible, update->pin);
+            ApplyPinState(update->show, update->pin);
             delete update;
         }
         return 0;
