@@ -3841,6 +3841,12 @@ extern "C" void uxplay_embedded_request_stop(void) {
 
 extern "C" void uxplay_embedded_stop_current_session(void) {
     if (raop) {
+        raop_control_stop(raop);
+    }
+}
+
+extern "C" void uxplay_embedded_stop_current_session_with_discovery_refresh(void) {
+    if (raop) {
         embedded_refresh_airplay_dnssd_requested.store(true);
         raop_control_stop(raop);
     }
