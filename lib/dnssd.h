@@ -35,9 +35,17 @@ extern "C" {
 
 typedef struct dnssd_s dnssd_t;
 typedef struct logger_s logger_t;
+typedef void (*dnssd_registration_callback_t)(void *userdata,
+                                              const char *service,
+                                              int error_code,
+                                              const char *registered_name,
+                                              unsigned short port);
 
 DNSSD_API dnssd_t *dnssd_init(const char *name, int name_len, const char *hw_addr, int hw_addr_len, int *error, unsigned char pin_pw);
 DNSSD_API void dnssd_set_logger(dnssd_t *dnssd, logger_t *logger);
+DNSSD_API void dnssd_set_registration_callback(dnssd_t *dnssd,
+                                               dnssd_registration_callback_t callback,
+                                               void *userdata);
 DNSSD_API const char *dnssd_get_module_path(dnssd_t *dnssd);
 
 DNSSD_API int dnssd_register_raop(dnssd_t *dnssd, unsigned short port);

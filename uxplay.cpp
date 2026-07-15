@@ -2893,6 +2893,30 @@ static void log_dnssd_register_failure(const char *service, int error) {
     }
 }
 
+static void emit_airplay_registration_event(const char *state,
+                                            const char *registered_name,
+                                            unsigned short port,
+                                            int error_code) {
+    std::string data = "{\"state\":" + json_string_or_null(state ? state : "failed") +
+        ",\"serviceName\":" + json_string_or_null(registered_name ? registered_name : "") +
+        ",\"port\":" + std::to_string(port) +
+        ",\"errorCode\":" + std::to_string(error_code) + "}";
+    embedded_emit_event("airplay.registrationChanged", data.c_str());
+}
+
+static void dnssd_registration_changed(void *userdata,
+                                       const char *service,
+                                       int error_code,
+                                       const char *registered_name,
+                                       unsigned short port) {
+    (void) userdata;
+    if (!service || strcmp(service, "airplay")) {
+        return;
+    }
+    emit_airplay_registration_event(error_code == 0 ? "registered" : "failed",
+                                    registered_name, port, error_code);
+}
+
 static int register_dnssd() {
     int dnssd_error;
     uint64_t features;
@@ -2901,7 +2925,9 @@ static int register_dnssd() {
         log_dnssd_register_failure("RAOP", dnssd_error);
         return -3;
     }
+    emit_airplay_registration_event("registering", server_name.c_str(), airplay_port, 0);
     if ((dnssd_error = dnssd_register_airplay(dnssd, airplay_port))) {
+        emit_airplay_registration_event("failed", server_name.c_str(), airplay_port, dnssd_error);
         log_dnssd_register_failure("AirPlay", dnssd_error);
         return -4;
     }
@@ -2928,8 +2954,10 @@ static int refresh_airplay_dnssd() {
 
     LOGI("Refreshing AirPlay DNS-SD registration after embedded session stop");
     dnssd_unregister_airplay(dnssd);
+    emit_airplay_registration_event("registering", server_name.c_str(), airplay_port, 0);
     const int error = dnssd_register_airplay(dnssd, airplay_port);
     if (error) {
+        emit_airplay_registration_event("failed", server_name.c_str(), airplay_port, error);
         log_dnssd_register_failure("AirPlay refresh", error);
         return error;
     }
@@ -2963,6 +2991,7 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
         return 1;
     }
     dnssd_set_logger(dnssd, render_logger);
+    dnssd_set_registration_callback(dnssd, dnssd_registration_changed, NULL);
     const char *dnssd_module_path = dnssd_get_module_path(dnssd);
     LOGI("DNSSD initialized for AirPlay receiver \"%s\" using %s",
          name.c_str(), dnssd_module_path ? dnssd_module_path : "unknown dnssd module");
