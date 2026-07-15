@@ -164,6 +164,8 @@ struct dnssd_s {
 
     unsigned char pin_pw;
     logger_t *logger;
+    dnssd_registration_callback_t registration_callback;
+    void *registration_callback_userdata;
 
     unsigned short raop_port;
     unsigned short airplay_port;
@@ -236,6 +238,17 @@ dnssd_set_logger(dnssd_t *dnssd, logger_t *logger)
 {
     if (dnssd) {
         dnssd->logger = logger;
+    }
+}
+
+void
+dnssd_set_registration_callback(dnssd_t *dnssd,
+                                dnssd_registration_callback_t callback,
+                                void *userdata)
+{
+    if (dnssd) {
+        dnssd->registration_callback = callback;
+        dnssd->registration_callback_userdata = userdata;
     }
 }
 
@@ -408,12 +421,24 @@ static void DNSSD_STDCALL raop_register_reply(
     dnssd_t *dnssd = (dnssd_t *) context;
     if (errorCode == kDNSServiceErr_NoError) {
         dnssd_log(dnssd, LOGGER_INFO, "dnssd: RAOP service \"%s\" registered successfully", name);
+        if (dnssd->registration_callback) {
+            dnssd->registration_callback(dnssd->registration_callback_userdata,
+                                         "raop", (int) errorCode, name, dnssd->raop_port);
+        }
     } else if (errorCode == kDNSServiceErr_NameConflict) {
+        if (dnssd->registration_callback) {
+            dnssd->registration_callback(dnssd->registration_callback_userdata,
+                                         "raop", (int) errorCode, name, dnssd->raop_port);
+        }
         dnssd_log(dnssd, LOGGER_WARNING, "dnssd: RAOP name conflict, re-registering...");
         dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
         dnssd->raop_service = NULL;
         dnssd_register_raop(dnssd, dnssd->raop_port);
     } else {
+        if (dnssd->registration_callback) {
+            dnssd->registration_callback(dnssd->registration_callback_userdata,
+                                         "raop", (int) errorCode, name, dnssd->raop_port);
+        }
         dnssd_log(dnssd, LOGGER_ERR, "dnssd: RAOP registration error %d, re-registering...", errorCode);
         dnssd->DNSServiceRefDeallocate(dnssd->raop_service);
         dnssd->raop_service = NULL;
@@ -433,12 +458,24 @@ static void DNSSD_STDCALL airplay_register_reply(
     dnssd_t *dnssd = (dnssd_t *) context;
     if (errorCode == kDNSServiceErr_NoError) {
         dnssd_log(dnssd, LOGGER_INFO, "dnssd: AirPlay service \"%s\" registered successfully", name);
+        if (dnssd->registration_callback) {
+            dnssd->registration_callback(dnssd->registration_callback_userdata,
+                                         "airplay", (int) errorCode, name, dnssd->airplay_port);
+        }
     } else if (errorCode == kDNSServiceErr_NameConflict) {
+        if (dnssd->registration_callback) {
+            dnssd->registration_callback(dnssd->registration_callback_userdata,
+                                         "airplay", (int) errorCode, name, dnssd->airplay_port);
+        }
         dnssd_log(dnssd, LOGGER_WARNING, "dnssd: AirPlay name conflict, re-registering...");
         dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
         dnssd->airplay_service = NULL;
         dnssd_register_airplay(dnssd, dnssd->airplay_port);
     } else {
+        if (dnssd->registration_callback) {
+            dnssd->registration_callback(dnssd->registration_callback_userdata,
+                                         "airplay", (int) errorCode, name, dnssd->airplay_port);
+        }
         dnssd_log(dnssd, LOGGER_ERR, "dnssd: AirPlay registration error %d, re-registering...", errorCode);
         dnssd->DNSServiceRefDeallocate(dnssd->airplay_service);
         dnssd->airplay_service = NULL;
