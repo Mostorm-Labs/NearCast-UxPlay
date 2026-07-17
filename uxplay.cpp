@@ -690,6 +690,11 @@ static bool control_state_note_client(const char *name, const char *model, const
     control_client_name = (name ? name : "");
     control_client_model = (model ? model : "");
     control_client_device_id = (device_id ? device_id : "");
+    // A successful authenticated client is the handoff from the PIN
+    // challenge to a real AirPlay session.  Do not leave the challenge
+    // marker armed, otherwise a later connection close could be mistaken for
+    // cancellation of the authenticated session.
+    control_pin_prompt_announced = false;
     if (open_connections > 0 && !control_mirror_started_announced) {
         control_mirror_started_announced = true;
         should_announce = true;
@@ -754,9 +759,20 @@ static bool control_state_connection_closed() {
     }
     if (open_connections == 0) {
         all_connections_closed = true;
-        stopped = control_mirror_started_announced || control_pin_prompt_announced;
+        // The connection which asks for a PIN is an authentication
+        // challenge, not a user-visible cast session.  AirPlay commonly
+        // closes that HTTP connection while the sender displays its PIN
+        // dialog and opens a fresh connection after the PIN is entered.  A
+        // sessionStopped event here would therefore report a false stop
+        // immediately after pinCodeRequired.
+        stopped = control_mirror_started_announced;
         control_mirror_started_announced = false;
-        control_pin_prompt_announced = false;
+        // Keep the prompt marker while authentication is pending.  An
+        // explicit stop/teardown can then report cancellation even though
+        // the challenge connection itself has already gone away.
+        if (stopped) {
+            control_pin_prompt_announced = false;
+        }
         control_client_name.clear();
         control_client_model.clear();
         control_client_device_id.clear();
@@ -770,23 +786,40 @@ static bool control_state_connection_closed() {
     return stopped;
 }
 
-static bool control_state_mirror_stopped() {
-    bool stopped = false;
+enum class ControlStopState {
+    None,
+    Mirror,
+    PinPrompt,
+};
+
+static ControlStopState control_state_take_stop_state() {
+    ControlStopState state = ControlStopState::None;
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    stopped = control_mirror_started_announced;
+    if (control_mirror_started_announced) {
+        state = ControlStopState::Mirror;
+    } else if (control_pin_prompt_announced) {
+        state = ControlStopState::PinPrompt;
+    }
     control_mirror_started_announced = false;
     control_pin_prompt_announced = false;
-    if (open_connections == 0) {
-        control_client_name.clear();
-        control_client_model.clear();
-        control_client_device_id.clear();
-    }
+    control_client_name.clear();
+    control_client_model.clear();
+    control_client_device_id.clear();
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
-    return stopped;
+    return state;
+}
+
+static void publish_control_session_stopped(const char *reason) {
+    const std::string stopReason = reason ? reason : "unknown";
+    const std::string payload = std::string("{\"sessionId\":\"current\",\"reason\":\"") +
+        stopReason + "\"}";
+    ws_control_queue_event("cast.sessionStopped", payload);
+    embedded_emit_event("cast.sessionStopped", payload.c_str());
+    ws_queue_status_changed_event();
 }
 
 static std::string generate_ws_control_token() {
@@ -3209,10 +3242,7 @@ extern "C" void conn_destroy (void *cls) {
         }    
     }
     if (stopped) {
-        const char *payload = "{\"sessionId\":\"current\",\"reason\":\"connection_closed\"}";
-        ws_control_queue_event("cast.sessionStopped", payload);
-        embedded_emit_event("cast.sessionStopped", payload);
-        ws_queue_status_changed_event();
+        publish_control_session_stopped("connection_closed");
     }
 }
 
@@ -3243,11 +3273,11 @@ extern "C" void conn_reset (void *cls, int reason) {
 
 extern "C" void conn_teardown(void *cls, bool *teardown_96, bool *teardown_110) {
     if (*teardown_110) {
-        control_state_mirror_stopped();
-        const char *payload = "{\"sessionId\":\"current\",\"reason\":\"teardown\"}";
-        ws_control_queue_event("cast.sessionStopped", payload);
-        embedded_emit_event("cast.sessionStopped", payload);
-        ws_queue_status_changed_event();
+        // TEARDOWN is an explicit sender-side end signal.  It is also the
+        // signal available when the sender cancels a PIN challenge, so it
+        // must consume both an authenticated session and a pending prompt.
+        control_state_take_stop_state();
+        publish_control_session_stopped("teardown");
     }
     if (*teardown_110 && close_window) {
         relaunch_video = true;
@@ -3607,7 +3637,16 @@ extern "C" void on_video_rate(void *cls, const float rate) {
 }
 
 extern "C" void on_video_stop(void *cls) {
+    (void) cls;
     LOGI("on_video_stop\n");
+    // /stop and the local stop control are explicit end requests.  Emit the
+    // event before the HTTP layer removes the remaining connections; this is
+    // important for a PIN-only flow because its challenge connection is
+    // normally already closed by the time the sender cancels.
+    const ControlStopState state = control_state_take_stop_state();
+    if (state != ControlStopState::None) {
+        publish_control_session_stopped("externalRequest");
+    }
 }
 
 extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *playback_info) {
