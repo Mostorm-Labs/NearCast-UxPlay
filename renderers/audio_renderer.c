@@ -40,11 +40,17 @@ static gboolean render_audio = FALSE;
 static gboolean async = FALSE;
 static gboolean vsync = FALSE;
 static gboolean sync = FALSE;
+static double desired_volume = 1.0;
+static audio_renderer_event_callback_t event_callback = NULL;
+static void *event_userdata = NULL;
+static GMutex renderer_mutex;
 
 typedef struct audio_renderer_s {
     GstElement *appsrc; 
     GstElement *pipeline;
     GstElement *volume;
+    GstBus *bus;
+    gint expected_eos;
     unsigned char ct;
 } audio_renderer_t ;
 static audio_renderer_t *renderer_type[NFORMATS];
@@ -56,14 +62,86 @@ static audio_renderer_t *renderer = NULL;
 static const char lpcm_caps[]="audio/x-raw,rate=(int)44100,channels=(int)2,format=S16LE,layout=interleaved";
 
 /* ct = 2; codec_data is ALAC magic cookie:  44100/16/2 spf = 352 */    
-static const char alac_caps[] = "audio/x-alac,mpegversion=(int)4,channnels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)"
+static const char alac_caps[] = "audio/x-alac,mpegversion=(int)4,channels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)"
                            "00000024""616c6163""00000000""00000160""0010280a""0e0200ff""00000000""00000000""0000ac44";
 
 /* ct = 4; codec_data from MPEG v4 ISO 14996-3 Section 1.6.2.1:  AAC-LC 44100/2 spf = 1024 */
-static const char aac_lc_caps[] ="audio/mpeg,mpegversion=(int)4,channnels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)1210";
+static const char aac_lc_caps[] ="audio/mpeg,mpegversion=(int)4,channels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)1210";
 
 /* ct = 8; codec_data from MPEG v4 ISO 14996-3 Section 1.6.2.1: AAC_ELD 44100/2  spf = 480 */
-static const char aac_eld_caps[] ="audio/mpeg,mpegversion=(int)4,channnels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)f8e85000";
+static const char aac_eld_caps[] ="audio/mpeg,mpegversion=(int)4,channels=(int)2,rate=(int)44100,stream-format=raw,codec_data=(buffer)f8e85000";
+
+static void notify_event(audio_renderer_event_type_t event_type, audio_renderer_t *source,
+                         int detail, double rms_db, double peak_db, const char *message) {
+    if (event_callback) {
+        event_callback(event_userdata, event_type, source ? source->ct : 0,
+                       detail, rms_db, peak_db, message);
+    }
+}
+
+static double first_level_value(const GstStructure *structure, const char *field) {
+    const GValue *values = gst_structure_get_value(structure, field);
+    if (!values || gst_value_list_get_size(values) == 0) {
+        return -INFINITY;
+    }
+    const GValue *first = gst_value_list_get_value(values, 0);
+    return G_VALUE_HOLDS_DOUBLE(first) ? g_value_get_double(first) : -INFINITY;
+}
+
+static audio_renderer_t *renderer_from_bus(GstBus *bus) {
+    for (int i = 0; i < NFORMATS; i++) {
+        if (renderer_type[i] && renderer_type[i]->bus == bus) {
+            return renderer_type[i];
+        }
+    }
+    return NULL;
+}
+
+static gboolean gstreamer_audio_pipeline_bus_callback(GstBus *bus, GstMessage *message, gpointer userdata) {
+    (void) userdata;
+    audio_renderer_t *source = renderer_from_bus(bus);
+    switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ERROR: {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        gst_message_parse_error(message, &err, &debug);
+        logger_log(logger, LOGGER_ERR, "GStreamer error (audio ct=%u): %s: %s%s%s",
+                   source ? source->ct : 0,
+                   GST_MESSAGE_SRC_NAME(message),
+                   err ? err->message : "unknown",
+                   debug ? "; " : "",
+                   debug ? debug : "");
+        notify_event(AUDIO_RENDERER_EVENT_ERROR, source,
+                     err ? err->code : 0, -INFINITY, -INFINITY,
+                     err ? err->message : "GStreamer audio error");
+        g_clear_error(&err);
+        g_free(debug);
+        break;
+    }
+    case GST_MESSAGE_EOS:
+        if (source && g_atomic_int_get(&source->expected_eos)) {
+            logger_log(logger, LOGGER_DEBUG, "GStreamer expected End-Of-Stream (audio ct=%u)", source->ct);
+        } else {
+            logger_log(logger, LOGGER_WARNING, "GStreamer unexpected End-Of-Stream (audio ct=%u)",
+                       source ? source->ct : 0);
+            notify_event(AUDIO_RENDERER_EVENT_UNEXPECTED_EOS, source, 0,
+                         -INFINITY, -INFINITY, "unexpected audio EOS");
+        }
+        break;
+    case GST_MESSAGE_ELEMENT: {
+        const GstStructure *structure = gst_message_get_structure(message);
+        if (structure && gst_structure_has_name(structure, "level")) {
+            notify_event(AUDIO_RENDERER_EVENT_OUTPUT, source, 0,
+                         first_level_value(structure, "rms"),
+                         first_level_value(structure, "peak"), NULL);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return TRUE;
+}
 
 static gboolean check_plugins (void)
 {
@@ -132,6 +210,10 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
     g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
 
     logger = render_logger;
+    desired_volume = 1.0;
+    render_audio = FALSE;
+    renderer = NULL;
+    gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
     
     aac = check_plugin_feature (avdec_aac);
     alac = check_plugin_feature (avdec_alac);
@@ -156,7 +238,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         }
         g_string_append (launch, "audioconvert ! ");
         g_string_append (launch, "audioresample ! ");    /* wasapisink must resample from 44.1 kHz to 48 kHz */
-        g_string_append (launch, "volume name=volume ! level ! ");
+        g_string_append (launch, "volume name=volume ! level name=audio_level post-messages=true interval=100000000 ! ");
         g_string_append (launch, audiosink);
         switch(i) {
         case 1:  /*ALAC*/
@@ -187,8 +269,10 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         g_assert (renderer_type[i]->pipeline);
         gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
 
+        renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);
         renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "audio_source");
         renderer_type[i]->volume = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "volume");
+        g_atomic_int_set(&renderer_type[i]->expected_eos, TRUE);
         switch (i) {
         case 0:
             caps =  gst_caps_from_string(aac_eld_caps);
@@ -218,16 +302,32 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         g_string_free(launch, TRUE);
         g_object_set(renderer_type[i]->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
         gst_caps_unref(caps);
-        g_object_unref(clock);
     }
+    gst_object_unref(clock);
+}
+
+void audio_renderer_set_event_callback(audio_renderer_event_callback_t callback, void *userdata) {
+    g_mutex_lock(&renderer_mutex);
+    event_callback = callback;
+    event_userdata = userdata;
+    g_mutex_unlock(&renderer_mutex);
 }
 
 void audio_renderer_stop() {
+    g_mutex_lock(&renderer_mutex);
     if (renderer) {
-        gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
-        gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+        audio_renderer_t *stopping = renderer;
+        g_atomic_int_set(&stopping->expected_eos, TRUE);
+        gst_app_src_end_of_stream(GST_APP_SRC(stopping->appsrc));
+        gst_bus_set_flushing(stopping->bus, TRUE);
+        gst_element_set_state(stopping->pipeline, GST_STATE_READY);
+        gst_element_set_state(stopping->pipeline, GST_STATE_NULL);
+        gst_bus_set_flushing(stopping->bus, FALSE);
+        gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
         renderer = NULL;
     }
+    render_audio = FALSE;
+    g_mutex_unlock(&renderer_mutex);
 }
 
 static void get_renderer_type(unsigned char *ct, int *id) {
@@ -266,33 +366,79 @@ static void get_renderer_type(unsigned char *ct, int *id) {
     }
 }
 
-void  audio_renderer_start(unsigned char *ct) {
+bool audio_renderer_start(unsigned char *ct) {
     int id = -1;
+    GstStateChangeReturn state_result = GST_STATE_CHANGE_FAILURE;
+    audio_renderer_t *starting = NULL;
+
+    g_mutex_lock(&renderer_mutex);
     get_renderer_type(ct, &id);
     if (id >= 0 && renderer) {
         if(*ct != renderer->ct) {
-            gst_app_src_end_of_stream(GST_APP_SRC(renderer->appsrc));
-            gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+            audio_renderer_t *stopping = renderer;
+            g_atomic_int_set(&stopping->expected_eos, TRUE);
+            gst_app_src_end_of_stream(GST_APP_SRC(stopping->appsrc));
+            gst_bus_set_flushing(stopping->bus, TRUE);
+            gst_element_set_state(stopping->pipeline, GST_STATE_READY);
+            gst_element_set_state(stopping->pipeline, GST_STATE_NULL);
+            gst_bus_set_flushing(stopping->bus, FALSE);
             logger_log(logger, LOGGER_INFO, "changed audio connection, format %s", format[id]);
             renderer = renderer_type[id];
-            gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
-            gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
+        } else {
+            g_mutex_unlock(&renderer_mutex);
+            return render_audio;
         }
     } else if (id >= 0) {
         logger_log(logger, LOGGER_INFO, "start audio connection, format %s", format[id]);
         renderer = renderer_type[id];
-        gst_element_set_state (renderer->pipeline, GST_STATE_PLAYING);
-        gst_audio_pipeline_base_time = gst_element_get_base_time(renderer->appsrc);
     } else {
         logger_log(logger, LOGGER_ERR, "unknown audio compression type ct = %d", *ct);
+        g_mutex_unlock(&renderer_mutex);
+        return false;
     }
+
+    starting = renderer;
+    if (!render_audio || !starting) {
+        renderer = NULL;
+        g_mutex_unlock(&renderer_mutex);
+        return false;
+    }
+
+    gst_bus_set_flushing(starting->bus, FALSE);
+    g_atomic_int_set(&starting->expected_eos, TRUE);
+    g_object_set(starting->volume, "volume", desired_volume, NULL);
+    state_result = gst_element_set_state(starting->pipeline, GST_STATE_PLAYING);
+    if (state_result == GST_STATE_CHANGE_FAILURE) {
+        logger_log(logger, LOGGER_ERR, "GStreamer audio pipeline failed to enter PLAYING (ct=%u)", starting->ct);
+        gst_element_set_state(starting->pipeline, GST_STATE_NULL);
+        renderer = NULL;
+        render_audio = FALSE;
+        g_mutex_unlock(&renderer_mutex);
+        notify_event(AUDIO_RENDERER_EVENT_START_FAILURE, starting,
+                     (int) state_result, -INFINITY, -INFINITY,
+                     "audio pipeline failed to enter PLAYING");
+        return false;
+    }
+    gst_audio_pipeline_base_time = gst_element_get_base_time(starting->appsrc);
+    g_atomic_int_set(&starting->expected_eos, FALSE);
+    g_mutex_unlock(&renderer_mutex);
+    return true;
 }
 
-void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
+bool audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time) {
     GstBuffer *buffer;
     bool valid;
+    GstFlowReturn flow_result = GST_FLOW_ERROR;
+    audio_renderer_t *active = NULL;
 
-    if (!render_audio) return;    /* do nothing unless render_audio == TRUE */
+    (void) seqnum;
+    g_mutex_lock(&renderer_mutex);
+
+    if (!render_audio || renderer == NULL || data == NULL || data_len == NULL || *data_len <= 0) {
+        g_mutex_unlock(&renderer_mutex);
+        return false;
+    }
+    active = renderer;
 
     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
@@ -302,10 +448,10 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         } else {
             logger_log(logger, LOGGER_ERR, "*** invalid ntp_time < gst_audio_pipeline_base_time\n%8.6f ntp_time\n%8.6f base_time",
                        ((double) *ntp_time) / SECOND_IN_NSECS, ((double) gst_audio_pipeline_base_time) / SECOND_IN_NSECS);
-            return;
+            g_mutex_unlock(&renderer_mutex);
+            return false;
         }
     }
-    if (data_len == 0 || renderer == NULL) return;
 
     /* all audio received seems to be either ct = 8 (AAC_ELD 44100/2 spf 460 ) AirPlay Mirror protocol *
      * or ct = 2 (ALAC 44100/16/2 spf 352) AirPlay protocol.                                           *
@@ -321,7 +467,7 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         GST_BUFFER_PTS(buffer) = pts;
     }
     gst_buffer_fill(buffer, 0, data, *data_len);
-    switch (renderer->ct){
+    switch (active->ct){
     case 8: /*AAC-ELD*/
         switch (data[0]){
         case 0x8c:
@@ -348,17 +494,37 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         break;
     }
     if (valid) {
-        gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+        flow_result = gst_app_src_push_buffer(GST_APP_SRC(active->appsrc), buffer);
+        g_mutex_unlock(&renderer_mutex);
+        if (flow_result != GST_FLOW_OK) {
+            logger_log(logger, LOGGER_ERR,
+                       "GStreamer audio appsrc push failed: ct=%u seq=%u flow=%s (%d)",
+                       active->ct, seqnum ? *seqnum : 0,
+                       gst_flow_get_name(flow_result), (int) flow_result);
+            notify_event(AUDIO_RENDERER_EVENT_PUSH_FAILURE, active,
+                         (int) flow_result, -INFINITY, -INFINITY,
+                         gst_flow_get_name(flow_result));
+            return false;
+        }
+        return true;
     } else {
-        logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", renderer->ct);
+        logger_log(logger, LOGGER_ERR, "*** ERROR invalid  audio frame (compression_type %d) skipped ", active->ct);
         logger_log(logger, LOGGER_ERR, "***       first byte of invalid frame was  0x%2.2x ", (unsigned int) data[0]);
+        gst_buffer_unref(buffer);
+        g_mutex_unlock(&renderer_mutex);
+        return false;
     }
 }
 
 void audio_renderer_set_volume(double volume) {
     volume = (volume > 10.0) ? 10.0 : volume;
     volume = (volume < 0.0) ? 0.0 : volume;
-    g_object_set(renderer->volume, "volume", volume, NULL);
+    g_mutex_lock(&renderer_mutex);
+    desired_volume = volume;
+    if (renderer && renderer->volume) {
+        g_object_set(renderer->volume, "volume", desired_volume, NULL);
+    }
+    g_mutex_unlock(&renderer_mutex);
 }
 
 void audio_renderer_flush() {
@@ -366,7 +532,10 @@ void audio_renderer_flush() {
 
 void audio_renderer_destroy() {
     audio_renderer_stop();
+    audio_renderer_set_event_callback(NULL, NULL);
     for (int i = 0; i < NFORMATS ; i++ ) {
+        gst_object_unref (renderer_type[i]->bus);
+        renderer_type[i]->bus = NULL;
         gst_object_unref (renderer_type[i]->volume);
 	renderer_type[i]->volume = NULL;
         gst_object_unref (renderer_type[i]->appsrc);
@@ -374,5 +543,15 @@ void audio_renderer_destroy() {
 	gst_object_unref (renderer_type[i]->pipeline);
         renderer_type[i]->pipeline = NULL;
         free(renderer_type[i]);
+        renderer_type[i] = NULL;
     }
+}
+
+unsigned int audio_renderer_listen(void *loop, int id) {
+    (void) loop;
+    g_assert(id >= 0 && id < NFORMATS);
+    g_assert(renderer_type[id] && renderer_type[id]->bus);
+    return (unsigned int) gst_bus_add_watch(renderer_type[id]->bus,
+                                            gstreamer_audio_pipeline_bus_callback,
+                                            NULL);
 }

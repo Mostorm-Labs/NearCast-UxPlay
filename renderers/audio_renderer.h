@@ -32,14 +32,33 @@ extern "C" {
 #include <stdbool.h>
 #include "../lib/logger.h"
 
+typedef enum audio_renderer_event_type_e {
+    AUDIO_RENDERER_EVENT_ERROR = 1,
+    AUDIO_RENDERER_EVENT_UNEXPECTED_EOS = 2,
+    AUDIO_RENDERER_EVENT_OUTPUT = 3,
+    AUDIO_RENDERER_EVENT_START_FAILURE = 4,
+    AUDIO_RENDERER_EVENT_PUSH_FAILURE = 5
+} audio_renderer_event_type_t;
+
+typedef void (*audio_renderer_event_callback_t)(
+    void *userdata,
+    audio_renderer_event_type_t event_type,
+    unsigned char compression_type,
+    int detail,
+    double rms_db,
+    double peak_db,
+    const char *message);
+
 bool gstreamer_init();
 void audio_renderer_init(logger_t *logger, const char* audiosink, const bool *audio_sync, const bool *video_sync);
-void audio_renderer_start(unsigned char* compression_type);
+void audio_renderer_set_event_callback(audio_renderer_event_callback_t callback, void *userdata);
+bool audio_renderer_start(unsigned char* compression_type);
 void audio_renderer_stop();
-void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time);
+bool audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time);
 void audio_renderer_set_volume(double volume);
 void audio_renderer_flush();
 void audio_renderer_destroy();
+unsigned int audio_renderer_listen(void *loop, int id);
 
 #ifdef __cplusplus
 }

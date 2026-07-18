@@ -606,7 +606,8 @@ raop_rtp_thread_udp(void *arg)
 		 raop_rtp->initial_sync = true;
 	    }	    
 
-            if (packetlen == 16 && memcmp(packet + 12, no_data_marker, 4) == 0) {
+            if (packetlen == 12 ||
+                (packetlen == 16 && memcmp(packet + 12, no_data_marker, 4) == 0)) {
                 /* this is a "no data" packet */
 	        /* the first such packet could be used to provide the initial rtptime and seqnum formerly given in the RECORD request */
                 continue;

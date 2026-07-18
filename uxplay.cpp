@@ -71,6 +71,7 @@
 #include "renderers/audio_renderer.h"
 #include "renderers/native_window.h"
 #include "mongoose.h"
+#include "audio_recovery_policy.h"
 
 #define VERSION "1.72"
 
@@ -130,6 +131,11 @@ static bool audio_renderer_stop_thread_started = false;
 static bool audio_renderer_stop_thread_finished = false;
 static mutex_handle_t audio_control_mutex;
 static bool audio_control_mutex_initialized = false;
+static uxplay_audio_recovery::HealthState audio_health;
+static bool audio_recovery_pending = false;
+static bool audio_recovery_waiting_for_output = false;
+static uint64_t audio_recovery_not_before_us = 0;
+static std::string audio_recovery_reason;
 #if __APPLE__
 static bool new_window_closing_behavior = false;
 #else
@@ -247,6 +253,11 @@ static void reset_embedded_runtime_audio_defaults() {
     audio_renderer_stop_pending = false;
     audio_renderer_stop_thread_started = false;
     audio_renderer_stop_thread_finished = false;
+    uxplay_audio_recovery::ResetSessionHealth(audio_health);
+    audio_recovery_pending = false;
+    audio_recovery_waiting_for_output = false;
+    audio_recovery_not_before_us = 0;
+    audio_recovery_reason.clear();
     dump_audio = false;
     previous_audio_type = 0x00;
 }
@@ -316,6 +327,144 @@ static bool audio_renderer_stop_is_pending() {
     pending = audio_renderer_stop_pending;
     MUTEX_UNLOCK(audio_control_mutex);
     return pending;
+}
+
+static uint64_t audio_monotonic_time_us() {
+    return static_cast<uint64_t>(g_get_monotonic_time());
+}
+
+static bool audio_recovery_is_pending() {
+    if (!audio_control_mutex_initialized) {
+        return audio_recovery_pending;
+    }
+    MUTEX_LOCK(audio_control_mutex);
+    const bool pending = audio_recovery_pending;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return pending;
+}
+
+static void audio_recovery_reset(const char *reason) {
+    if (!audio_control_mutex_initialized) {
+        uxplay_audio_recovery::ResetSessionHealth(audio_health);
+        audio_recovery_pending = false;
+        audio_recovery_waiting_for_output = false;
+        audio_recovery_not_before_us = 0;
+        audio_recovery_reason.clear();
+        return;
+    }
+    MUTEX_LOCK(audio_control_mutex);
+    uxplay_audio_recovery::ResetSessionHealth(audio_health);
+    audio_recovery_pending = false;
+    audio_recovery_waiting_for_output = false;
+    audio_recovery_not_before_us = 0;
+    audio_recovery_reason.clear();
+    MUTEX_UNLOCK(audio_control_mutex);
+    log(LOGGER_DEBUG, "audio recovery state reset: %s", reason ? reason : "unknown");
+}
+
+static void audio_recovery_note_input(uint64_t now_us) {
+    MUTEX_LOCK(audio_control_mutex);
+    audio_health.lastInputUs = now_us;
+    MUTEX_UNLOCK(audio_control_mutex);
+}
+
+static void audio_recovery_note_push(uint64_t now_us) {
+    MUTEX_LOCK(audio_control_mutex);
+    audio_health.lastPushUs = now_us;
+    MUTEX_UNLOCK(audio_control_mutex);
+}
+
+static void audio_recovery_note_started(uint64_t now_us) {
+    MUTEX_LOCK(audio_control_mutex);
+    audio_health.pipelineStartedUs = now_us;
+    audio_health.lastPushUs = 0;
+    audio_health.lastOutputUs = 0;
+    audio_health.stableOutputSinceUs = 0;
+    MUTEX_UNLOCK(audio_control_mutex);
+}
+
+static void audio_recovery_request(const char *reason) {
+    if (!audio_renderer_initialized || !audio_control_mutex_initialized ||
+        !mirror_audio_is_enabled() ||
+        media_handoff_in_progress.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const uint64_t now_us = audio_monotonic_time_us();
+    bool queued = false;
+    uint64_t delay_us = 0;
+    unsigned int next_attempt = 0;
+    MUTEX_LOCK(audio_control_mutex);
+    if (!audio_recovery_pending && !audio_renderer_stop_pending) {
+        delay_us = uxplay_audio_recovery::RecoveryDelayUs(audio_health.recoveryAttempts);
+        audio_recovery_pending = true;
+        audio_recovery_not_before_us = now_us + delay_us;
+        audio_recovery_reason = reason ? reason : "unknown";
+        next_attempt = audio_health.recoveryAttempts + 1;
+        queued = true;
+    }
+    MUTEX_UNLOCK(audio_control_mutex);
+
+    if (queued) {
+        log(LOGGER_WARNING,
+            "audio recovery queued: reason=%s attempt=%u delay_ms=%llu",
+            reason ? reason : "unknown", next_attempt,
+            static_cast<unsigned long long>(delay_us / 1000));
+    }
+}
+
+static void handle_audio_renderer_event(
+    void *userdata,
+    audio_renderer_event_type_t event_type,
+    unsigned char compression_type_value,
+    int detail,
+    double rms_db,
+    double peak_db,
+    const char *message) {
+    (void) userdata;
+    const uint64_t now_us = audio_monotonic_time_us();
+    if (event_type == AUDIO_RENDERER_EVENT_OUTPUT) {
+        bool recovered = false;
+        bool attempts_reset = false;
+        unsigned int attempt = 0;
+        MUTEX_LOCK(audio_control_mutex);
+        audio_health.lastRmsDb = rms_db;
+        audio_health.lastPeakDb = peak_db;
+        recovered = audio_recovery_waiting_for_output;
+        attempt = audio_health.recoveryAttempts;
+        audio_recovery_waiting_for_output = false;
+        attempts_reset = uxplay_audio_recovery::NoteOutputAndMaybeReset(audio_health, now_us);
+        MUTEX_UNLOCK(audio_control_mutex);
+        if (recovered) {
+            log(LOGGER_INFO,
+                "audio recovery restored decoded output: ct=%u attempt=%u rms_db=%.2f peak_db=%.2f",
+                compression_type_value, attempt, rms_db, peak_db);
+        } else if (attempts_reset) {
+            log(LOGGER_INFO, "audio recovery counter reset after stable decoded output");
+        }
+        return;
+    }
+
+    log(LOGGER_WARNING,
+        "audio renderer failure signal: event=%d ct=%u detail=%d message=%s",
+        static_cast<int>(event_type), compression_type_value, detail,
+        message ? message : "none");
+    switch (event_type) {
+    case AUDIO_RENDERER_EVENT_ERROR:
+        audio_recovery_request("gstreamer-bus-error");
+        break;
+    case AUDIO_RENDERER_EVENT_UNEXPECTED_EOS:
+        audio_recovery_request("unexpected-eos");
+        break;
+    case AUDIO_RENDERER_EVENT_START_FAILURE:
+        audio_recovery_request("pipeline-start-failure");
+        break;
+    case AUDIO_RENDERER_EVENT_PUSH_FAILURE:
+        audio_recovery_request("appsrc-push-failure");
+        break;
+    default:
+        break;
+    }
 }
 
 static void audio_renderer_request_async_stop(const char *reason) {
@@ -472,6 +621,7 @@ static void begin_media_handoff_boundary(const char *reason) {
     media_handoff_in_progress.store(true, std::memory_order_release);
     remote_clock_offset = 0;
     compression_type = 0;
+    audio_recovery_reset(reason ? reason : "handoff-boundary");
     if (audio_renderer_initialized) {
         audio_renderer_stop_now(reason ? reason : "handoff-boundary");
     }
@@ -1728,6 +1878,59 @@ static gboolean audio_stop_callback(gpointer loop) {
     if (audio_renderer_stop_thread_is_finished()) {
         audio_renderer_join_stop_worker_if_started();
     }
+
+    const uint64_t now_us = audio_monotonic_time_us();
+    bool start_recovery = false;
+    bool watchdog_stall = false;
+    std::string recovery_reason;
+    unsigned int recovery_attempt = 0;
+    uint64_t input_age_us = 0;
+    uint64_t output_age_us = 0;
+    MUTEX_LOCK(audio_control_mutex);
+    watchdog_stall = uxplay_audio_recovery::ShouldRecoverSilentPipeline(
+        audio_health,
+        now_us,
+        use_audio && !media_handoff_in_progress.load(std::memory_order_acquire),
+        audio_renderer_running,
+        audio_recovery_pending,
+        audio_renderer_stop_pending);
+    if (watchdog_stall) {
+        input_age_us = now_us - audio_health.lastPushUs;
+        output_age_us = now_us -
+            std::max(audio_health.pipelineStartedUs, audio_health.lastOutputUs);
+        const uint64_t delay_us =
+            uxplay_audio_recovery::RecoveryDelayUs(audio_health.recoveryAttempts);
+        audio_recovery_pending = true;
+        audio_recovery_not_before_us = now_us + delay_us;
+        audio_recovery_reason = "decoded-output-stall";
+    }
+    if (audio_recovery_pending &&
+        now_us >= audio_recovery_not_before_us &&
+        !audio_renderer_stop_thread_started) {
+        audio_recovery_pending = false;
+        audio_renderer_running = false;
+        audio_renderer_stop_pending = true;
+        audio_health.recoveryAttempts++;
+        audio_health.stableOutputSinceUs = 0;
+        audio_recovery_waiting_for_output = true;
+        recovery_reason = audio_recovery_reason;
+        recovery_attempt = audio_health.recoveryAttempts;
+        start_recovery = true;
+    }
+    MUTEX_UNLOCK(audio_control_mutex);
+
+    if (watchdog_stall) {
+        log(LOGGER_WARNING,
+            "audio watchdog detected stalled decoded output: input_age_ms=%llu output_age_ms=%llu",
+            static_cast<unsigned long long>(input_age_us / 1000),
+            static_cast<unsigned long long>(output_age_us / 1000));
+    }
+    if (start_recovery) {
+        log(LOGGER_WARNING, "audio recovery starting: reason=%s attempt=%u",
+            recovery_reason.c_str(), recovery_attempt);
+        audio_renderer_start_stop_worker(recovery_reason.c_str());
+        return TRUE;
+    }
     if (audio_renderer_stop_is_pending()) {
         audio_renderer_start_stop_worker("async-session-boundary");
     }
@@ -1778,7 +1981,8 @@ static guint g_unix_signal_add(gint signum, GSourceFunc handler, gpointer user_d
 #endif
 
 static void main_loop()  {
-    guint gst_bus_watch_id[2] = { 0 };
+    guint gst_video_bus_watch_id[2] = { 0 };
+    guint gst_audio_bus_watch_id[2] = { 0 };
     g_assert(n_renderers <= 2);
     GMainLoop *loop = g_main_loop_new(NULL,FALSE);
 #ifdef UXPLAY_EMBEDDED_RUNTIME
@@ -1800,7 +2004,12 @@ static void main_loop()  {
             gst_x11_window_id = g_timeout_add(100, (GSourceFunc) x11_window_callback, (gpointer) loop);
         }
         for (int i = 0; i < n_renderers; i++) {
-            gst_bus_watch_id[i] = (guint) video_renderer_listen((void *)loop, i);
+            gst_video_bus_watch_id[i] = (guint) video_renderer_listen((void *)loop, i);
+        }
+    }
+    if (audio_renderer_initialized) {
+        for (int i = 0; i < 2; i++) {
+            gst_audio_bus_watch_id[i] = (guint) audio_renderer_listen((void *)loop, i);
         }
     }
     missed_feedback = 0;
@@ -1817,7 +2026,10 @@ static void main_loop()  {
     g_main_loop_run(loop);
 
     for (int i = 0; i < n_renderers; i++) {
-        if (gst_bus_watch_id[i] > 0) g_source_remove(gst_bus_watch_id[i]);
+        if (gst_video_bus_watch_id[i] > 0) g_source_remove(gst_video_bus_watch_id[i]);
+    }
+    for (int i = 0; i < 2; i++) {
+        if (gst_audio_bus_watch_id[i] > 0) g_source_remove(gst_audio_bus_watch_id[i]);
     }
     if (gst_x11_window_id > 0) g_source_remove(gst_x11_window_id);
     if (sigint_watch_id > 0) g_source_remove(sigint_watch_id);
@@ -3234,6 +3446,7 @@ extern "C" void conn_destroy (void *cls) {
         end_media_handoff_boundary("all-connections-closed");
         remote_clock_offset = 0;
         compression_type = 0;
+        audio_recovery_reset("all-connections-closed");
         if (audio_renderer_initialized) {
             audio_renderer_request_async_stop("last-connection-closed");
         }
@@ -3322,13 +3535,20 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
     if (!mirror_audio_is_enabled()) {
         return;
     }
-    if (audio_renderer_stop_is_pending()) {
+    const uint64_t now_us = audio_monotonic_time_us();
+    audio_recovery_note_input(now_us);
+    if (audio_renderer_stop_is_pending() || audio_recovery_is_pending()) {
         return;
     }
     if (audio_renderer_initialized && !audio_renderer_is_running() && data->ct) {
         unsigned char ct = data->ct;
-        audio_renderer_start(&ct);
-        audio_renderer_set_running(true);
+        const bool started = audio_renderer_start(&ct);
+        audio_renderer_set_running(started);
+        if (!started) {
+            audio_recovery_request("pipeline-start-failure");
+            return;
+        }
+        audio_recovery_note_started(now_us);
     }
     if (!remote_clock_offset) {
         uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
@@ -3350,7 +3570,9 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
     default:
         break;
     }
-    audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote));
+    if (audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote))) {
+        audio_recovery_note_push(audio_monotonic_time_us());
+    }
 }
 
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
@@ -3421,6 +3643,9 @@ extern "C" void mirror_audio_set_enabled(void *cls, bool enabled) {
         return;
     }
     mirror_audio_set_requested(enabled);
+    if (!enabled) {
+        audio_recovery_reset("mirror-audio-muted");
+    }
     /*
      * This callback runs in the single httpd thread, which also receives the
      * client's once-per-second /feedback requests.  Avoid GStreamer state
@@ -3478,6 +3703,7 @@ extern "C" void audio_set_volume (void *cls, float volume) {
 
 extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
     unsigned char type;
+    const unsigned char previous_compression_type = compression_type;
     compression_type = *ct;
     LOGI("ct=%d spf=%d usingScreen=%d isMedia=%d  audioFormat=0x%lx",*ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
     switch (*ct) {
@@ -3497,9 +3723,17 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     }
     audio_type = type;
     
+    if (previous_compression_type != 0 && previous_compression_type != *ct) {
+        audio_recovery_reset("audio-format-changed");
+    }
     if (mirror_audio_is_enabled()) {
-      audio_renderer_start(ct);
-      audio_renderer_set_running(true);
+      const bool started = audio_renderer_start(ct);
+      audio_renderer_set_running(started);
+      if (started) {
+          audio_recovery_note_started(audio_monotonic_time_us());
+      } else {
+          audio_recovery_request("format-pipeline-start-failure");
+      }
     }
 
     if (coverart_filename.length()) {
@@ -4035,6 +4269,11 @@ int main (int argc, char *argv[]) {
     audio_renderer_stop_pending = false;
     audio_renderer_stop_thread_started = false;
     audio_renderer_stop_thread_finished = false;
+    uxplay_audio_recovery::ResetSessionHealth(audio_health);
+    audio_recovery_pending = false;
+    audio_recovery_waiting_for_output = false;
+    audio_recovery_not_before_us = 0;
+    audio_recovery_reason.clear();
     MUTEX_CREATE(control_state_mutex);
     control_state_mutex_initialized = true;
     MUTEX_CREATE(ws_control_mutex);
@@ -4195,6 +4434,7 @@ int main (int argc, char *argv[]) {
 
     if (mirror_audio_is_enabled()) {
       audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync);
+      audio_renderer_set_event_callback(handle_audio_renderer_event, NULL);
       audio_renderer_initialized = true;
       if (default_mirror_audio_muted) {
           mirror_audio_set_requested(false);
