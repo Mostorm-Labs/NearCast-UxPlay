@@ -27,6 +27,15 @@ typedef struct raop_ntp_s raop_ntp_t;
 
 typedef enum timing_protocol_e { NTP, TP_NONE, TP_OTHER, TP_UNSPECIFIED } timing_protocol_t;
 
+typedef struct raop_ntp_diagnostics_s {
+    uint64_t update_count;
+    uint64_t last_update_local_ns;
+    int64_t last_correction_ns;
+    int64_t offset_ns;
+    int64_t delay_ns;
+    int64_t dispersion_value;
+} raop_ntp_diagnostics_t;
+
 void raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport);
 
 void raop_ntp_stop(raop_ntp_t *raop_ntp);
@@ -42,6 +51,7 @@ uint64_t raop_ntp_get_local_time();
 uint64_t raop_ntp_get_remote_time(raop_ntp_t *raop_ntp);
 uint64_t raop_ntp_convert_remote_time(raop_ntp_t *raop_ntp, uint64_t remote_time);
 uint64_t raop_ntp_convert_local_time(raop_ntp_t *raop_ntp, uint64_t local_time);
+bool raop_ntp_get_diagnostics(raop_ntp_t *raop_ntp, raop_ntp_diagnostics_t *diagnostics);
 
 void  raop_ntp_set_video_arrival_offset(raop_ntp_t* raop_ntp, const uint64_t *offset);
 uint64_t raop_ntp_get_video_arrival_offset(raop_ntp_t* raop_ntp);

@@ -65,6 +65,17 @@ struct raop_rtp_s {
     uint64_t client_ntp_sync;
     bool initial_sync;
 
+    uint64_t resend_request_count;
+    uint64_t resend_requested_packet_count;
+    uint64_t resend_failure_count;
+    uint64_t resent_packet_count;
+    uint64_t last_resend_request_local_ns;
+    uint64_t last_resend_failure_local_ns;
+    uint64_t last_resent_packet_local_ns;
+    uint64_t rtp_sync_update_count;
+    uint64_t last_rtp_sync_update_local_ns;
+    int64_t last_rtp_sync_offset_change_ns;
+
     // Transmission Stats, could be used if a playout buffer is needed
     // float interarrival_jitter; // As defined by RTP RFC 3550, Section 6.4.1
     // unsigned int last_packet_transit_time;
@@ -225,6 +236,9 @@ raop_rtp_resend_callback(void *opaque, unsigned short seqnum, unsigned short cou
     addrlen = raop_rtp->control_saddr_len;
 
     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp got resend request %d %d", seqnum, count);
+    raop_rtp->resend_request_count++;
+    raop_rtp->resend_requested_packet_count += count;
+    raop_rtp->last_resend_request_local_ns = raop_ntp_get_local_time();
     ourseqnum = raop_rtp->control_seqnum++;
 
     /* Fill the request buffer */
@@ -239,6 +253,8 @@ raop_rtp_resend_callback(void *opaque, unsigned short seqnum, unsigned short cou
 
     ret = sendto(raop_rtp->csock, (const char *)packet, sizeof(packet), 0, addr, addrlen);
     if (ret == -1) {
+        raop_rtp->resend_failure_count++;
+        raop_rtp->last_resend_failure_local_ns = raop_ntp_get_local_time();
         logger_log(raop_rtp->logger, LOGGER_WARNING, "raop_rtp resend failed: %d", SOCKET_GET_ERROR());
     }
 
@@ -487,6 +503,8 @@ raop_rtp_thread_udp(void *arg)
                 unsigned short seqnum = byteutils_get_short_be(resent_packet, 2);
                 if (resent_packetlen >= 12) {
                     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp resent audio packet: seqnum=%u", seqnum);
+                    raop_rtp->resent_packet_count++;
+                    raop_rtp->last_resent_packet_local_ns = raop_ntp_get_local_time();
                     int result = raop_buffer_enqueue(raop_rtp->buffer, resent_packet, resent_packetlen, 1);
                     assert(result >= 0);
                 } else if (logger_debug) {
@@ -519,10 +537,15 @@ raop_rtp_thread_udp(void *arg)
                 raop_rtp->rtp_sync = byteutils_get_int_be(packet, 4);
                 uint64_t sync_ntp_raw = byteutils_get_long_be(packet, 8);
                 raop_rtp->client_ntp_sync = raop_remote_timestamp_to_nano_seconds(raop_rtp->ntp, sync_ntp_raw);
+                double offset_change = ((double) raop_rtp->client_ntp_sync) -
+                                       raop_rtp->rtp_clock_rate * raop_rtp->rtp_sync;
+                offset_change -= ((double) client_ntp_sync_prev) -
+                                 raop_rtp->rtp_clock_rate * rtp_sync_prev;
+                raop_rtp->rtp_sync_update_count++;
+                raop_rtp->last_rtp_sync_update_local_ns = raop_ntp_get_local_time();
+                raop_rtp->last_rtp_sync_offset_change_ns = (int64_t) offset_change;
  
                 if (logger_debug) {
-                    double offset_change = ((double) raop_rtp->client_ntp_sync) - raop_rtp->rtp_clock_rate * raop_rtp->rtp_sync;
-                    offset_change -= ((double) client_ntp_sync_prev) - raop_rtp->rtp_clock_rate * rtp_sync_prev;
                     uint64_t sync_ntp_local = raop_ntp_convert_remote_time(raop_rtp->ntp,  raop_rtp->rtp_sync);
                     char *str = utils_data_to_string(packet, packetlen, 20);
                     logger_log(raop_rtp->logger, LOGGER_DEBUG,
@@ -637,6 +660,18 @@ raop_rtp_thread_udp(void *arg)
                     audio_data.ct = raop_rtp->ct;
                     audio_data.ntp_time_remote = rtp_time_to_client_ntp(raop_rtp, rtp_timestamp);
                     audio_data.ntp_time_local  = raop_ntp_convert_remote_time(raop_rtp->ntp, audio_data.ntp_time_remote);
+                    audio_data.resend_request_count = raop_rtp->resend_request_count;
+                    audio_data.resend_requested_packet_count = raop_rtp->resend_requested_packet_count;
+                    audio_data.resend_failure_count = raop_rtp->resend_failure_count;
+                    audio_data.resent_packet_count = raop_rtp->resent_packet_count;
+                    audio_data.last_resend_request_local_ns = raop_rtp->last_resend_request_local_ns;
+                    audio_data.last_resend_failure_local_ns = raop_rtp->last_resend_failure_local_ns;
+                    audio_data.last_resent_packet_local_ns = raop_rtp->last_resent_packet_local_ns;
+                    audio_data.rtp_sync_update_count = raop_rtp->rtp_sync_update_count;
+                    audio_data.last_rtp_sync_update_local_ns = raop_rtp->last_rtp_sync_update_local_ns;
+                    audio_data.last_rtp_sync_offset_change_ns = raop_rtp->last_rtp_sync_offset_change_ns;
+                    memset(&audio_data.ntp_diagnostics, 0, sizeof(audio_data.ntp_diagnostics));
+                    raop_ntp_get_diagnostics(raop_rtp->ntp, &audio_data.ntp_diagnostics);
 
                     if (logger_debug_data) {
                         uint64_t ntp_now = raop_ntp_get_local_time();

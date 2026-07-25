@@ -8,6 +8,23 @@ project( uxplay )
 
 message( STATUS "Project name: " ${PROJECT_NAME} )
 
+set(UXPLAY_AV_SYNC_STRATEGY "LEGACY_REBASE" CACHE STRING
+    "Mirror A/V timestamp strategy: LEGACY_REBASE, ABSOLUTE_NTP, or SESSION_ANCHOR")
+set_property(CACHE UXPLAY_AV_SYNC_STRATEGY PROPERTY STRINGS
+    LEGACY_REBASE ABSOLUTE_NTP SESSION_ANCHOR)
+string(TOUPPER "${UXPLAY_AV_SYNC_STRATEGY}" _uxplay_av_sync_strategy)
+if(_uxplay_av_sync_strategy STREQUAL "LEGACY_REBASE")
+  add_definitions(-DUXPLAY_AV_SYNC_STRATEGY=0)
+elseif(_uxplay_av_sync_strategy STREQUAL "ABSOLUTE_NTP")
+  add_definitions(-DUXPLAY_AV_SYNC_STRATEGY=1)
+elseif(_uxplay_av_sync_strategy STREQUAL "SESSION_ANCHOR")
+  add_definitions(-DUXPLAY_AV_SYNC_STRATEGY=2)
+else()
+  message(FATAL_ERROR
+      "UXPLAY_AV_SYNC_STRATEGY must be LEGACY_REBASE, ABSOLUTE_NTP, or SESSION_ANCHOR; got '${UXPLAY_AV_SYNC_STRATEGY}'")
+endif()
+message(STATUS "UxPlay A/V sync strategy: ${_uxplay_av_sync_strategy}")
+
 include(GNUInstallDirs)
 
 set ( CMAKE_CXX_STANDARD 11 )

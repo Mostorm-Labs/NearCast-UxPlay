@@ -72,6 +72,9 @@ struct raop_ntp_s {
     int64_t sync_offset;
     int64_t sync_dispersion;
     int64_t sync_delay;
+    uint64_t sync_update_count;
+    uint64_t last_sync_update_local_ns;
+    int64_t last_sync_correction_ns;
 
     // Socket address of the AirPlay client
     struct sockaddr_storage remote_saddr;
@@ -382,6 +385,9 @@ raop_ntp_thread(void *arg)
                 raop_ntp->sync_offset = offset;
                 raop_ntp->sync_dispersion = dispersion;
                 raop_ntp->sync_delay = delay;
+                raop_ntp->sync_update_count++;
+                raop_ntp->last_sync_update_local_ns = t3;
+                raop_ntp->last_sync_correction_ns = correction;
                 MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
 
                 logger_log(raop_ntp->logger, LOGGER_DEBUG, "raop_ntp sync correction = %lld", correction);
@@ -545,4 +551,19 @@ uint64_t raop_ntp_convert_local_time(raop_ntp_t *raop_ntp, uint64_t local_time) 
     int64_t offset = raop_ntp->sync_offset;
     MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
     return (uint64_t) ((int64_t) local_time + offset);
+}
+
+bool raop_ntp_get_diagnostics(raop_ntp_t *raop_ntp, raop_ntp_diagnostics_t *diagnostics) {
+    if (!raop_ntp || !diagnostics) {
+        return false;
+    }
+    MUTEX_LOCK(raop_ntp->sync_params_mutex);
+    diagnostics->update_count = raop_ntp->sync_update_count;
+    diagnostics->last_update_local_ns = raop_ntp->last_sync_update_local_ns;
+    diagnostics->last_correction_ns = raop_ntp->last_sync_correction_ns;
+    diagnostics->offset_ns = raop_ntp->sync_offset;
+    diagnostics->delay_ns = raop_ntp->sync_delay;
+    diagnostics->dispersion_value = raop_ntp->sync_dispersion;
+    MUTEX_UNLOCK(raop_ntp->sync_params_mutex);
+    return diagnostics->update_count != 0;
 }

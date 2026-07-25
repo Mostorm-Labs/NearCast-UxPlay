@@ -21,6 +21,7 @@
  */
 
 #include <math.h>
+#include <string.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
@@ -44,6 +45,8 @@ static double desired_volume = 1.0;
 static audio_renderer_event_callback_t event_callback = NULL;
 static void *event_userdata = NULL;
 static GMutex renderer_mutex;
+static audio_renderer_sync_snapshot_t sync_snapshot;
+static guint64 pipeline_generation = 0;
 
 typedef struct audio_renderer_s {
     GstElement *appsrc; 
@@ -214,6 +217,8 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
     render_audio = FALSE;
     renderer = NULL;
     gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
+    memset(&sync_snapshot, 0, sizeof(sync_snapshot));
+    pipeline_generation = 0;
     
     aac = check_plugin_feature (avdec_aac);
     alac = check_plugin_feature (avdec_alac);
@@ -324,6 +329,8 @@ void audio_renderer_stop() {
         gst_element_set_state(stopping->pipeline, GST_STATE_NULL);
         gst_bus_set_flushing(stopping->bus, FALSE);
         gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
+        memset(&sync_snapshot, 0, sizeof(sync_snapshot));
+        sync_snapshot.generation = pipeline_generation;
         renderer = NULL;
     }
     render_audio = FALSE;
@@ -420,6 +427,9 @@ bool audio_renderer_start(unsigned char *ct) {
         return false;
     }
     gst_audio_pipeline_base_time = gst_element_get_base_time(starting->appsrc);
+    pipeline_generation++;
+    memset(&sync_snapshot, 0, sizeof(sync_snapshot));
+    sync_snapshot.generation = pipeline_generation;
     g_atomic_int_set(&starting->expected_eos, FALSE);
     g_mutex_unlock(&renderer_mutex);
     return true;
@@ -495,6 +505,30 @@ bool audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
     }
     if (valid) {
         flow_result = gst_app_src_push_buffer(GST_APP_SRC(active->appsrc), buffer);
+        if (flow_result == GST_FLOW_OK) {
+            GstClockTime running = GST_CLOCK_TIME_NONE;
+            GstClock *clock = gst_element_get_clock(active->pipeline);
+            if (clock) {
+                const GstClockTime now = gst_clock_get_time(clock);
+                gst_object_unref(clock);
+                if (GST_CLOCK_TIME_IS_VALID(now) &&
+                    GST_CLOCK_TIME_IS_VALID(gst_audio_pipeline_base_time) &&
+                    now >= gst_audio_pipeline_base_time) {
+                    running = now - gst_audio_pipeline_base_time;
+                }
+            }
+            sync_snapshot.valid = TRUE;
+            sync_snapshot.sample_monotonic_us = (uint64_t) g_get_monotonic_time();
+            sync_snapshot.converted_ntp_ns = *ntp_time;
+            sync_snapshot.pipeline_base_ns = gst_audio_pipeline_base_time;
+            sync_snapshot.running_time_ns = running;
+            sync_snapshot.submitted_pts_ns = sync ? pts : GST_CLOCK_TIME_NONE;
+            sync_snapshot.target_clock_ns =
+                sync && G_MAXUINT64 - gst_audio_pipeline_base_time >= pts
+                    ? gst_audio_pipeline_base_time + pts
+                    : GST_CLOCK_TIME_NONE;
+            sync_snapshot.generation = pipeline_generation;
+        }
         g_mutex_unlock(&renderer_mutex);
         if (flow_result != GST_FLOW_OK) {
             logger_log(logger, LOGGER_ERR,
@@ -514,6 +548,16 @@ bool audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
         g_mutex_unlock(&renderer_mutex);
         return false;
     }
+}
+
+bool audio_renderer_get_sync_snapshot(audio_renderer_sync_snapshot_t *snapshot) {
+    if (!snapshot) {
+        return false;
+    }
+    g_mutex_lock(&renderer_mutex);
+    *snapshot = sync_snapshot;
+    g_mutex_unlock(&renderer_mutex);
+    return snapshot->valid;
 }
 
 void audio_renderer_set_volume(double volume) {

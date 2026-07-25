@@ -47,6 +47,30 @@ typedef enum videoflip_e {
 
 typedef struct video_renderer_s video_renderer_t;
 
+typedef enum video_renderer_rebase_reason_e {
+    VIDEO_RENDERER_REBASE_NONE = 0,
+    VIDEO_RENDERER_REBASE_INITIAL = 1,
+    VIDEO_RENDERER_REBASE_LATE = 2,
+    VIDEO_RENDERER_REBASE_FUTURE = 3
+} video_renderer_rebase_reason_t;
+
+typedef struct video_renderer_sync_snapshot_s {
+    bool valid;
+    uint64_t sample_monotonic_us;
+    uint64_t converted_ntp_ns;
+    uint64_t pipeline_base_ns;
+    uint64_t running_time_ns;
+    uint64_t source_pts_ns;
+    uint64_t submitted_pts_ns;
+    uint64_t target_clock_ns;
+    uint64_t rebase_count;
+    uint64_t last_rebase_old_pts_ns;
+    uint64_t last_rebase_new_pts_ns;
+    uint64_t last_rebase_correction_ns;
+    video_renderer_rebase_reason_t last_rebase_reason;
+    int sync_strategy;
+} video_renderer_sync_snapshot_t;
+
 void video_renderer_init (logger_t *logger, const char *server_name, videoflip_t videoflip[2], const char *parser,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options,
                           bool initial_fullscreen, bool video_sync, bool h265_support, guint playbin_version,
@@ -59,6 +83,7 @@ void video_renderer_set_start(float position);
 void video_renderer_resume ();
 bool video_renderer_is_paused();
 uint64_t  video_renderer_render_buffer (unsigned char* data, int *data_len, int *nal_count, uint64_t *ntp_time);
+bool video_renderer_get_sync_snapshot(video_renderer_sync_snapshot_t *snapshot);
 void video_renderer_flush ();
 unsigned int video_renderer_listen(void *loop, int id);
 void video_renderer_destroy ();

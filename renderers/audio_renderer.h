@@ -49,12 +49,24 @@ typedef void (*audio_renderer_event_callback_t)(
     double peak_db,
     const char *message);
 
+typedef struct audio_renderer_sync_snapshot_s {
+    bool valid;
+    uint64_t sample_monotonic_us;
+    uint64_t converted_ntp_ns;
+    uint64_t pipeline_base_ns;
+    uint64_t running_time_ns;
+    uint64_t submitted_pts_ns;
+    uint64_t target_clock_ns;
+    uint64_t generation;
+} audio_renderer_sync_snapshot_t;
+
 bool gstreamer_init();
 void audio_renderer_init(logger_t *logger, const char* audiosink, const bool *audio_sync, const bool *video_sync);
 void audio_renderer_set_event_callback(audio_renderer_event_callback_t callback, void *userdata);
 bool audio_renderer_start(unsigned char* compression_type);
 void audio_renderer_stop();
 bool audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time);
+bool audio_renderer_get_sync_snapshot(audio_renderer_sync_snapshot_t *snapshot);
 void audio_renderer_set_volume(double volume);
 void audio_renderer_flush();
 void audio_renderer_destroy();

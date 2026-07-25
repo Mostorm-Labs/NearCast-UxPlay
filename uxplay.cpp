@@ -38,6 +38,7 @@
 #include <math.h>
 #include <random>
 #include <atomic>
+#include <mutex>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
 #include <glib.h>
@@ -72,6 +73,7 @@
 #include "renderers/native_window.h"
 #include "mongoose.h"
 #include "audio_recovery_policy.h"
+#include "av_sync_diagnostics.h"
 
 #define VERSION "1.72"
 
@@ -183,6 +185,35 @@ static bool nofreeze = false;
 static unsigned short raop_port;
 static unsigned short airplay_port;
 static uint64_t remote_clock_offset = 0;
+struct AvSyncInputDiagnostics {
+    uint64_t audioRawRemoteNs = 0;
+    uint64_t audioConvertedNs = 0;
+    uint64_t audioSampleUs = 0;
+    uint64_t videoRawRemoteNs = 0;
+    uint64_t videoConvertedNs = 0;
+    uint64_t videoSampleUs = 0;
+    uint64_t remoteClockOffset = 0;
+    uint64_t resendRequestCount = 0;
+    uint64_t resendRequestedPacketCount = 0;
+    uint64_t resendFailureCount = 0;
+    uint64_t resentPacketCount = 0;
+    uint64_t lastResendRequestLocalNs = 0;
+    uint64_t lastResendFailureLocalNs = 0;
+    uint64_t lastResentPacketLocalNs = 0;
+    uint64_t rtpSyncUpdateCount = 0;
+    uint64_t lastRtpSyncUpdateLocalNs = 0;
+    int64_t lastRtpSyncOffsetChangeNs = 0;
+    raop_ntp_diagnostics_t ntp{};
+    uint64_t recoveryCount = 0;
+    uint64_t recoveryStartUs = 0;
+    uint64_t recoveryEndUs = 0;
+    uint64_t recoveryBaseBeforeNs = 0;
+    uint64_t recoveryBaseAfterNs = 0;
+    uint64_t nextLogUs = 0;
+};
+static std::mutex av_sync_diagnostics_mutex;
+static AvSyncInputDiagnostics av_sync_diagnostics;
+static uxplay_av_sync::SessionClockState av_sync_session_clock;
 static std::atomic_bool media_handoff_in_progress{false};
 static std::vector<std::string> allowed_clients;
 static std::vector<std::string> blocked_clients;
@@ -333,6 +364,192 @@ static uint64_t audio_monotonic_time_us() {
     return static_cast<uint64_t>(g_get_monotonic_time());
 }
 
+static void av_sync_diagnostics_reset() {
+    std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+    av_sync_diagnostics = AvSyncInputDiagnostics{};
+    av_sync_session_clock = uxplay_av_sync::SessionClockState{};
+}
+
+static const char *av_sync_strategy_name() {
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_ABSOLUTE_NTP
+    return "ABSOLUTE_NTP";
+#elif UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_SESSION_ANCHOR
+    return "SESSION_ANCHOR";
+#else
+    return "LEGACY_REBASE";
+#endif
+}
+
+static uint64_t av_sync_map_timestamp(uint64_t converted_local_ns) {
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_SESSION_ANCHOR
+    std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+    return uxplay_av_sync::MapSessionTimestamp(
+        av_sync_session_clock, converted_local_ns, get_local_time());
+#else
+    return converted_local_ns;
+#endif
+}
+
+static void av_sync_adjust_session_anchor(uint64_t adjustment_ns) {
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_SESSION_ANCHOR
+    std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+    av_sync_session_clock.targetAnchorNs = uxplay_av_sync::SaturatingAdd(
+        av_sync_session_clock.targetAnchorNs, adjustment_ns);
+#else
+    (void) adjustment_ns;
+#endif
+}
+
+static void av_sync_reset_format_anchor() {
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_SESSION_ANCHOR
+    std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+    av_sync_session_clock = uxplay_av_sync::SessionClockState{};
+#endif
+}
+
+static void av_sync_note_audio_input(
+    uint64_t raw_remote_ns,
+    uint64_t converted_ns,
+    const audio_decode_struct& data) {
+    std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+    av_sync_diagnostics.audioRawRemoteNs = raw_remote_ns;
+    av_sync_diagnostics.audioConvertedNs = converted_ns;
+    av_sync_diagnostics.audioSampleUs = audio_monotonic_time_us();
+    av_sync_diagnostics.remoteClockOffset = remote_clock_offset;
+    av_sync_diagnostics.resendRequestCount = data.resend_request_count;
+    av_sync_diagnostics.resendRequestedPacketCount = data.resend_requested_packet_count;
+    av_sync_diagnostics.resendFailureCount = data.resend_failure_count;
+    av_sync_diagnostics.resentPacketCount = data.resent_packet_count;
+    av_sync_diagnostics.lastResendRequestLocalNs = data.last_resend_request_local_ns;
+    av_sync_diagnostics.lastResendFailureLocalNs = data.last_resend_failure_local_ns;
+    av_sync_diagnostics.lastResentPacketLocalNs = data.last_resent_packet_local_ns;
+    av_sync_diagnostics.rtpSyncUpdateCount = data.rtp_sync_update_count;
+    av_sync_diagnostics.lastRtpSyncUpdateLocalNs = data.last_rtp_sync_update_local_ns;
+    av_sync_diagnostics.lastRtpSyncOffsetChangeNs = data.last_rtp_sync_offset_change_ns;
+    av_sync_diagnostics.ntp = data.ntp_diagnostics;
+}
+
+static void av_sync_note_video_input(uint64_t raw_remote_ns, uint64_t converted_ns) {
+    std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+    av_sync_diagnostics.videoRawRemoteNs = raw_remote_ns;
+    av_sync_diagnostics.videoConvertedNs = converted_ns;
+    av_sync_diagnostics.videoSampleUs = audio_monotonic_time_us();
+    av_sync_diagnostics.remoteClockOffset = remote_clock_offset;
+}
+
+static int64_t av_sync_event_age_ms(uint64_t now_ns, uint64_t event_ns) {
+    if (event_ns == 0 || now_ns < event_ns) {
+        return -1;
+    }
+    const uint64_t age_ms = (now_ns - event_ns) / 1000000ULL;
+    return age_ms > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+        ? std::numeric_limits<int64_t>::max()
+        : static_cast<int64_t>(age_ms);
+}
+
+static uint64_t av_sync_time_or_zero(uint64_t value) {
+    return value == UINT64_MAX ? 0 : value;
+}
+
+static void av_sync_emit_diagnostics(uint64_t now_us) {
+    AvSyncInputDiagnostics input;
+    {
+        std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+        if ((av_sync_diagnostics.audioSampleUs == 0 &&
+             av_sync_diagnostics.videoSampleUs == 0) ||
+            now_us < av_sync_diagnostics.nextLogUs) {
+            return;
+        }
+        av_sync_diagnostics.nextLogUs = now_us + 2000000ULL;
+        input = av_sync_diagnostics;
+    }
+
+    audio_renderer_sync_snapshot_t audio{};
+    video_renderer_sync_snapshot_t video{};
+    const bool have_audio = audio_renderer_get_sync_snapshot(&audio);
+    const bool have_video = video_renderer_get_sync_snapshot(&video);
+    const bool comparable = have_audio && have_video &&
+        uxplay_av_sync::SamplesComparable(
+            audio.sample_monotonic_us, video.sample_monotonic_us) &&
+        audio.target_clock_ns != UINT64_MAX &&
+        video.target_clock_ns != UINT64_MAX;
+
+    int64_t av_delta_ns = 0;
+    int64_t av_source_delta_ns = 0;
+    int64_t audio_adjustment_ns = 0;
+    int64_t video_adjustment_ns = 0;
+    int64_t av_adjustment_delta_ns = 0;
+    if (comparable) {
+        av_delta_ns = uxplay_av_sync::SignedDelta(
+            audio.target_clock_ns, video.target_clock_ns);
+        av_source_delta_ns = uxplay_av_sync::SignedDelta(
+            audio.converted_ntp_ns, video.converted_ntp_ns);
+        audio_adjustment_ns = uxplay_av_sync::SignedDelta(
+            audio.target_clock_ns, audio.converted_ntp_ns);
+        video_adjustment_ns = uxplay_av_sync::SignedDelta(
+            video.target_clock_ns, video.converted_ntp_ns);
+        av_adjustment_delta_ns = uxplay_av_sync::SaturatingSubtract(
+            audio_adjustment_ns, video_adjustment_ns);
+    }
+
+    const uint64_t wall_now_ns = get_local_time();
+    log(LOGGER_INFO,
+        "av_sync_diag: strategy=%d comparable=%d "
+        "audio_raw_ntp=%llu video_raw_ntp=%llu audio_ntp=%llu video_ntp=%llu "
+        "audio_base=%llu video_base=%llu audio_pts=%llu video_pts=%llu "
+        "audio_running=%llu video_running=%llu audio_target=%llu video_target=%llu "
+        "av_delta_ns=%lld av_source_delta_ns=%lld audio_adjustment_ns=%lld "
+        "video_adjustment_ns=%lld av_adjustment_delta_ns=%lld "
+        "remote_clock_offset=%llu audio_generation=%llu video_rebase_count=%llu "
+        "video_rebase_reason=%d video_rebase_correction_ns=%llu "
+        "audio_recovery_count=%llu recovery_base_before=%llu recovery_base_after=%llu "
+        "resend_requests=%llu resend_requested_packets=%llu resent_packets=%llu resend_failures=%llu "
+        "last_resend_request_age_ms=%lld last_resent_packet_age_ms=%lld last_resend_failure_age_ms=%lld "
+        "rtp_sync_updates=%llu rtp_sync_offset_change_ns=%lld rtp_sync_age_ms=%lld "
+        "ntp_updates=%llu ntp_correction_ns=%lld ntp_offset_ns=%lld ntp_delay_ns=%lld ntp_age_ms=%lld",
+        UXPLAY_AV_SYNC_STRATEGY, comparable ? 1 : 0,
+        static_cast<unsigned long long>(input.audioRawRemoteNs),
+        static_cast<unsigned long long>(input.videoRawRemoteNs),
+        static_cast<unsigned long long>(input.audioConvertedNs),
+        static_cast<unsigned long long>(input.videoConvertedNs),
+        static_cast<unsigned long long>(have_audio ? audio.pipeline_base_ns : 0),
+        static_cast<unsigned long long>(have_video ? video.pipeline_base_ns : 0),
+        static_cast<unsigned long long>(have_audio ? av_sync_time_or_zero(audio.submitted_pts_ns) : 0),
+        static_cast<unsigned long long>(have_video ? av_sync_time_or_zero(video.submitted_pts_ns) : 0),
+        static_cast<unsigned long long>(have_audio ? av_sync_time_or_zero(audio.running_time_ns) : 0),
+        static_cast<unsigned long long>(have_video ? av_sync_time_or_zero(video.running_time_ns) : 0),
+        static_cast<unsigned long long>(have_audio ? av_sync_time_or_zero(audio.target_clock_ns) : 0),
+        static_cast<unsigned long long>(have_video ? av_sync_time_or_zero(video.target_clock_ns) : 0),
+        static_cast<long long>(av_delta_ns),
+        static_cast<long long>(av_source_delta_ns),
+        static_cast<long long>(audio_adjustment_ns),
+        static_cast<long long>(video_adjustment_ns),
+        static_cast<long long>(av_adjustment_delta_ns),
+        static_cast<unsigned long long>(input.remoteClockOffset),
+        static_cast<unsigned long long>(have_audio ? audio.generation : 0),
+        static_cast<unsigned long long>(have_video ? video.rebase_count : 0),
+        have_video ? static_cast<int>(video.last_rebase_reason) : 0,
+        static_cast<unsigned long long>(have_video ? video.last_rebase_correction_ns : 0),
+        static_cast<unsigned long long>(input.recoveryCount),
+        static_cast<unsigned long long>(input.recoveryBaseBeforeNs),
+        static_cast<unsigned long long>(input.recoveryBaseAfterNs),
+        static_cast<unsigned long long>(input.resendRequestCount),
+        static_cast<unsigned long long>(input.resendRequestedPacketCount),
+        static_cast<unsigned long long>(input.resentPacketCount),
+        static_cast<unsigned long long>(input.resendFailureCount),
+        static_cast<long long>(av_sync_event_age_ms(wall_now_ns, input.lastResendRequestLocalNs)),
+        static_cast<long long>(av_sync_event_age_ms(wall_now_ns, input.lastResentPacketLocalNs)),
+        static_cast<long long>(av_sync_event_age_ms(wall_now_ns, input.lastResendFailureLocalNs)),
+        static_cast<unsigned long long>(input.rtpSyncUpdateCount),
+        static_cast<long long>(input.lastRtpSyncOffsetChangeNs),
+        static_cast<long long>(av_sync_event_age_ms(wall_now_ns, input.lastRtpSyncUpdateLocalNs)),
+        static_cast<unsigned long long>(input.ntp.update_count),
+        static_cast<long long>(input.ntp.last_correction_ns),
+        static_cast<long long>(input.ntp.offset_ns),
+        static_cast<long long>(input.ntp.delay_ns),
+        static_cast<long long>(av_sync_event_age_ms(wall_now_ns, input.ntp.last_update_local_ns)));
+}
+
 static bool audio_recovery_is_pending() {
     if (!audio_control_mutex_initialized) {
         return audio_recovery_pending;
@@ -436,9 +653,26 @@ static void handle_audio_renderer_event(
         attempts_reset = uxplay_audio_recovery::NoteOutputAndMaybeReset(audio_health, now_us);
         MUTEX_UNLOCK(audio_control_mutex);
         if (recovered) {
+            audio_renderer_sync_snapshot_t snapshot{};
+            audio_renderer_get_sync_snapshot(&snapshot);
+            uint64_t recovery_elapsed_ms = 0;
+            {
+                std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+                av_sync_diagnostics.recoveryEndUs = now_us;
+                av_sync_diagnostics.recoveryBaseAfterNs = snapshot.valid
+                    ? snapshot.pipeline_base_ns
+                    : 0;
+                if (av_sync_diagnostics.recoveryStartUs != 0 &&
+                    now_us >= av_sync_diagnostics.recoveryStartUs) {
+                    recovery_elapsed_ms =
+                        (now_us - av_sync_diagnostics.recoveryStartUs) / 1000;
+                }
+            }
             log(LOGGER_INFO,
-                "audio recovery restored decoded output: ct=%u attempt=%u rms_db=%.2f peak_db=%.2f",
-                compression_type_value, attempt, rms_db, peak_db);
+                "audio recovery restored decoded output: ct=%u attempt=%u rms_db=%.2f peak_db=%.2f elapsed_ms=%llu base_after=%llu",
+                compression_type_value, attempt, rms_db, peak_db,
+                static_cast<unsigned long long>(recovery_elapsed_ms),
+                static_cast<unsigned long long>(snapshot.valid ? snapshot.pipeline_base_ns : 0));
         } else if (attempts_reset) {
             log(LOGGER_INFO, "audio recovery counter reset after stable decoded output");
         }
@@ -620,6 +854,7 @@ static void audio_renderer_stop_now(const char *reason) {
 static void begin_media_handoff_boundary(const char *reason) {
     media_handoff_in_progress.store(true, std::memory_order_release);
     remote_clock_offset = 0;
+    av_sync_diagnostics_reset();
     compression_type = 0;
     audio_recovery_reset(reason ? reason : "handoff-boundary");
     if (audio_renderer_initialized) {
@@ -630,6 +865,7 @@ static void begin_media_handoff_boundary(const char *reason) {
 
 static void end_media_handoff_boundary(const char *reason) {
     remote_clock_offset = 0;
+    av_sync_diagnostics_reset();
     compression_type = 0;
     const bool was_active = media_handoff_in_progress.exchange(false, std::memory_order_acq_rel);
     if (was_active) {
@@ -1880,6 +2116,7 @@ static gboolean audio_stop_callback(gpointer loop) {
     }
 
     const uint64_t now_us = audio_monotonic_time_us();
+    av_sync_emit_diagnostics(now_us);
     bool start_recovery = false;
     bool watchdog_stall = false;
     std::string recovery_reason;
@@ -1926,6 +2163,18 @@ static gboolean audio_stop_callback(gpointer loop) {
             static_cast<unsigned long long>(output_age_us / 1000));
     }
     if (start_recovery) {
+        audio_renderer_sync_snapshot_t snapshot{};
+        audio_renderer_get_sync_snapshot(&snapshot);
+        {
+            std::lock_guard<std::mutex> lock(av_sync_diagnostics_mutex);
+            av_sync_diagnostics.recoveryCount++;
+            av_sync_diagnostics.recoveryStartUs = now_us;
+            av_sync_diagnostics.recoveryEndUs = 0;
+            av_sync_diagnostics.recoveryBaseBeforeNs = snapshot.valid
+                ? snapshot.pipeline_base_ns
+                : 0;
+            av_sync_diagnostics.recoveryBaseAfterNs = 0;
+        }
         log(LOGGER_WARNING, "audio recovery starting: reason=%s attempt=%u",
             recovery_reason.c_str(), recovery_attempt);
         audio_renderer_start_stop_worker(recovery_reason.c_str());
@@ -3371,6 +3620,7 @@ extern "C" void video_reset(void *cls) {
     video_renderer_stop();
     url.erase();
     remote_clock_offset = 0;
+    av_sync_diagnostics_reset();
     relaunch_video = true;
     reset_loop = true;
 }
@@ -3385,6 +3635,11 @@ extern "C" void handoff_start(void *cls) {
 }
 
 extern "C" int video_set_codec(void *cls, video_codec_t codec) {
+    static video_codec_t previous_codec = VIDEO_CODEC_UNKNOWN;
+    if (previous_codec != VIDEO_CODEC_UNKNOWN && previous_codec != codec) {
+        av_sync_reset_format_anchor();
+    }
+    previous_codec = codec;
     bool video_is_h265 = (codec == VIDEO_CODEC_H265);
     return video_renderer_choose_codec(video_is_h265);
 }
@@ -3445,6 +3700,7 @@ extern "C" void conn_destroy (void *cls) {
     if (connections == 0) {
         end_media_handoff_boundary("all-connections-closed");
         remote_clock_offset = 0;
+        av_sync_diagnostics_reset();
         compression_type = 0;
         audio_recovery_reset("all-connections-closed");
         if (audio_renderer_initialized) {
@@ -3550,11 +3806,18 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
         }
         audio_recovery_note_started(now_us);
     }
+    const uint64_t raw_remote_ns = data->ntp_time_remote;
     if (!remote_clock_offset) {
         uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
         remote_clock_offset = local_time - data->ntp_time_remote;
     }
-    data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+    uint64_t converted_ns = raw_remote_ns + remote_clock_offset;
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_SESSION_ANCHOR
+    if (data->ntp_time_local) {
+        converted_ns = data->ntp_time_local;
+    }
+#endif
+    data->ntp_time_remote = av_sync_map_timestamp(converted_ns);
     switch (data->ct) {
     case 2:
         if (audio_delay_alac) {
@@ -3570,6 +3833,7 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
     default:
         break;
     }
+    av_sync_note_audio_input(raw_remote_ns, data->ntp_time_remote, *data);
     if (audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote))) {
         audio_recovery_note_push(audio_monotonic_time_us());
     }
@@ -3583,6 +3847,7 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
         return;
     }
     if (use_video) {
+        const uint64_t raw_remote_ns = data->ntp_time_remote;
         if (!remote_clock_offset) {
             uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
             remote_clock_offset = local_time - data->ntp_time_remote;
@@ -3590,14 +3855,29 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
         int count = 0;
 	    uint64_t pts_mismatch = 0;
 	    do {
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_LEGACY_REBASE
             data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+#else
+            uint64_t converted_ns = raw_remote_ns + remote_clock_offset;
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_SESSION_ANCHOR
+            if (data->ntp_time_local) {
+                converted_ns = data->ntp_time_local;
+            }
+#endif
+            data->ntp_time_remote = av_sync_map_timestamp(converted_ns);
+#endif
             pts_mismatch = video_renderer_render_buffer(data->data, &(data->data_len), &(data->nal_count), &(data->ntp_time_remote));
             if (pts_mismatch) {
                 LOGI("adjust timestamps by %8.6f secs", (double) pts_mismatch / SECOND_IN_NSECS);
+#if UXPLAY_AV_SYNC_STRATEGY == UXPLAY_AV_SYNC_SESSION_ANCHOR
+                av_sync_adjust_session_anchor(pts_mismatch);
+#else
                 remote_clock_offset += pts_mismatch;
+#endif
             }
             count++;
         } while (pts_mismatch && count < 10);
+        av_sync_note_video_input(raw_remote_ns, data->ntp_time_remote);
     }
 }
 
@@ -3724,6 +4004,7 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     audio_type = type;
     
     if (previous_compression_type != 0 && previous_compression_type != *ct) {
+        av_sync_reset_format_anchor();
         audio_recovery_reset("audio-format-changed");
     }
     if (mirror_audio_is_enabled()) {
@@ -4428,6 +4709,8 @@ int main (int argc, char *argv[]) {
     render_logger = logger_init();
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
+    LOGI("UxPlay A/V sync diagnostics enabled: strategy=%s interval_ms=2000 comparable_window_ms=500",
+         av_sync_strategy_name());
 #ifdef _WIN32
     native_window_set_action_callback(native_window_control_action, NULL);
 #endif

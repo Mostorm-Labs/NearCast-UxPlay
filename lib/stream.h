@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "raop_ntp.h"
 
 typedef struct {
     bool is_h265;
@@ -39,6 +40,17 @@ typedef struct {
     uint64_t ntp_time_remote;
     uint64_t rtp_time;
     unsigned short seqnum;
+    uint64_t resend_request_count;
+    uint64_t resend_requested_packet_count;
+    uint64_t resend_failure_count;
+    uint64_t resent_packet_count;
+    uint64_t last_resend_request_local_ns;
+    uint64_t last_resend_failure_local_ns;
+    uint64_t last_resent_packet_local_ns;
+    uint64_t rtp_sync_update_count;
+    uint64_t last_rtp_sync_update_local_ns;
+    int64_t last_rtp_sync_offset_change_ns;
+    raop_ntp_diagnostics_t ntp_diagnostics;
 } audio_decode_struct;
 
 #endif //AIRPLAYSERVER_STREAM_H
