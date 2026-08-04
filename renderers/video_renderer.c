@@ -33,6 +33,19 @@
 #endif
 
 #define SECOND_IN_NSECS 1000000000UL
+
+/*
+ * Keep AirPlay's realtime clock private.  UxPlay runs in-process with the
+ * NearCast HID GStreamer backend, so changing the GstSystemClock singleton
+ * here can invalidate timestamps and base-times of an already-running HID
+ * pipeline.
+ */
+static GstClock *uxplay_realtime_clock_obtain(void) {
+    return GST_CLOCK(g_object_new(
+        GST_TYPE_SYSTEM_CLOCK,
+        "clock-type", GST_CLOCK_TYPE_REALTIME,
+        NULL));
+}
 #define SECOND_IN_MICROSECS 1000000
 #define GST_VIDEO_LATE_RESYNC_NS 200000000ULL
 #define GST_VIDEO_FUTURE_RESYNC_NS 200000000ULL
@@ -497,8 +510,7 @@ void  video_renderer_init(logger_t *render_logger, const char *server_name, vide
             }
             g_assert (renderer_type[i]->pipeline);
 
-            GstClock *clock = gst_system_clock_obtain();
-            g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
+            GstClock *clock = uxplay_realtime_clock_obtain();
             gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
             renderer_type[i]->appsrc = gst_bin_get_by_name (GST_BIN (renderer_type[i]->pipeline), "video_source");
             g_assert(renderer_type[i]->appsrc);
@@ -761,9 +773,9 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
     if (data[0]) {
         logger_log(logger, LOGGER_ERR, "*** ERROR decryption of video packet failed ");
     } else {
+        const bool show_native_window_after_push = first_packet;
         if (first_packet) {
             logger_log(logger, LOGGER_INFO, "Begin streaming to GStreamer video pipeline");
-            first_packet = false;
         }
         // if (sync) {
         //     if (GST_CLOCK_TIME_IS_VALID(debug_last_pts) && pts <= debug_last_pts) {
@@ -784,6 +796,14 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
         gst_buffer_fill(buffer, 0, data, *data_len);
         GstFlowReturn flow_ret = gst_app_src_push_buffer (GST_APP_SRC(renderer->appsrc), buffer);
         if (flow_ret == GST_FLOW_OK) {
+            if (show_native_window_after_push) {
+                first_packet = false;
+#ifdef _WIN32
+                if (use_native_window) {
+                    native_window_show();
+                }
+#endif
+            }
             sync_snapshot.valid = TRUE;
             sync_snapshot.sample_monotonic_us = (uint64_t) g_get_monotonic_time();
             sync_snapshot.converted_ntp_ns = *ntp_time;
@@ -1197,11 +1217,6 @@ int video_renderer_choose_codec (bool video_is_h265) {
         g_mutex_unlock(&renderer_mutex);
         return -1;
     } else if (renderer_used == renderer) {
-#ifdef _WIN32
-        if (use_native_window) {
-            native_window_show();
-        }
-#endif
         g_mutex_unlock(&renderer_mutex);
         return 0;
     } else if (renderer) {
@@ -1237,11 +1252,6 @@ int video_renderer_choose_codec (bool video_is_h265) {
     if (renderer == renderer_type[1]) {
         logger_log(logger, LOGGER_INFO, "*** video format is h265 high definition (HD/4K) video %dx%d", width, height);
     }
-#ifdef _WIN32
-    if (use_native_window) {
-        native_window_show();
-    }
-#endif
     if (renderer_unused) {
         for (int i = 0; i < n_renderers; i++) {
             if (renderer_type[i] != renderer_unused) {

@@ -1064,7 +1064,27 @@ static void control_state_get_snapshot(unsigned int *connections, bool *mirrorin
     }
 }
 
-static bool control_state_note_client(const char *name, const char *model, const char *device_id) {
+static void control_state_note_client(const char *name, const char *model, const char *device_id) {
+    if (control_state_mutex_initialized) {
+        MUTEX_LOCK(control_state_mutex);
+    }
+    control_client_name = (name ? name : "");
+    control_client_model = (model ? model : "");
+    control_client_device_id = (device_id ? device_id : "");
+    // Authentication/client admission is not yet a renderable cast session.
+    // Cache the identity and consume the PIN challenge, but wait for the first
+    // successfully admitted media packet before publishing sessionStarted.
+    control_pin_prompt_announced = false;
+    if (control_state_mutex_initialized) {
+        MUTEX_UNLOCK(control_state_mutex);
+    }
+
+#ifdef _WIN32
+    native_window_set_pin(NULL, false);
+#endif
+}
+
+static bool control_state_note_media_started(const char *media_kind) {
     bool should_announce = false;
     std::string event_client;
     std::string event_model;
@@ -1073,14 +1093,6 @@ static bool control_state_note_client(const char *name, const char *model, const
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    control_client_name = (name ? name : "");
-    control_client_model = (model ? model : "");
-    control_client_device_id = (device_id ? device_id : "");
-    // A successful authenticated client is the handoff from the PIN
-    // challenge to a real AirPlay session.  Do not leave the challenge
-    // marker armed, otherwise a later connection close could be mistaken for
-    // cancellation of the authenticated session.
-    control_pin_prompt_announced = false;
     if (open_connections > 0 && !control_mirror_started_announced) {
         control_mirror_started_announced = true;
         should_announce = true;
@@ -1092,10 +1104,9 @@ static bool control_state_note_client(const char *name, const char *model, const
         MUTEX_UNLOCK(control_state_mutex);
     }
 
-#ifdef _WIN32
-    native_window_set_pin(NULL, false);
-#endif
     if (should_announce) {
+        LOGI("AirPlay media session started on first %s packet",
+             media_kind ? media_kind : "media");
         reset_mirror_audio_to_default_mute("session-started");
         std::string data = "{\"sessionId\":\"current\",\"source\":{\"device\":" + json_string_or_null(event_client) +
                            ",\"model\":" + json_string_or_null(event_model) +
@@ -3772,10 +3783,7 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
     if (*admit) {
         end_media_handoff_boundary("client-admitted");
         reset_mirror_audio_to_default_mute("client-admitted");
-        const bool announced_session_started = control_state_note_client(name, model, deviceid);
-        if (auto_rotate_pin_enabled && raop && !announced_session_started) {
-            raop_rotate_pin(raop, "client-admitted");
-        }
+        control_state_note_client(name, model, deviceid);
     } else {
         end_media_handoff_boundary("client-denied");
     }
@@ -3836,6 +3844,7 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
     av_sync_note_audio_input(raw_remote_ns, data->ntp_time_remote, *data);
     if (audio_renderer_render_buffer(data->data, &(data->data_len), &(data->seqnum), &(data->ntp_time_remote))) {
         audio_recovery_note_push(audio_monotonic_time_us());
+        control_state_note_media_started("audio");
     }
 }
 
@@ -3878,6 +3887,9 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
             count++;
         } while (pts_mismatch && count < 10);
         av_sync_note_video_input(raw_remote_ns, data->ntp_time_remote);
+        if (data->data && data->data_len > 0 && data->data[0] == 0) {
+            control_state_note_media_started("video");
+        }
     }
 }
 

@@ -27,6 +27,20 @@
 #include "audio_renderer.h"
 #define SECOND_IN_NSECS 1000000000UL
 
+/*
+ * UxPlay is hosted in the NearCast process alongside the HID GStreamer
+ * backend.  gst_system_clock_obtain() returns the process-wide singleton;
+ * changing its clock-type would therefore move an already-running HID
+ * pipeline from monotonic time to realtime (or vice versa).  Keep AirPlay's
+ * realtime clock private instead of mutating that shared singleton.
+ */
+static GstClock *uxplay_realtime_clock_obtain(void) {
+    return GST_CLOCK(g_object_new(
+        GST_TYPE_SYSTEM_CLOCK,
+        "clock-type", GST_CLOCK_TYPE_REALTIME,
+        NULL));
+}
+
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
 
 static GstClockTime gst_audio_pipeline_base_time = GST_CLOCK_TIME_NONE;
@@ -209,8 +223,7 @@ bool gstreamer_init(){
 void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync) {
     GError *error = NULL;
     GstCaps *caps = NULL;
-    GstClock *clock = gst_system_clock_obtain();
-    g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
+    GstClock *clock = uxplay_realtime_clock_obtain();
 
     logger = render_logger;
     desired_volume = 1.0;
