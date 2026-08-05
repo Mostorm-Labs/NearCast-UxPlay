@@ -74,6 +74,7 @@
 #include "mongoose.h"
 #include "audio_recovery_policy.h"
 #include "av_sync_diagnostics.h"
+#include "control_session_state.h"
 
 #define VERSION "1.72"
 
@@ -115,7 +116,6 @@ static int64_t audio_delay_alac = 0;
 static int64_t audio_delay_aac = 0;
 static bool relaunch_video = false;
 static bool reset_loop = false;
-static unsigned int open_connections= 0;
 static std::string videosink = "autovideosink";
 static std::string videosink_options = "";
 static videoflip_t videoflip[2] = { NONE , NONE };
@@ -261,8 +261,7 @@ struct WsControlEvent {
 static std::deque<WsControlEvent> ws_control_event_queue;
 static mutex_handle_t control_state_mutex;
 static bool control_state_mutex_initialized = false;
-static bool control_mirror_started_announced = false;
-static bool control_pin_prompt_announced = false;
+static uxplay_control::SessionState control_session_state;
 static std::string control_client_name = "";
 static std::string control_client_model = "";
 static std::string control_client_device_id = "";
@@ -1025,7 +1024,7 @@ static void ws_control_queue_event(const std::string &op, const std::string &dat
     MUTEX_UNLOCK(ws_control_mutex);
 }
 
-static void publish_mirror_audio_state(bool enabled) {
+static void publish_mirror_audio_state(bool enabled, bool notify_status = true) {
 #ifdef _WIN32
     native_window_set_muted(!enabled);
 #endif
@@ -1034,10 +1033,12 @@ static void publish_mirror_audio_state(bool enabled) {
         : "{\"enabled\":false,\"muted\":true,\"source\":\"backend\"}";
     ws_control_queue_event("cast.audioChanged", payload);
     embedded_emit_event("cast.audioChanged", payload);
-    ws_queue_status_changed_event();
+    if (notify_status) {
+        ws_queue_status_changed_event();
+    }
 }
 
-static void reset_mirror_audio_to_default_mute(const char *reason) {
+static void reset_mirror_audio_to_default_mute(const char *reason, bool notify_status = true) {
     if (!default_mirror_audio_muted) {
         return;
     }
@@ -1045,7 +1046,7 @@ static void reset_mirror_audio_to_default_mute(const char *reason) {
     LOGI("mirror audio reset to muted for AirPlay session boundary: %s%s",
          reason ? reason : "unknown",
          changed ? "" : " (already muted)");
-    publish_mirror_audio_state(false);
+    publish_mirror_audio_state(false, notify_status);
 }
 
 static void control_state_get_snapshot(unsigned int *connections, bool *mirroring,
@@ -1054,8 +1055,8 @@ static void control_state_get_snapshot(unsigned int *connections, bool *mirrorin
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    if (connections) *connections = open_connections;
-    if (mirroring) *mirroring = control_mirror_started_announced;
+    if (connections) *connections = control_session_state.openConnections;
+    if (mirroring) *mirroring = control_session_state.mirrorStartedAnnounced;
     if (client) *client = control_client_name;
     if (model) *model = control_client_model;
     if (device_id) *device_id = control_client_device_id;
@@ -1074,7 +1075,7 @@ static void control_state_note_client(const char *name, const char *model, const
     // Authentication/client admission is not yet a renderable cast session.
     // Cache the identity and consume the PIN challenge, but wait for the first
     // successfully admitted media packet before publishing sessionStarted.
-    control_pin_prompt_announced = false;
+    control_session_state.NoteClientAdmitted();
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
@@ -1086,34 +1087,31 @@ static void control_state_note_client(const char *name, const char *model, const
 
 static bool control_state_note_media_started(const char *media_kind) {
     bool should_announce = false;
-    std::string event_client;
-    std::string event_model;
-    std::string event_device_id;
 
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    if (open_connections > 0 && !control_mirror_started_announced) {
-        control_mirror_started_announced = true;
+    if (control_session_state.TryAnnounceMediaStart()) {
         should_announce = true;
-        event_client = control_client_name;
-        event_model = control_client_model;
-        event_device_id = control_client_device_id;
+        LOGI("AirPlay media session started on first %s packet",
+             media_kind ? media_kind : "media");
+        // State transition and event publication share the same lock. A stop
+        // can therefore occur wholly before this start (and revoke admission)
+        // or wholly after it, but can never interleave between the check and
+        // the event callback.
+        reset_mirror_audio_to_default_mute("session-started", false);
+        std::string data = "{\"sessionId\":\"current\",\"source\":{\"device\":" + json_string_or_null(control_client_name) +
+                           ",\"model\":" + json_string_or_null(control_client_model) +
+                           ",\"deviceId\":" + json_string_or_null(control_client_device_id) +
+                           ",\"ip\":null},\"protocol\":\"airplay\"}";
+        ws_control_queue_event("cast.sessionStarted", data);
+        embedded_emit_event("cast.sessionStarted", data.c_str());
     }
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
 
     if (should_announce) {
-        LOGI("AirPlay media session started on first %s packet",
-             media_kind ? media_kind : "media");
-        reset_mirror_audio_to_default_mute("session-started");
-        std::string data = "{\"sessionId\":\"current\",\"source\":{\"device\":" + json_string_or_null(event_client) +
-                           ",\"model\":" + json_string_or_null(event_model) +
-                           ",\"deviceId\":" + json_string_or_null(event_device_id) +
-                           ",\"ip\":null},\"protocol\":\"airplay\"}";
-        ws_control_queue_event("cast.sessionStarted", data);
-        embedded_emit_event("cast.sessionStarted", data.c_str());
         if (auto_rotate_pin_enabled && raop) {
             raop_rotate_pin(raop, "session-started");
         }
@@ -1126,7 +1124,7 @@ static void control_state_note_pin_prompt() {
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    control_pin_prompt_announced = true;
+    control_session_state.NotePinPrompt();
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
@@ -1137,8 +1135,7 @@ static bool control_state_connection_opened() {
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    open_connections++;
-    first_connection = (open_connections == 1);
+    first_connection = control_session_state.ConnectionOpened();
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
@@ -1151,10 +1148,8 @@ static bool control_state_connection_closed() {
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    if (open_connections > 0) {
-        open_connections--;
-    }
-    if (open_connections == 0) {
+    stopped = control_session_state.ConnectionClosed();
+    if (control_session_state.openConnections == 0) {
         all_connections_closed = true;
         // The connection which asks for a PIN is an authentication
         // challenge, not a user-visible cast session.  AirPlay commonly
@@ -1162,61 +1157,55 @@ static bool control_state_connection_closed() {
         // dialog and opens a fresh connection after the PIN is entered.  A
         // sessionStopped event here would therefore report a false stop
         // immediately after pinCodeRequired.
-        stopped = control_mirror_started_announced;
-        control_mirror_started_announced = false;
-        // Keep the prompt marker while authentication is pending.  An
-        // explicit stop/teardown can then report cancellation even though
-        // the challenge connection itself has already gone away.
-        if (stopped) {
-            control_pin_prompt_announced = false;
-        }
         control_client_name.clear();
         control_client_model.clear();
         control_client_device_id.clear();
+        // Keep the audio/session event order atomic with respect to a new
+        // media start. ws status is queued after unlocking because it takes a
+        // control-state snapshot itself.
+        reset_mirror_audio_to_default_mute("all-connections-closed", false);
+        if (stopped) {
+            const std::string payload =
+                "{\"sessionId\":\"current\",\"reason\":\"connection_closed\"}";
+            ws_control_queue_event("cast.sessionStopped", payload);
+            embedded_emit_event("cast.sessionStopped", payload.c_str());
+        }
     }
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
     if (all_connections_closed) {
-        reset_mirror_audio_to_default_mute("all-connections-closed");
+        ws_queue_status_changed_event();
     }
     return stopped;
 }
 
-enum class ControlStopState {
-    None,
-    Mirror,
-    PinPrompt,
-};
-
-static ControlStopState control_state_take_stop_state() {
-    ControlStopState state = ControlStopState::None;
+static uxplay_control::StopState control_state_stop_and_publish(
+    const char *reason, bool publish_without_active_state) {
+    uxplay_control::StopState state = uxplay_control::StopState::None;
+    bool published = false;
     if (control_state_mutex_initialized) {
         MUTEX_LOCK(control_state_mutex);
     }
-    if (control_mirror_started_announced) {
-        state = ControlStopState::Mirror;
-    } else if (control_pin_prompt_announced) {
-        state = ControlStopState::PinPrompt;
-    }
-    control_mirror_started_announced = false;
-    control_pin_prompt_announced = false;
+    state = control_session_state.TakeStopState();
     control_client_name.clear();
     control_client_model.clear();
     control_client_device_id.clear();
+    if (state != uxplay_control::StopState::None || publish_without_active_state) {
+        const std::string stop_reason = reason ? reason : "unknown";
+        const std::string payload = std::string("{\"sessionId\":\"current\",\"reason\":\"") +
+            stop_reason + "\"}";
+        ws_control_queue_event("cast.sessionStopped", payload);
+        embedded_emit_event("cast.sessionStopped", payload.c_str());
+        published = true;
+    }
     if (control_state_mutex_initialized) {
         MUTEX_UNLOCK(control_state_mutex);
     }
+    if (published) {
+        ws_queue_status_changed_event();
+    }
     return state;
-}
-
-static void publish_control_session_stopped(const char *reason) {
-    const std::string stopReason = reason ? reason : "unknown";
-    const std::string payload = std::string("{\"sessionId\":\"current\",\"reason\":\"") +
-        stopReason + "\"}";
-    ws_control_queue_event("cast.sessionStopped", payload);
-    embedded_emit_event("cast.sessionStopped", payload.c_str());
-    ws_queue_status_changed_event();
 }
 
 static std::string generate_ws_control_token() {
@@ -3722,7 +3711,7 @@ extern "C" void conn_destroy (void *cls) {
         }    
     }
     if (stopped) {
-        publish_control_session_stopped("connection_closed");
+        LOGI("AirPlay session stopped after the last connection closed");
     }
 }
 
@@ -3756,8 +3745,7 @@ extern "C" void conn_teardown(void *cls, bool *teardown_96, bool *teardown_110) 
         // TEARDOWN is an explicit sender-side end signal.  It is also the
         // signal available when the sender cancels a PIN challenge, so it
         // must consume both an authenticated session and a pending prompt.
-        control_state_take_stop_state();
-        publish_control_session_stopped("teardown");
+        control_state_stop_and_publish("teardown", true);
     }
     if (*teardown_110 && close_window) {
         relaunch_video = true;
@@ -4170,10 +4158,7 @@ extern "C" void on_video_stop(void *cls) {
     // event before the HTTP layer removes the remaining connections; this is
     // important for a PIN-only flow because its challenge connection is
     // normally already closed by the time the sender cancels.
-    const ControlStopState state = control_state_take_stop_state();
-    if (state != ControlStopState::None) {
-        publish_control_session_stopped("externalRequest");
-    }
+    control_state_stop_and_publish("externalRequest", false);
 }
 
 extern "C" void on_video_acquire_playback_info (void *cls, playback_info_t *playback_info) {
@@ -4567,6 +4552,10 @@ int main (int argc, char *argv[]) {
     audio_recovery_waiting_for_output = false;
     audio_recovery_not_before_us = 0;
     audio_recovery_reason.clear();
+    control_session_state = {};
+    control_client_name.clear();
+    control_client_model.clear();
+    control_client_device_id.clear();
     MUTEX_CREATE(control_state_mutex);
     control_state_mutex_initialized = true;
     MUTEX_CREATE(ws_control_mutex);
