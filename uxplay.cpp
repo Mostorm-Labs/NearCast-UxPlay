@@ -125,6 +125,11 @@ static std::string audiosink = "autoaudiosink";
 static int  audiodelay = -1;
 static bool use_audio = true;
 static bool default_mirror_audio_muted = false;
+// Keep the last user-selected mirror-audio state across AirPlay session
+// boundaries.  `default_mirror_audio_muted` is only the process-start
+// preference supplied by -amute; it must not force every later session back
+// to mute after the user has explicitly unmuted the receiver.
+static bool remembered_mirror_audio_muted = false;
 static bool audio_renderer_initialized = false;
 static bool audio_renderer_running = false;
 static bool audio_renderer_stop_pending = false;
@@ -278,6 +283,7 @@ static void reset_embedded_runtime_audio_defaults() {
     audiodelay = -1;
     use_audio = true;
     default_mirror_audio_muted = false;
+    remembered_mirror_audio_muted = false;
     audio_renderer_initialized = false;
     audio_renderer_running = false;
     audio_renderer_stop_pending = false;
@@ -324,6 +330,27 @@ static void mirror_audio_set_requested(bool enabled) {
     }
     MUTEX_LOCK(audio_control_mutex);
     use_audio = enabled;
+    MUTEX_UNLOCK(audio_control_mutex);
+}
+
+static bool mirror_audio_is_remembered_muted() {
+    if (!audio_control_mutex_initialized) {
+        return remembered_mirror_audio_muted;
+    }
+    bool muted;
+    MUTEX_LOCK(audio_control_mutex);
+    muted = remembered_mirror_audio_muted;
+    MUTEX_UNLOCK(audio_control_mutex);
+    return muted;
+}
+
+static void mirror_audio_set_remembered_muted(bool muted) {
+    if (!audio_control_mutex_initialized) {
+        remembered_mirror_audio_muted = muted;
+        return;
+    }
+    MUTEX_LOCK(audio_control_mutex);
+    remembered_mirror_audio_muted = muted;
     MUTEX_UNLOCK(audio_control_mutex);
 }
 
@@ -1025,6 +1052,7 @@ static void ws_control_queue_event(const std::string &op, const std::string &dat
 }
 
 static void publish_mirror_audio_state(bool enabled, bool notify_status = true) {
+    mirror_audio_set_remembered_muted(!enabled);
 #ifdef _WIN32
     native_window_set_muted(!enabled);
 #endif
@@ -1038,15 +1066,18 @@ static void publish_mirror_audio_state(bool enabled, bool notify_status = true) 
     }
 }
 
-static void reset_mirror_audio_to_default_mute(const char *reason, bool notify_status = true) {
-    if (!default_mirror_audio_muted) {
+static void restore_mirror_audio_state(const char *reason, bool notify_status = true) {
+    if (!mirror_audio_is_enabled()) {
+        publish_mirror_audio_state(false, notify_status);
         return;
     }
-    bool changed = mirror_audio_set_requested_if_changed(false);
-    LOGI("mirror audio reset to muted for AirPlay session boundary: %s%s",
+    const bool rememberedMuted = mirror_audio_is_remembered_muted();
+    bool changed = mirror_audio_set_requested_if_changed(!rememberedMuted);
+    LOGI("mirror audio restored remembered state=%s for AirPlay session boundary: %s%s",
+         rememberedMuted ? "muted" : "unmuted",
          reason ? reason : "unknown",
-         changed ? "" : " (already muted)");
-    publish_mirror_audio_state(false, notify_status);
+         changed ? "" : " (already in remembered state)");
+    publish_mirror_audio_state(!rememberedMuted, notify_status);
 }
 
 static void control_state_get_snapshot(unsigned int *connections, bool *mirroring,
@@ -1099,7 +1130,7 @@ static bool control_state_note_media_started(const char *media_kind) {
         // can therefore occur wholly before this start (and revoke admission)
         // or wholly after it, but can never interleave between the check and
         // the event callback.
-        reset_mirror_audio_to_default_mute("session-started", false);
+        restore_mirror_audio_state("session-started", false);
         std::string data = "{\"sessionId\":\"current\",\"source\":{\"device\":" + json_string_or_null(control_client_name) +
                            ",\"model\":" + json_string_or_null(control_client_model) +
                            ",\"deviceId\":" + json_string_or_null(control_client_device_id) +
@@ -1163,7 +1194,7 @@ static bool control_state_connection_closed() {
         // Keep the audio/session event order atomic with respect to a new
         // media start. ws status is queued after unlocking because it takes a
         // control-state snapshot itself.
-        reset_mirror_audio_to_default_mute("all-connections-closed", false);
+        restore_mirror_audio_state("all-connections-closed", false);
         if (stopped) {
             const std::string payload =
                 "{\"sessionId\":\"current\",\"reason\":\"connection_closed\"}";
@@ -2507,7 +2538,7 @@ static void print_info (char *name) {
     printf("          some choices:pulsesink,alsasink,pipewiresink,jackaudiosink,\n");
     printf("          osssink,oss4sink,osxaudiosink,wasapisink,directsoundsink.\n");
     printf("-as 0     (or -a)  Turn audio off, streamed video only\n");
-    printf("-amute    Start each AirPlay mirroring session with mirror audio muted\n");
+    printf("-amute    Start mirror audio muted; remember the user's choice across sessions\n");
     printf("-al x     Audio latency in seconds (default 0.25) reported to client.\n");
     printf("-ca <fn>  In Airplay Audio (ALAC) mode, write cover-art to file <fn>\n");
     printf("-md <fn>  In Airplay Audio (ALAC) mode, write metadata text to file <fn>\n");
@@ -2847,6 +2878,7 @@ static void parse_arguments (int argc, char *argv[]) {
             use_audio = false;
         } else if (arg == "-amute") {
             default_mirror_audio_muted = true;
+            remembered_mirror_audio_muted = true;
         } else if (arg == "-logfile") {
             if (i < argc - 1 && argv[i+1][0] != '-') {
                 log_filename = argv[++i];
@@ -3683,7 +3715,7 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
 extern "C" void conn_init (void *cls) {
     const bool first_connection = control_state_connection_opened();
     if (first_connection) {
-        reset_mirror_audio_to_default_mute("first-connection-opened");
+        restore_mirror_audio_state("first-connection-opened");
     }
     unsigned int connections = 0;
     control_state_get_snapshot(&connections, NULL, NULL, NULL, NULL);
@@ -3770,7 +3802,7 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
     }
     if (*admit) {
         end_media_handoff_boundary("client-admitted");
-        reset_mirror_audio_to_default_mute("client-admitted");
+        restore_mirror_audio_state("client-admitted");
         control_state_note_client(name, model, deviceid);
     } else {
         end_media_handoff_boundary("client-denied");
@@ -4723,7 +4755,7 @@ int main (int argc, char *argv[]) {
       if (default_mirror_audio_muted) {
           mirror_audio_set_requested(false);
           publish_mirror_audio_state(false);
-          LOGI("mirror audio starts muted by default");
+          LOGI("mirror audio starts muted by default; state is remembered across sessions");
       }
     } else {
         audio_renderer_initialized = false;
