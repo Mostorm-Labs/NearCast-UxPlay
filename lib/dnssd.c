@@ -514,10 +514,10 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
 	break;
     case 1:
         dnssd->TXTRecordSetValue(&dnssd->raop_record, "pw", strlen("true"), "true");
-	dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", 3, "0x8c");
+	dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", strlen("0x8c"), "0x8c");
 	break;
     default:
-        dnssd->TXTRecordSetValue(&dnssd->raop_record, "pw", strlen("true"), "false");
+        dnssd->TXTRecordSetValue(&dnssd->raop_record, "pw", strlen("false"), "false");
 	dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", strlen(RAOP_SF), RAOP_SF);
 	break;
     }
@@ -526,7 +526,6 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "sv", strlen(RAOP_SV), RAOP_SV);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "tp", strlen(RAOP_TP), RAOP_TP);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "txtvers", strlen(RAOP_TXTVERS), RAOP_TXTVERS);
-    dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", strlen(RAOP_SF), RAOP_SF);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "vs", strlen(RAOP_VS), RAOP_VS);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "vn", strlen(RAOP_VN), RAOP_VN);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "pk", strlen(dnssd->pk), dnssd->pk);
