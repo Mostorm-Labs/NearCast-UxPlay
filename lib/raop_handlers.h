@@ -690,7 +690,13 @@ raop_handler_setup(raop_conn_t *conn,
                     unsigned char nonce[16] = { '\0' };
                     int len = 16;
                     uint64_t now = raop_ntp_get_local_time();
-                    assert (!pairing_session_make_nonce(conn->session, &now, url, nonce, len));
+                    int nonce_result = pairing_session_make_nonce(conn->session, &now, url, nonce, len);
+                    assert (!nonce_result);
+                    if (nonce_result) {
+                        logger_log(conn->raop->logger, LOGGER_ERR, "Failed to generate authentication nonce");
+                        http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+                        return;
+                    }
                     if (conn->raop->nonce) {
                         free(conn->raop->nonce);
                     }
