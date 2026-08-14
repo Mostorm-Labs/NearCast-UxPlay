@@ -508,7 +508,6 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "rhd", strlen(RAOP_RHD), RAOP_RHD);
     switch (dnssd->pin_pw) {
     case 2:
-    case 3:
         dnssd->TXTRecordSetValue(&dnssd->raop_record, "pw", strlen("true"), "true");
 	dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", 4, "0x84");
 	break;
@@ -589,7 +588,6 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
 	dnssd->TXTRecordSetValue(&dnssd->airplay_record, "flags", 3, "0x4");
 	break;  
     case 2:  // require password
-    case 3:
         dnssd->TXTRecordSetValue(&dnssd->airplay_record, "pw", strlen("true"), "true");
         dnssd->TXTRecordSetValue(&dnssd->airplay_record, "flags", 3, "0x4");
         break;
