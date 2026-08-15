@@ -4631,7 +4631,7 @@ int main (int argc, char *argv[]) {
         videosink.erase();
         videosink.append("d3d11videosink");
     }
-    if (videosink == "d3d11videosink") {
+    if (videosink == "d3d11videosink" && video_decoder == "decodebin") {
         video_decoder.erase();
         video_decoder.append("d3d11h264dec");
     }
