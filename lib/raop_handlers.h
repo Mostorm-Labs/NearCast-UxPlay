@@ -975,6 +975,9 @@ raop_handler_setup(raop_conn_t *conn,
             conn_end_media_session(conn);
             goto setup_cleanup;
         }
+        /* Preserve Legacy's original clock-worker startup order. Only the
+         * opt-in service prepares all children before publishing workers. */
+        if (!conn->raop->session_transport_budget) raop_ntp_start(conn->raop_ntp, &timing_lport);
         conn->raop_rtp = raop_rtp_init(conn->raop->logger, &conn->callbacks, conn->raop_ntp,
                                        remote, conn->remotelen, aeskey, aesiv);
         conn->raop_rtp_mirror = raop_rtp_mirror_init(conn->raop->logger, &conn->callbacks,
@@ -984,7 +987,7 @@ raop_handler_setup(raop_conn_t *conn,
             conn_end_media_session(conn);
             goto setup_cleanup;
         }
-        raop_ntp_start(conn->raop_ntp, &timing_lport);
+        if (conn->raop->session_transport_budget) raop_ntp_start(conn->raop_ntp, &timing_lport);
         if (!timing_lport) {
             http_response_init(response, "RTSP/1.0", 500, "NTP startup failed");
             conn_end_media_session(conn);
