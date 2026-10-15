@@ -743,6 +743,13 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
     raop_rtp->joined = 0;
 
     THREAD_CREATE(raop_rtp->thread, raop_rtp_thread_udp, raop_rtp);
+    if (!raop_rtp->thread) {
+        raop_rtp->running = 0;
+        raop_rtp->joined = 1;
+        closesocket(raop_rtp->csock);
+        closesocket(raop_rtp->dsock);
+        raop_rtp->csock = raop_rtp->dsock = -1;
+    }
     MUTEX_UNLOCK(raop_rtp->run_mutex);
 }
 
@@ -858,10 +865,9 @@ raop_rtp_stop(raop_rtp_t *raop_rtp)
 {
     assert(raop_rtp);
 
-    /* Check that we are running and thread is not
-     * joined (should never be while still running) */
+    /* Serialized owner-side lifecycle: even a self-exited worker needs join. */
     MUTEX_LOCK(raop_rtp->run_mutex);
-    if (!raop_rtp->running || raop_rtp->joined) {
+    if (raop_rtp->joined) {
         MUTEX_UNLOCK(raop_rtp->run_mutex);
         return;
     }

@@ -887,7 +887,9 @@ raop_rtp_mirror_thread(void *arg)
 
     if (unsupported_codec) {
         closesocket(raop_rtp_mirror->mirror_data_sock);
-        raop_rtp_mirror_stop(raop_rtp_mirror);
+        raop_rtp_mirror->mirror_data_sock = -1;
+        /* The connection owner joins us after this final callback returns.
+         * Never call the owner-side stop/join API from this worker. */
         raop_rtp_mirror->callbacks.video_reset(raop_rtp_mirror->callbacks.cls);
     }
 
@@ -959,16 +961,22 @@ raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror
     raop_rtp_mirror->joined = 0;
 
     THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread, raop_rtp_mirror);
+    if (!raop_rtp_mirror->thread_mirror) {
+        raop_rtp_mirror->running = 0;
+        raop_rtp_mirror->joined = 1;
+        closesocket(raop_rtp_mirror->mirror_data_sock);
+        raop_rtp_mirror->mirror_data_sock = -1;
+    }
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
 }
 
 void raop_rtp_mirror_stop(raop_rtp_mirror_t *raop_rtp_mirror) {
     assert(raop_rtp_mirror);
 
-    /* Check that we are running and thread is not
-     * joined (should never be while still running) */
+    /* Serialized owner-side lifecycle: stopped is not the same as joined.
+     * A self-exited worker may still be executing its final callbacks. */
     MUTEX_LOCK(raop_rtp_mirror->run_mutex);
-    if (!raop_rtp_mirror->running || raop_rtp_mirror->joined) {
+    if (raop_rtp_mirror->joined) {
         MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
         return;
     }

@@ -446,6 +446,12 @@ raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport)
     raop_ntp->joined = 0;
     
     THREAD_CREATE(raop_ntp->thread, raop_ntp_thread, raop_ntp);
+    if (!raop_ntp->thread) {
+        raop_ntp->running = 0;
+        raop_ntp->joined = 1;
+        closesocket(raop_ntp->tsock);
+        raop_ntp->tsock = -1;
+    }
     MUTEX_UNLOCK(raop_ntp->run_mutex);
 }
 
@@ -454,10 +460,9 @@ raop_ntp_stop(raop_ntp_t *raop_ntp)
 {
     assert(raop_ntp);
 
-    /* Check that we are running and thread is not
-     * joined (should never be while still running) */
+    /* Serialized owner-side lifecycle: even a self-exited worker needs join. */
     MUTEX_LOCK(raop_ntp->run_mutex);
-    if (!raop_ntp->running || raop_ntp->joined) {
+    if (raop_ntp->joined) {
         MUTEX_UNLOCK(raop_ntp->run_mutex);
         return;
     }
