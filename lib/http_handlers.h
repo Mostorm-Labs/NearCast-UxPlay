@@ -107,7 +107,7 @@ http_handler_scrub(raop_conn_t *conn, http_request_t *request, http_response_t *
         }
     }
     logger_log(conn->raop->logger, LOGGER_DEBUG, "**********************SCRUB %f ***********************",scrub_position);
-    conn->raop->callbacks.on_video_scrub(conn->raop->callbacks.cls, scrub_position);
+    conn->callbacks.on_video_scrub(conn->callbacks.cls, scrub_position);
 }
 
 static void
@@ -127,7 +127,7 @@ http_handler_rate(raop_conn_t *conn, http_request_t *request, http_response_t *r
             logger_log(conn->raop->logger, LOGGER_DEBUG, "http_handler_rate: got rate = %.6f", rate_value);	  
 	}
     }
-    conn->raop->callbacks.on_video_rate(conn->raop->callbacks.cls, rate_value);
+    conn->callbacks.on_video_rate(conn->callbacks.cls, rate_value);
 }
 
 static void
@@ -135,7 +135,7 @@ http_handler_stop(raop_conn_t *conn, http_request_t *request, http_response_t *r
                   char **response_data, int *response_datalen) {
     logger_log(conn->raop->logger, LOGGER_INFO, "client HTTP request POST stop");
 
-    conn->raop->callbacks.on_video_stop(conn->raop->callbacks.cls);
+    conn->callbacks.on_video_stop(conn->callbacks.cls);
 }
 
 static void
@@ -215,11 +215,11 @@ http_handler_stop_control(raop_conn_t *conn, http_request_t *request, http_respo
     }
 
     logger_log(conn->raop->logger, LOGGER_INFO, "HTTP control requested stop casting");
-    if (conn->raop->callbacks.on_video_stop) {
-        conn->raop->callbacks.on_video_stop(conn->raop->callbacks.cls);
+    if (conn->callbacks.on_video_stop) {
+        conn->callbacks.on_video_stop(conn->callbacks.cls);
     }
-    if (conn->raop->callbacks.video_reset) {
-        conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
+    if (conn->callbacks.video_reset) {
+        conn->callbacks.video_reset(conn->callbacks.cls);
     }
     httpd_remove_known_connections_except(conn->raop->httpd, conn);
     http_stop_send_status(protocol, "ok", "casting stopped", response, response_data, response_datalen);
@@ -604,8 +604,8 @@ http_audio_parse_from_payload(const char *payload, bool *enabled_out) {
 static bool
 http_mirror_audio_get_enabled(raop_conn_t *conn) {
     bool enabled = conn->raop->mirror_audio_enabled;
-    if (conn->raop->callbacks.mirror_audio_get_enabled) {
-        enabled = conn->raop->callbacks.mirror_audio_get_enabled(conn->raop->callbacks.cls);
+    if (conn->callbacks.mirror_audio_get_enabled) {
+        enabled = conn->callbacks.mirror_audio_get_enabled(conn->callbacks.cls);
     }
     return enabled;
 }
@@ -867,13 +867,13 @@ http_handler_playback_info(raop_conn_t *conn, http_request_t *request, http_resp
     //ayback_info.ready_to_play = true; // ???;
     //ayback_info.playback_likely_to_keep_up = true;
 
-    conn->raop->callbacks.on_video_acquire_playback_info(conn->raop->callbacks.cls, &playback_info);
+    conn->callbacks.on_video_acquire_playback_info(conn->callbacks.cls, &playback_info);
     if (playback_info.duration == -1.0) {
         /* video has finished, reset */
 	logger_log(conn->raop->logger, LOGGER_DEBUG, "playback_info not available (finishing)");
 	//httpd_remove_known_connections(conn->raop->httpd);
 	http_response_set_disconnect(response,1);
-	conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
+	conn->callbacks.video_reset(conn->callbacks.cls);
 	return;
     } else if (playback_info.position == -1.0) {
         logger_log(conn->raop->logger, LOGGER_DEBUG, "playback_info not available");
@@ -1169,7 +1169,7 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 	set_next_media_uri_id(conn->raop->airplay_video, ++uri_num);
     } else {
         char * uri_local_prefix = get_uri_local_prefix(conn->raop->airplay_video);
-        conn->raop->callbacks.on_video_play(conn->raop->callbacks.cls,
+        conn->callbacks.on_video_play(conn->callbacks.cls,
 					    strcat(uri_local_prefix, "/master.m3u8"),
                                             get_start_position_seconds(conn->raop->airplay_video));
     }
@@ -1313,7 +1313,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     logger_log(conn->raop->logger, LOGGER_ERR, "Could not find valid Plist Data for POST/play request, Unhandled");
     http_response_init(response, "HTTP/1.1", 400, "Bad Request");
     http_response_set_disconnect(response, 1);
-    conn->raop->callbacks.conn_reset(conn->raop->callbacks.cls, 2);
+    conn->callbacks.conn_reset(conn->callbacks.cls, 2);
 }
 
 /* the HLS handler handles http requests GET /[uri] on the HLS channel from the media player to the Server, asking for

@@ -36,6 +36,7 @@
 struct raop_s {
     /* Callbacks for audio and video */
     raop_callbacks_t callbacks;
+    raop_callback_factory_t callback_factory;
 
     /* Logger instance */
     logger_t *logger;
@@ -87,6 +88,8 @@ struct raop_s {
 
 struct raop_conn_s {
     raop_t *raop;
+    raop_callbacks_t callbacks;
+    bool owns_callbacks;
     raop_ntp_t *raop_ntp;
     raop_rtp_t *raop_rtp;
     raop_rtp_mirror_t *raop_rtp_mirror;
@@ -143,6 +146,28 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
         return NULL;
     }
 
+    /* Legacy keeps its service table. An opt-in factory supplies a complete,
+     * independently owned table before this connection can be published. */
+    if (raop->callback_factory.create) {
+        if (raop->callback_factory.create(raop->callback_factory.cls,
+                                          &conn->callbacks) != 0) {
+            pairing_session_destroy(conn->session);
+            fairplay_destroy(conn->fairplay);
+            free(conn);
+            return NULL;
+        }
+        conn->owns_callbacks = true;
+        if (!conn->callbacks.audio_process || !conn->callbacks.video_process) {
+            raop->callback_factory.release(raop->callback_factory.cls, &conn->callbacks);
+            pairing_session_destroy(conn->session);
+            fairplay_destroy(conn->fairplay);
+            free(conn);
+            return NULL;
+        }
+    } else {
+        memcpy(&conn->callbacks, &raop->callbacks, sizeof(conn->callbacks));
+    }
+
 
     utils_ipaddress_to_string(locallen, local, zone_id, ip_address, (int) sizeof(ip_address));
     logger_log(conn->raop->logger, LOGGER_INFO, "Local : %s", ip_address);
@@ -171,8 +196,8 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
 
     conn->have_active_remote = false;
     
-    if (raop->callbacks.conn_init) {
-        raop->callbacks.conn_init(raop->callbacks.cls);
+    if (conn->callbacks.conn_init) {
+        conn->callbacks.conn_init(conn->callbacks.cls);
     }
 
     return conn;
@@ -259,9 +284,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                 utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, ipaddr, (int) (sizeof(ipaddr)));
                 if (httpd_nohold(conn->raop->httpd)) {
                     bool requires_authentication = false;
-                    if (conn->raop->callbacks.passwd) {
+                    if (conn->callbacks.passwd) {
                         int pw_len = 0;
-                        conn->raop->callbacks.passwd(conn->raop->callbacks.cls, &pw_len);
+                        conn->callbacks.passwd(conn->callbacks.cls, &pw_len);
                         requires_authentication = (pw_len != 0);
                     }
                     logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: switch to new connection request from %s", ipaddr);
@@ -269,11 +294,11 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                         conn->nohold_disconnect_pending = true;
                         logger_log(conn->raop->logger, LOGGER_INFO, "\"nohold\" feature: delaying previous connection disconnect until authentication succeeds");
                     } else {
-                        if (conn->raop->callbacks.handoff_start) {
-                            conn->raop->callbacks.handoff_start(conn->raop->callbacks.cls);
+                        if (conn->callbacks.handoff_start) {
+                            conn->callbacks.handoff_start(conn->callbacks.cls);
                         }
-                        if (conn->raop->callbacks.video_reset) {
-                            conn->raop->callbacks.video_reset(conn->raop->callbacks.cls);
+                        if (conn->callbacks.video_reset) {
+                            conn->callbacks.video_reset(conn->callbacks.cls);
                         }
                         httpd_remove_known_connections(conn->raop->httpd);
                     }
@@ -347,9 +372,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         const char *active_remote = http_request_get_header(request, "Active-Remote");
         if (active_remote) {
             conn->have_active_remote = true;
-            if (conn->raop->callbacks.export_dacp) {
+            if (conn->callbacks.export_dacp) {
                 const char *dacp_id = http_request_get_header(request, "DACP-ID");
-                conn->raop->callbacks.export_dacp(conn->raop->callbacks.cls, active_remote, dacp_id);
+                conn->callbacks.export_dacp(conn->callbacks.cls, active_remote, dacp_id);
             }
         }
     }
@@ -586,8 +611,8 @@ conn_destroy(void *ptr) {
 
     logger_log(conn->raop->logger, LOGGER_DEBUG, "Destroying connection");
 
-    if (conn->raop->callbacks.conn_destroy) {
-        conn->raop->callbacks.conn_destroy(conn->raop->callbacks.cls);
+    if (conn->callbacks.conn_destroy) {
+        conn->callbacks.conn_destroy(conn->callbacks.cls);
     }
 
     if (conn->raop_rtp) {
@@ -602,8 +627,8 @@ conn_destroy(void *ptr) {
         raop_ntp_destroy(conn->raop_ntp);
     }
 
-    if (conn->raop->callbacks.video_flush) {
-        conn->raop->callbacks.video_flush(conn->raop->callbacks.cls);
+    if (conn->callbacks.video_flush) {
+        conn->callbacks.video_flush(conn->callbacks.cls);
     }
 
     free(conn->local);
@@ -617,6 +642,10 @@ conn_destroy(void *ptr) {
         airplay_video_service_destroy(conn->airplay_video);
     }
 
+    if (conn->owns_callbacks) {
+        conn->raop->callback_factory.release(conn->raop->callback_factory.cls,
+                                             &conn->callbacks);
+    }
     free(conn);
 }
 
@@ -677,6 +706,20 @@ raop_init(raop_callbacks_t *callbacks) {
 
     raop->nonce = NULL;
     return raop;
+}
+
+int
+raop_set_callback_factory(raop_t *raop, const raop_callback_factory_t *factory) {
+    if (!raop || raop->httpd ||
+        (factory && (!factory->create || !factory->release))) {
+        return -1;
+    }
+    if (factory) {
+        raop->callback_factory = *factory;
+    } else {
+        memset(&raop->callback_factory, 0, sizeof(raop->callback_factory));
+    }
+    return 0;
 }
 
 int

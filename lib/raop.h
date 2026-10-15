@@ -108,6 +108,23 @@ struct raop_callbacks_s {
   
 };
 typedef struct raop_callbacks_s raop_callbacks_t;
+
+#define RAOP_CALLBACK_SCOPES_API_VERSION 1
+/* Optional transport callback ownership seam, configured before raop_init2.
+ * A transport scope is NOT an authenticated sender/media-session identity.
+ * create receives a zeroed table; return 0 with a complete callback table
+ * (including the mandatory audio_process/video_process callbacks). On failure
+ * the factory owns rollback. A successful result is released exactly once,
+ * even when its table is invalid. Release runs only after protocol children
+ * have stopped/joined and the final connection flush has returned.
+ * The factory/cls must outlive raop. Callbacks must not throw or synchronously
+ * destroy their owning service. No callback buffer ownership is changed here.
+ */
+typedef struct raop_callback_factory_s {
+    void *cls;
+    int (*create)(void *cls, raop_callbacks_t *connection_callbacks);
+    void (*release)(void *cls, const raop_callbacks_t *connection_callbacks);
+} raop_callback_factory_t;
 raop_ntp_t *raop_ntp_init(logger_t *logger, raop_callbacks_t *callbacks, const char *remote,
                           int remote_addr_len, unsigned short timing_rport,
                           timing_protocol_t *time_protocol);
@@ -120,6 +137,8 @@ airplay_video_t *deregister_airplay_video(raop_t *raop);
 uint64_t get_local_time();
 
 RAOP_API raop_t *raop_init(raop_callbacks_t *callbacks);
+/* Returns -1 for invalid factories or configuration after init2; NULL clears. */
+RAOP_API int raop_set_callback_factory(raop_t *raop, const raop_callback_factory_t *factory);
 RAOP_API int raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile);
 RAOP_API void raop_set_log_level(raop_t *raop, int level);
 RAOP_API void raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, void *cls);
