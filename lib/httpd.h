@@ -56,6 +56,10 @@ httpd_t *httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int  nohold)
 
 int httpd_is_running(httpd_t *httpd);
 
+/* Lifecycle calls are serialized by an external owner, never from a callback.
+ * start: 1 started, 0 already active/unjoined, negative on startup failure.
+ * stop/destroy wait for every started worker, including its final callback.
+ * The logger and callback contexts must outlive that wait. */
 int httpd_start(httpd_t *httpd, unsigned short *port);
 void httpd_stop(httpd_t *httpd);
 

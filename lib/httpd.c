@@ -186,6 +186,8 @@ httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
     /* Initial status joined */
     httpd->running = 0;
     httpd->joined = 1;
+    httpd->server_fd4 = -1;
+    httpd->server_fd6 = -1;
     MUTEX_CREATE(httpd->run_mutex);
 
     return httpd;
@@ -638,6 +640,7 @@ httpd_start(httpd_t *httpd, unsigned short *port)
 {
     /* How many connection attempts are kept in queue */
     int backlog = 5;
+    int result;
 
     assert(httpd);
     assert(port);
@@ -662,17 +665,13 @@ httpd_start(httpd_t *httpd, unsigned short *port)
 
     if (httpd->server_fd4 != -1 && listen(httpd->server_fd4, backlog) == -1) {
         logger_log(httpd->logger, LOGGER_ERR, "Error listening to IPv4 socket");
-        closesocket(httpd->server_fd4);
-        closesocket(httpd->server_fd6);
-        MUTEX_UNLOCK(httpd->run_mutex);
-        return -2;
+        result = -2;
+        goto sockets_cleanup;
     }
     if (httpd->server_fd6 != -1 && listen(httpd->server_fd6, backlog) == -1) {
         logger_log(httpd->logger, LOGGER_ERR, "Error listening to IPv6 socket");
-        closesocket(httpd->server_fd4);
-        closesocket(httpd->server_fd6);
-        MUTEX_UNLOCK(httpd->run_mutex);
-        return -2;
+        result = -2;
+        goto sockets_cleanup;
     }
     logger_log(httpd->logger, LOGGER_INFO, "Initialized server socket(s) on port %hu", *port);
 
@@ -680,9 +679,23 @@ httpd_start(httpd_t *httpd, unsigned short *port)
     httpd->running = 1;
     httpd->joined = 0;
     THREAD_CREATE(httpd->thread, httpd_thread, httpd);
+    if (!httpd->thread) {
+        httpd->running = 0;
+        httpd->joined = 1;
+        logger_log(httpd->logger, LOGGER_ERR, "Error creating HTTP worker thread");
+        result = -3;
+        goto sockets_cleanup;
+    }
     MUTEX_UNLOCK(httpd->run_mutex);
 
     return 1;
+
+ sockets_cleanup:
+    if (httpd->server_fd4 != -1) closesocket(httpd->server_fd4);
+    if (httpd->server_fd6 != -1) closesocket(httpd->server_fd6);
+    httpd->server_fd4 = httpd->server_fd6 = -1;
+    MUTEX_UNLOCK(httpd->run_mutex);
+    return result;
 }
 
 int
@@ -705,7 +718,9 @@ httpd_stop(httpd_t *httpd)
     assert(httpd);
 
     MUTEX_LOCK(httpd->run_mutex);
-    if (!httpd->running || httpd->joined) {
+    /* A self-exited worker can still own the terminal logger callback.
+     * Only a completed join permits the serialized owner to skip waiting. */
+    if (httpd->joined) {
         MUTEX_UNLOCK(httpd->run_mutex);
         return;
     }
