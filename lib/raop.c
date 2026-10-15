@@ -285,7 +285,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     const char *protocol = http_request_get_protocol(request);
     /* Mirroring session mode has no global HTTP control/HLS owner. In
      * particular /stop and a new HLS transport must not clear another sender. */
-    if (conn->raop->session_transport_budget && !cseq) {
+    if (conn->raop->session_transport_budget && (!cseq || strcmp(protocol, "RTSP/1.0"))) {
         *response = http_response_create();
         http_response_init(*response, protocol, 501, "Only RAOP mirroring is supported");
         goto finish;
