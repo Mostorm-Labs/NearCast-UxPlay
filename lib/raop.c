@@ -33,10 +33,17 @@
 #include "raop_rtp_mirror.h"
 #include "raop_ntp.h"
 
+typedef struct raop_auth_s {
+    char *nonce;
+    char *random_pw;
+    unsigned char auth_fail_count;
+} raop_auth_t;
+
 struct raop_s {
     /* Callbacks for audio and video */
     raop_callbacks_t callbacks;
     raop_callback_factory_t callback_factory;
+    unsigned int session_transport_budget;
 
     /* Logger instance */
     logger_t *logger;
@@ -81,9 +88,7 @@ struct raop_s {
     bool hls_support;
 
     /* used in digest authentication */
-    char *nonce;
-    char *random_pw;
-    unsigned char auth_fail_count;
+    raop_auth_t auth;
 };
 
 struct raop_conn_s {
@@ -112,8 +117,23 @@ struct raop_conn_s {
     bool have_active_remote;
     bool nohold_disconnect_pending;
     bool pin_required_announced;
+    raop_auth_t auth;
+    unsigned short pin;
+    bool media_session_active;
 };
 typedef struct raop_conn_s raop_conn_t;
+
+static void
+conn_end_media_session(raop_conn_t *conn) {
+    if (conn->raop_rtp) { raop_rtp_destroy(conn->raop_rtp); conn->raop_rtp = NULL; }
+    if (conn->raop_rtp_mirror) { raop_rtp_mirror_destroy(conn->raop_rtp_mirror); conn->raop_rtp_mirror = NULL; }
+    if (conn->raop_ntp) { raop_ntp_destroy(conn->raop_ntp); conn->raop_ntp = NULL; }
+    if (conn->media_session_active) {
+        if (conn->callbacks.video_flush) conn->callbacks.video_flush(conn->callbacks.cls);
+        conn->media_session_active = false;
+        conn->callbacks.session_end(conn->callbacks.cls);
+    }
+}
 
 #include "raop_handlers.h"
 #include "http_handlers.h"
@@ -157,7 +177,8 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
             return NULL;
         }
         conn->owns_callbacks = true;
-        if (!conn->callbacks.audio_process || !conn->callbacks.video_process) {
+        if (!conn->callbacks.audio_process || !conn->callbacks.video_process ||
+            (raop->session_transport_budget && (!conn->callbacks.session_begin || !conn->callbacks.session_end))) {
             raop->callback_factory.release(raop->callback_factory.cls, &conn->callbacks);
             pairing_session_destroy(conn->session);
             fairplay_destroy(conn->fairplay);
@@ -193,6 +214,7 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
     conn->airplay_video = NULL;
 
     conn->authenticated = false;
+    conn->pin = raop->pin;
 
     conn->have_active_remote = false;
     
@@ -261,6 +283,20 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/
     const char *cseq = http_request_get_header(request, "CSeq");
     const char *protocol = http_request_get_protocol(request);
+    /* Mirroring session mode has no global HTTP control/HLS owner. In
+     * particular /stop and a new HLS transport must not clear another sender. */
+    if (conn->raop->session_transport_budget && !cseq) {
+        *response = http_response_create();
+        http_response_init(*response, protocol, 501, "Only RAOP mirroring is supported");
+        goto finish;
+    }
+    if (conn->raop->session_transport_budget && conn->media_session_active &&
+        (!strcmp(url, "/pair-setup") || !strcmp(url, "/pair-verify") ||
+         !strcmp(url, "/pair-setup-pin") || !strcmp(url, "/pair-pin-start") || !strcmp(url, "/fp-setup"))) {
+        *response = http_response_create();
+        http_response_init(*response, protocol, 409, "End media session before reauthentication");
+        goto finish;
+    }
     if (!cseq && !conn->raop->hls_support && !is_pin_endpoint && !is_audio_endpoint &&
         !is_stop_endpoint) {
         logger_log(conn->raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
@@ -279,7 +315,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
         if (cseq) {
-            if (httpd_count_connection_type(conn->raop->httpd, CONNECTION_TYPE_RAOP)) {
+            if (!conn->raop->session_transport_budget &&
+                httpd_count_connection_type(conn->raop->httpd, CONNECTION_TYPE_RAOP)) {
                 char ipaddr[40];
                 utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, ipaddr, (int) (sizeof(ipaddr)));
                 if (httpd_nohold(conn->raop->httpd)) {
@@ -314,6 +351,11 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             conn->connection_type = CONNECTION_TYPE_RAOP;
             raop_report_configured_pin_required(conn);
         } else if (client_session_id) {
+            if (conn->raop->session_transport_budget) {
+                *response = http_response_create();
+                http_response_init(*response, protocol, 501, "HLS unsupported by session service");
+                goto finish;
+            }
             logger_log(conn->raop->logger, LOGGER_DEBUG, "New connection %p identified as Connection type AirPlay", ptr);            
             httpd_set_connection_type(conn->raop->httpd, ptr, CONNECTION_TYPE_AIRPLAY);
             conn->connection_type = CONNECTION_TYPE_AIRPLAY;
@@ -615,6 +657,9 @@ conn_destroy(void *ptr) {
         conn->callbacks.conn_destroy(conn->callbacks.cls);
     }
 
+    if (conn->raop->session_transport_budget) {
+        conn_end_media_session(conn);
+    }
     if (conn->raop_rtp) {
         /* This is done in case TEARDOWN was not called */
         raop_rtp_destroy(conn->raop_rtp);
@@ -627,7 +672,7 @@ conn_destroy(void *ptr) {
         raop_ntp_destroy(conn->raop_ntp);
     }
 
-    if (conn->callbacks.video_flush) {
+    if (conn->callbacks.video_flush && !conn->raop->session_transport_budget) {
         conn->callbacks.video_flush(conn->callbacks.cls);
     }
 
@@ -646,6 +691,8 @@ conn_destroy(void *ptr) {
         conn->raop->callback_factory.release(conn->raop->callback_factory.cls,
                                              &conn->callbacks);
     }
+    free(conn->auth.nonce);
+    free(conn->auth.random_pw);
     free(conn);
 }
 
@@ -704,13 +751,20 @@ raop_init(raop_callbacks_t *callbacks) {
 
     raop->hls_support = false;
 
-    raop->nonce = NULL;
     return raop;
 }
 
 int
+raop_enable_session_service(raop_t *raop, unsigned int transport_budget) {
+    if (!raop || raop->httpd || !raop->callback_factory.create ||
+        !transport_budget || transport_budget > 52) return -1;
+    raop->session_transport_budget = transport_budget;
+    return 0;
+}
+
+int
 raop_set_callback_factory(raop_t *raop, const raop_callback_factory_t *factory) {
-    if (!raop || raop->httpd ||
+    if (!raop || raop->httpd || (!factory && raop->session_transport_budget) ||
         (factory && (!factory->create || !factory->release))) {
         return -1;
     }
@@ -764,6 +818,12 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
         pairing_destroy(pairing);
         return -1;
     }
+    if (raop->session_transport_budget &&
+        httpd_set_connection_budget(httpd, raop->session_transport_budget)) {
+        httpd_destroy(httpd);
+        pairing_destroy(pairing);
+        return -1;
+    }
 
     raop->pairing = pairing;
     raop->httpd = httpd;
@@ -778,11 +838,11 @@ raop_destroy(raop_t *raop) {
         pairing_destroy(raop->pairing);
         httpd_destroy(raop->httpd);
         logger_destroy(raop->logger);
-	if (raop->nonce) {
-            free(raop->nonce);
+	if (raop->auth.nonce) {
+            free(raop->auth.nonce);
         }
-	if (raop->random_pw) {
-            free(raop->random_pw);
+	if (raop->auth.random_pw) {
+            free(raop->auth.random_pw);
         }
 
         free(raop);
@@ -939,11 +999,11 @@ raop_rotate_pin(raop_t *raop, const char *reason) {
         return -1;
     }
 
-    if (raop->random_pw) {
-        free(raop->random_pw);
-        raop->random_pw = NULL;
+    if (raop->auth.random_pw) {
+        free(raop->auth.random_pw);
+        raop->auth.random_pw = NULL;
     }
-    raop->auth_fail_count = 0;
+    raop->auth.auth_fail_count = 0;
 
     return raop_set_pin_internal(raop,
                                  (unsigned short) (pin_4 % 10000),
@@ -1029,7 +1089,7 @@ raop_start_httpd(raop_t *raop, unsigned short *port) {
 void
 raop_stop_httpd(raop_t *raop) {
     assert(raop);
-    httpd_stop(raop->httpd);
+    if (raop->httpd) httpd_stop(raop->httpd);
 }
 
 void raop_remove_known_connections(raop_t * raop) {

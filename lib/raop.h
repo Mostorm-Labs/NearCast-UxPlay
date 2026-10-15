@@ -60,6 +60,18 @@ typedef enum video_codec_e {
     VIDEO_CODEC_H265
 } video_codec_t;
 
+#define RAOP_SESSION_SERVICE_API_VERSION 1
+/* Borrowed SETUP metadata. Names/device IDs are untrusted claims; only the
+ * public key below is proven by a completed pair-verify on this connection. */
+typedef struct raop_session_info_s {
+    const char *device_id;
+    const char *model;
+    const char *name;
+    bool peer_verified;
+    unsigned char peer_public_key[32];
+    bool password_authenticated;
+} raop_session_info_t;
+
 struct raop_callbacks_s {
     void* cls;
 
@@ -105,6 +117,12 @@ struct raop_callbacks_s {
     void  (*on_video_acquire_playback_info) (void *cls, playback_info_t *playback_video);
     void  (*control_pin_changed) (void *cls, unsigned short pin, const char *source, const char *reason);
     void  (*control_audio_changed) (void *cls, bool enabled);
+    /* Opt-in service only. begin reserves a logical session, returning 0 to
+     * accept; no media workers are started before acceptance. end follows all
+     * child joins and final flush, exactly once per successful begin (including
+     * startup rollback). Callbacks must be bounded, nonblocking and no-throw. */
+    int   (*session_begin)(void *cls, const raop_session_info_t *info);
+    void  (*session_end)(void *cls);
   
 };
 typedef struct raop_callbacks_s raop_callbacks_t;
@@ -139,6 +157,10 @@ uint64_t get_local_time();
 RAOP_API raop_t *raop_init(raop_callbacks_t *callbacks);
 /* Returns -1 for invalid factories or configuration after init2; NULL clears. */
 RAOP_API int raop_set_callback_factory(raop_t *raop, const raop_callback_factory_t *factory);
+/* Pre-init, factory required. Requires pair-verify; disables single-client
+ * nohold/rejection and HLS. The bounded transport budget (1..52) is NOT sender
+ * capacity. Logical admission belongs to session_begin's external owner. */
+RAOP_API int raop_enable_session_service(raop_t *raop, unsigned int transport_budget);
 RAOP_API int raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile);
 RAOP_API void raop_set_log_level(raop_t *raop, int level);
 RAOP_API void raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, void *cls);

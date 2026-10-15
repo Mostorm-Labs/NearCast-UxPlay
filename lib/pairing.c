@@ -244,8 +244,10 @@ char *get_token(char **cursor, char *token_name, char start_char, char end_char)
 
 //#define test_digest
 bool
-pairing_digest_verify(const char *method, const char * authorization, const char *password) {
+pairing_digest_verify_nonce(const char *method, const char *expected_uri, const char * authorization,
+                            const char *password, const char *expected_nonce) {
   /* RFC 2617 HTTP md5 Digest password authentication */
+    if (!method || !authorization || !password || strncmp(authorization, "Digest ", 7)) return false;
     size_t authlen = strlen(authorization);
     char *sentence = (char *) malloc(authlen + 1);
     memcpy(sentence, authorization, authlen);
@@ -294,6 +296,13 @@ pairing_digest_verify(const char *method, const char * authorization, const char
         cnonce = get_token(&cursor, "cnonce", '\"', '\"');
     }
     response = get_token(&cursor, "response", '\"', '\"');
+    if (!username || !realm || !nonce || !uri || !response ||
+        (qop && (!nc || !cnonce)) ||
+        (expected_nonce && (strcmp(nonce, expected_nonce) || strcmp(realm, "raop"))) ||
+        (expected_uri && strcmp(uri, expected_uri))) {
+        free(sentence);
+        return false;
+    }
 
 #ifdef test_digest
     printf("username: [%s]  realm: [%s]\n", username, realm);
@@ -372,6 +381,11 @@ pairing_digest_verify(const char *method, const char * authorization, const char
 #endif
 
     return authenticated;
+}
+
+bool
+pairing_digest_verify(const char *method, const char *authorization, const char *password) {
+    return pairing_digest_verify_nonce(method, NULL, authorization, password, NULL);
 }
 
 int
@@ -457,6 +471,16 @@ pairing_session_destroy(pairing_session_t *session)
         }
         free(session);
     }
+}
+
+int
+pairing_session_get_verified_peer(pairing_session_t *session, unsigned char key[ED25519_KEY_SIZE])
+{
+    if (!session || !key || session->status != STATUS_FINISHED || !session->ed_theirs) {
+        return -1;
+    }
+    ed25519_key_get_raw(key, session->ed_theirs);
+    return 0;
 }
 
 void

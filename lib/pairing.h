@@ -48,6 +48,9 @@ int pairing_session_get_public_key(pairing_session_t *session, unsigned char ecd
 int random_pin();
 int pairing_session_get_signature(pairing_session_t *session, unsigned char signature[PAIRING_SIG_SIZE]);
 int pairing_session_finish(pairing_session_t *session, const unsigned char signature[PAIRING_SIG_SIZE]);
+/* Fails unless the peer signature was verified; never exposes a handshake key
+ * as an authenticated identity. */
+int pairing_session_get_verified_peer(pairing_session_t *session, unsigned char key[ED25519_KEY_SIZE]);
 void pairing_session_destroy(pairing_session_t *session);
 
 void pairing_destroy(pairing_t *pairing);
@@ -64,5 +67,7 @@ void get_pairing_session_client_data(pairing_session_t *session, char **username
 void ed25519_pk_to_base64(const unsigned char *pk, char **pk64);
 int pairing_session_make_nonce(pairing_session_t *session, uint64_t *local_time, const char *client_data, unsigned char *nonce, int len);
 bool pairing_digest_verify(const char *method, const char * authorization, const char *password);
+bool pairing_digest_verify_nonce(const char *method, const char *uri, const char *authorization,
+                                 const char *password, const char *expected_nonce);
 
 #endif

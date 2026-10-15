@@ -35,6 +35,10 @@ raop_handler_info(raop_conn_t *conn,
                   http_request_t *request, http_response_t *response,
                   char **response_data, int *response_datalen)
 {
+    if (conn->raop->session_transport_budget && !conn->raop->dnssd) {
+        http_response_init(response, "RTSP/1.0", 503, "Discovery metadata unavailable");
+        return;
+    }
     assert(conn->raop->dnssd);
 
 #if 0
@@ -229,6 +233,7 @@ raop_handler_pairpinstart(raop_conn_t *conn,
                           http_request_t *request, http_response_t *response,
                           char **response_data, int *response_datalen) {
     logger_log(conn->raop->logger, LOGGER_INFO, "client sent PAIR-PIN-START request");
+    unsigned short *stored_pin = conn->raop->session_transport_budget ? &conn->pin : &conn->raop->pin;
     int pin_4;
     bool configured_pin = (conn->raop->use_pin && conn->raop->pin > 0);
     if (configured_pin || conn->raop->pin > 9999) {
@@ -238,7 +243,7 @@ raop_handler_pairpinstart(raop_conn_t *conn,
         if (pin_4 < 0) {
             logger_log(conn->raop->logger, LOGGER_ERR, "Failed to generate random pin");
         } else {
-            conn->raop->pin = (unsigned short) pin_4 % 10000;
+            *stored_pin = (unsigned short) pin_4 % 10000;
         }
     }
     char pin[6];
@@ -302,9 +307,10 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         free (method);
 	plist_get_string_val(req_user_node, &user);
         logger_log(conn->raop->logger, LOGGER_INFO, "pair-setup-pin:  device_id = %s", user);
-        snprintf(pin, 6, "%04u", conn->raop->pin % 10000);
-        if (!conn->raop->use_pin && conn->raop->pin < 10000) {
-            conn->raop->pin = 0;
+        unsigned short *stored_pin = conn->raop->session_transport_budget ? &conn->pin : &conn->raop->pin;
+        snprintf(pin, 6, "%04u", *stored_pin % 10000);
+        if (!conn->raop->use_pin && *stored_pin < 10000) {
+            *stored_pin = 0;
         }
 	int ret = srp_new_user(conn->session, conn->raop->pairing, (const char *) user,
                                (const char *) pin, &salt, &len_salt, &pk, &len_pk);
@@ -505,6 +511,8 @@ raop_handler_pairverify(raop_conn_t *conn,
 
             if (pairing_session_finish(conn->session, data + 4)) {
                 logger_log(conn->raop->logger, LOGGER_ERR, "Incorrect pair-verify signature");
+                if (conn->raop->session_transport_budget)
+                    http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
                 http_response_set_disconnect(response, 1);
                 return;
             }
@@ -569,6 +577,7 @@ raop_handler_setup(raop_conn_t *conn,
     const char *dacp_id = NULL;
     const char *active_remote_header = NULL;
     bool logger_debug = (logger_get_level(conn->raop->logger) >= LOGGER_DEBUG);
+    raop_auth_t *auth = conn->raop->session_transport_budget ? &conn->auth : &conn->raop->auth;
     
     const char *data = NULL;
     int data_len = 0;
@@ -594,12 +603,37 @@ raop_handler_setup(raop_conn_t *conn,
     // For the response
     plist_t res_root_node = plist_new_dict();
 
+    if (conn->raop->session_transport_budget && !PLIST_IS_DICT(req_root_node)) {
+        http_response_init(response, "RTSP/1.0", 400, "Invalid SETUP plist");
+        goto setup_cleanup;
+    }
+
     if (PLIST_IS_DATA(req_eiv_node) && PLIST_IS_DATA(req_ekey_node)) {
         // The first SETUP call that initializes keys and timing
 
         unsigned char aesiv[16] = { 0 };
         unsigned char aeskey[16] = { 0 };
         unsigned char eaeskey[72] = { 0 };
+        raop_session_info_t session_info;
+        memset(&session_info, 0, sizeof(session_info));
+        if (conn->raop->session_transport_budget) {
+            uint64_t len_iv = 0, len_key = 0;
+            const char *iv_data = plist_get_data_ptr(req_eiv_node, &len_iv);
+            const char *key_data = plist_get_data_ptr(req_ekey_node, &len_key);
+            if (!iv_data || !key_data || len_iv != 16 || len_key != 72) {
+                http_response_init(response, "RTSP/1.0", 400, "Invalid SETUP key lengths");
+                goto setup_cleanup;
+            }
+            if (conn->media_session_active) {
+                http_response_init(response, "RTSP/1.0", 409, "Session already configured");
+                goto setup_cleanup;
+            }
+            if (pairing_session_get_verified_peer(conn->session, session_info.peer_public_key)) {
+                http_response_init(response, "RTSP/1.0", 470, "Pair verification required");
+                goto setup_cleanup;
+            }
+            session_info.peer_verified = true;
+        }
 
         logger_log(conn->raop->logger, LOGGER_DEBUG, "SETUP 1");
 
@@ -611,20 +645,29 @@ raop_handler_setup(raop_conn_t *conn,
             const char *password = conn->callbacks.passwd(conn->callbacks.cls, &len);
             // len = -1 means use a random password for this connection
             bool rotate_pin = false;
-            if (len == -1 && conn->raop->random_pw && conn->raop->auth_fail_count >= 5) {
+            if (len == -1 && auth->random_pw && auth->auth_fail_count >= 5) {
                 // change random_pw after 5 failed authentication attempts
                 logger_log(conn->raop->logger, LOGGER_INFO, "Too many authentication failures: generate new random password");
-                free(conn->raop->random_pw);
-                conn->raop->random_pw = NULL;
+                free(auth->random_pw);
+                auth->random_pw = NULL;
                 rotate_pin = true;
             }
-            if (len == -1 && !conn->raop->random_pw) {
+            if (len == -1 && !auth->random_pw) {
                 int pin_4;
-                if (conn->raop->use_pin && conn->raop->pin > 0 && !rotate_pin) {
+                if (conn->raop->use_pin && conn->pin > 0 && !rotate_pin && conn->raop->session_transport_budget) {
+                    pin_4 = conn->pin % 10000;
+                } else if (conn->raop->use_pin && conn->raop->pin > 0 && !rotate_pin) {
                     pin_4 = conn->raop->pin % 10000;
                 } else {
                     // get and store 4 random digits
-                    if (raop_rotate_pin(conn->raop, "auth-retry")) {
+                    if (conn->raop->session_transport_budget) {
+                        pin_4 = random_pin();
+                        if (pin_4 < 0) {
+                            http_response_init(response, "RTSP/1.0", 500, "PIN generation failed");
+                            goto setup_cleanup;
+                        }
+                        conn->pin = (unsigned short) pin_4;
+                    } else if (raop_rotate_pin(conn->raop, "auth-retry")) {
                         logger_log(conn->raop->logger, LOGGER_ERR, "Failed to generate random pin");
                         pin_4 = 1234;
                     } else {
@@ -632,55 +675,46 @@ raop_handler_setup(raop_conn_t *conn,
                     }
                 }
 		size_t len = 4;
-		conn->raop->random_pw =  (char *) malloc(len + 1);
-                char *pin = conn->raop->random_pw;
+		auth->random_pw =  (char *) malloc(len + 1);
+                char *pin = auth->random_pw;
                 snprintf(pin, len + 1, "%04u", pin_4 % 10000);
                 pin[len] = '\0';
-                conn->raop->auth_fail_count = 0;
+                auth->auth_fail_count = 0;
                 raop_report_pin_required(conn, pin);
             }
 	    if (len && !conn->authenticated) {
  	        if (len == -1) {
-                    password = (const char *) conn->raop->random_pw;
-                    if (conn->raop->random_pw && !conn->pin_required_announced) {
-                        raop_report_pin_required(conn, conn->raop->random_pw);
+                    password = (const char *) auth->random_pw;
+                    if (auth->random_pw && !conn->pin_required_announced) {
+                        raop_report_pin_required(conn, auth->random_pw);
                     }
                 }
-                char nonce_string[33] = { '\0' };
                 //bool stale = false;  //not implemented
                 const char *authorization = NULL;
                 authorization = http_request_get_header(request, "Authorization");
                 if (authorization) {
-                    char *ptr = strstr(authorization, "nonce=\"") +  strlen("nonce=\"");
-                    strncpy(nonce_string, ptr, 32);
                     const char *method = http_request_get_method(request);
-                    conn->authenticated = pairing_digest_verify(method, authorization, password);
+
+                    conn->authenticated = auth->nonce && pairing_digest_verify_nonce(method,
+                        http_request_get_url(request), authorization, password, auth->nonce);
 		    if (!conn->authenticated) {
-                        conn->raop->auth_fail_count++;
-                        logger_log(conn->raop->logger, LOGGER_INFO, "*** authentication failure: count = %u", conn->raop->auth_fail_count);
-		        if (conn->callbacks.display_pin && conn->raop->auth_fail_count > 1) {
-                            conn->callbacks.display_pin(conn->callbacks.cls, conn->raop->random_pw);
+                        if (auth->auth_fail_count < 255) auth->auth_fail_count++;
+                        logger_log(conn->raop->logger, LOGGER_INFO, "*** authentication failure: count = %u", auth->auth_fail_count);
+                        if (auth->random_pw && conn->callbacks.display_pin && auth->auth_fail_count > 1) {
+                            conn->callbacks.display_pin(conn->callbacks.cls, auth->random_pw);
                         }
-                        if (conn->callbacks.control_pin_required) {
-                            conn->callbacks.control_pin_required(conn->callbacks.cls, conn->raop->random_pw);
+                        if (auth->random_pw && conn->callbacks.control_pin_required) {
+                            conn->callbacks.control_pin_required(conn->callbacks.cls, auth->random_pw);
                         }
-                        logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", conn->raop->random_pw);
+                        if (auth->random_pw) logger_log(conn->raop->logger, LOGGER_INFO, "*** CLIENT MUST NOW ENTER PIN = \"%s\" AS AIRPLAY PASSWORD", auth->random_pw);
                     }
-                    if (conn->authenticated) {
-                        printf("initial authenticatication OK\n");
-                        conn->authenticated = conn->authenticated && !strcmp(nonce_string, conn->raop->nonce);
-                        if (!conn->authenticated) {
-                            logger_log(conn->raop->logger, LOGGER_INFO, "authentication rejected (nonce mismatch) %s %s",
-                                       nonce_string, conn->raop->nonce);
-                        }			
-                    }
-                    if (conn->authenticated && conn->raop->random_pw) {
-                        free (conn->raop->random_pw);
-                        conn->raop->random_pw = NULL;
+                    if (conn->authenticated && auth->random_pw) {
+                        free (auth->random_pw);
+                        auth->random_pw = NULL;
 		    }
-                    if (conn->raop->nonce) {
-                        free(conn->raop->nonce);
-                        conn->raop->nonce = NULL;
+                    if (auth->nonce) {
+                        free(auth->nonce);
+                        auth->nonce = NULL;
                     }
                     logger_log(conn->raop->logger, LOGGER_INFO, "Client authentication %s", (conn->authenticated ? "success" : "failure"));
                 }
@@ -695,18 +729,18 @@ raop_handler_setup(raop_conn_t *conn,
                     if (nonce_result) {
                         logger_log(conn->raop->logger, LOGGER_ERR, "Failed to generate authentication nonce");
                         http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
-                        return;
+                        goto setup_cleanup;
                     }
-                    if (conn->raop->nonce) {
-                        free(conn->raop->nonce);
+                    if (auth->nonce) {
+                        free(auth->nonce);
                     }
-                    conn->raop->nonce = utils_hex_to_string(nonce, len);
+                    auth->nonce = utils_hex_to_string(nonce, len);
                     char response_text[80] = "Digest realm=\"raop\", nonce=\"";
-                    strncat(response_text, conn->raop->nonce, 80 - strlen(response_text) - 1);
+                    strncat(response_text, auth->nonce, 80 - strlen(response_text) - 1);
                     strncat(response_text, "\"", 80 - strlen(response_text) - 1);
                     http_response_init(response, "RTSP/1.0", 401, "Unauthorized");
                     http_response_add_header(response, "WWW-Authenticate", response_text);
-                    return;
+                    goto setup_cleanup;
                 }
             }
         }
@@ -739,6 +773,15 @@ raop_handler_setup(raop_conn_t *conn,
 	if (conn->callbacks.report_client_request) {
             conn->callbacks.report_client_request(conn->callbacks.cls, deviceID, model, name, &admit_client);
         }
+
+        /* Defer logical admission until crypto validation below. These fields
+         * are claims; do not present them as verified sender identity. */
+        if (conn->raop->session_transport_budget) {
+            session_info.device_id = deviceID;
+            session_info.model = model;
+            session_info.name = name;
+            session_info.password_authenticated = conn->authenticated;
+        }
 	if (admit_client && deviceID && name && conn->callbacks.register_client) {
             char *client_device_id = NULL;
             char *client_pk = NULL;   /* encoded as null-terminated  base64 string, must be freed*/
@@ -748,15 +791,15 @@ raop_handler_setup(raop_conn_t *conn,
                 free (client_pk);
             }
 	}
-        if (deviceID) {
+        if (deviceID && !conn->raop->session_transport_budget) {
             free (deviceID);
             deviceID = NULL;
         }
-        if (model) {
+        if (model && !conn->raop->session_transport_budget) {
             free (model);
             model = NULL;
         }
-        if (name) {
+        if (name && !conn->raop->session_transport_budget) {
             free (name);
             name = NULL;
         }
@@ -764,6 +807,9 @@ raop_handler_setup(raop_conn_t *conn,
             /* client is not authorized to connect */
             plist_free(res_root_node);
             plist_free(req_root_node);
+            free(deviceID); free(model); free(name);
+            if (conn->raop->session_transport_budget)
+                http_response_init(response, "RTSP/1.0", 403, "Client refused");
             return;
 	}
 
@@ -790,6 +836,25 @@ raop_handler_setup(raop_conn_t *conn,
             free (str);
         }
         int ret = fairplay_decrypt(conn->fairplay, (unsigned char*) eaeskey, aeskey);
+        if (conn->raop->session_transport_budget) {
+            uint64_t timing_port = 0;
+            plist_t timing_node = plist_dict_get_item(req_root_node, "timingPort");
+            plist_get_uint_val(timing_node, &timing_port);
+            const char *timing_protocol = plist_get_string_ptr(plist_dict_get_item(req_root_node, "timingProtocol"), NULL);
+            if (!timing_port || timing_port > 65535 || (timing_protocol && strcmp(timing_protocol, "NTP"))) {
+                http_response_init(response, "RTSP/1.0", 400, "Unsupported timing configuration");
+                free(deviceID); free(model); free(name);
+                goto setup_cleanup;
+            }
+            if (ret || conn->callbacks.session_begin(conn->callbacks.cls, &session_info)) {
+                http_response_init(response, "RTSP/1.0", ret ? 470 : 453,
+                                   ret ? "FairPlay setup required" : "Session admission refused");
+                free(deviceID); free(model); free(name);
+                goto setup_cleanup;
+            }
+            conn->media_session_active = true;
+            free(deviceID); free(model); free(name);
+        }
         logger_log(conn->raop->logger, LOGGER_DEBUG, "fairplay_decrypt ret = %d", ret);
         if (logger_debug) {
             char *str = utils_data_to_string(aeskey, 16, 16);
@@ -802,7 +867,7 @@ raop_handler_setup(raop_conn_t *conn,
 
         bool old_protocol = false;
 #ifdef OLD_PROTOCOL_CLIENT_USER_AGENT_LIST    /* set in global.h */
-        if (strstr(OLD_PROTOCOL_CLIENT_USER_AGENT_LIST, user_agent)) old_protocol = true;
+        if (user_agent && strstr(OLD_PROTOCOL_CLIENT_USER_AGENT_LIST, user_agent)) old_protocol = true;
 #endif
         if  (old_protocol) {    /* some windows AirPlay-client emulators use old AirPlay 1 protocol with unhashed AES key */
             logger_log(conn->raop->logger, LOGGER_INFO, "Client identifed as using old protocol (unhashed) AES audio key)");
@@ -905,11 +970,26 @@ raop_handler_setup(raop_conn_t *conn,
         }
         conn->raop_ntp = raop_ntp_init(conn->raop->logger, &conn->callbacks, remote,
                                        conn->remotelen, (unsigned short) timing_rport, &time_protocol);
-        raop_ntp_start(conn->raop_ntp, &timing_lport);
+        if (!conn->raop_ntp) {
+            http_response_init(response, "RTSP/1.0", 500, "NTP initialization failed");
+            conn_end_media_session(conn);
+            goto setup_cleanup;
+        }
         conn->raop_rtp = raop_rtp_init(conn->raop->logger, &conn->callbacks, conn->raop_ntp,
                                        remote, conn->remotelen, aeskey, aesiv);
         conn->raop_rtp_mirror = raop_rtp_mirror_init(conn->raop->logger, &conn->callbacks,
                                                      conn->raop_ntp, remote, conn->remotelen, aeskey);
+        if (!conn->raop_rtp || !conn->raop_rtp_mirror) {
+            http_response_init(response, "RTSP/1.0", 500, "Media initialization failed");
+            conn_end_media_session(conn);
+            goto setup_cleanup;
+        }
+        raop_ntp_start(conn->raop_ntp, &timing_lport);
+        if (!timing_lport) {
+            http_response_init(response, "RTSP/1.0", 500, "NTP startup failed");
+            conn_end_media_session(conn);
+            goto setup_cleanup;
+        }
 
         /* the event port is not used in mirror mode or audio mode */
         unsigned short event_port = 0;
@@ -924,6 +1004,10 @@ raop_handler_setup(raop_conn_t *conn,
     // Process stream setup requests
     plist_t req_streams_node = plist_dict_get_item(req_root_node, "streams");
     if (PLIST_IS_ARRAY(req_streams_node)) {
+        if (conn->raop->session_transport_budget && !conn->media_session_active) {
+            http_response_init(response, "RTSP/1.0", 455, "Initial SETUP required");
+            goto setup_cleanup;
+        }
         plist_t res_streams_node = plist_new_array();
 
         int count = plist_array_get_size(req_streams_node);
@@ -1042,9 +1126,10 @@ raop_handler_setup(raop_conn_t *conn,
     }
 
     plist_to_bin(res_root_node, response_data, (uint32_t*) response_datalen);
+    http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
+setup_cleanup:
     plist_free(res_root_node);
     plist_free(req_root_node);
-    http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
 }
 
 static void
@@ -1250,6 +1335,10 @@ raop_handler_teardown(raop_conn_t *conn,
         }
     } else {
         /* Destroy our sessions */
+        if (conn->raop->session_transport_budget) {
+            conn_end_media_session(conn);
+            return;
+        }
         if (conn->raop_rtp) {
             raop_rtp_destroy(conn->raop_rtp);
             conn->raop_rtp = NULL;

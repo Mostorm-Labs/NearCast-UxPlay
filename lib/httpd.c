@@ -205,6 +205,21 @@ httpd_destroy(httpd_t *httpd)
     }
 }
 
+int
+httpd_set_connection_budget(httpd_t *httpd, unsigned int budget)
+{
+    if (!httpd || !budget || budget > 52 || budget + 2 > FD_SETSIZE ||
+        httpd->running || !httpd->joined || httpd->open_connections) {
+        return -1;
+    }
+    http_connection_t *connections = calloc(budget, sizeof(http_connection_t));
+    if (!connections) return -1;
+    free(httpd->connections);
+    httpd->connections = connections;
+    httpd->max_connections = (int) budget;
+    return 0;
+}
+
 static void
 httpd_remove_connection(httpd_t *httpd, http_connection_t *connection)
 {

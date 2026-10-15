@@ -53,6 +53,9 @@ int httpd_get_connection_socket_by_type (httpd_t *httpd, connection_type_t type,
 const char *httpd_get_connection_typename (connection_type_t type);
 void *httpd_get_connection_by_type (httpd_t *httpd, connection_type_t type, int instance);
 httpd_t *httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int  nohold);
+/* Before first start only; caller serializes lifecycle. Budget is transport
+ * slots, not logical senders. Leaves old storage unchanged on failure. */
+int httpd_set_connection_budget(httpd_t *httpd, unsigned int budget);
 
 int httpd_is_running(httpd_t *httpd);
 
