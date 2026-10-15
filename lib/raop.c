@@ -132,6 +132,20 @@ conn_end_media_session(raop_conn_t *conn) {
         if (conn->callbacks.video_flush) conn->callbacks.video_flush(conn->callbacks.cls);
         conn->media_session_active = false;
         conn->callbacks.session_end(conn->callbacks.cls);
+        /* Random-password access is for one casting session, not the lifetime
+         * of a reusable control socket. Keep Legacy and fixed-password policy
+         * unchanged; FLUSH/partial track teardown never reaches this branch. */
+        if (conn->raop->session_transport_budget && conn->callbacks.passwd) {
+            int password_len = 0;
+            conn->callbacks.passwd(conn->callbacks.cls, &password_len);
+            if (password_len == -1) {
+                conn->authenticated = false;
+                conn->pin_required_announced = false;
+                free(conn->auth.nonce);
+                free(conn->auth.random_pw);
+                memset(&conn->auth, 0, sizeof(conn->auth));
+            }
+        }
     }
 }
 
