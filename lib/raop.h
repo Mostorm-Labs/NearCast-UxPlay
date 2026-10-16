@@ -60,7 +60,7 @@ typedef enum video_codec_e {
     VIDEO_CODEC_H265
 } video_codec_t;
 
-#define RAOP_SESSION_SERVICE_API_VERSION 1
+#define RAOP_SESSION_SERVICE_API_VERSION 2
 /* Borrowed SETUP metadata. Names/device IDs are untrusted claims; only the
  * public key below is proven by a completed pair-verify on this connection. */
 typedef struct raop_session_info_s {
@@ -123,6 +123,17 @@ struct raop_callbacks_s {
      * startup rollback). Callbacks must be bounded, nonblocking and no-throw. */
     int   (*session_begin)(void *cls, const raop_session_info_t *info);
     void  (*session_end)(void *cls);
+    /* Optional paired callbacks, session service only. Called after completed
+     * pair-verify, before admission. request returns a borrowed 4-digit password
+     * valid until result/next request/release (NULL refuses, never disables
+     * authentication). A nonzero challenge_id identifies this password
+     * generation; changing it invalidates the previous transport nonce even
+     * if the random digits repeat. Nonces/Digest remain per transport.
+     * result revalidates an attempted Authorization, including failed Digest;
+     * it may reject a successful Digest but must never promote a failed one.
+     * No secret belongs in diagnostics. Callbacks must be bounded/no-throw. */
+    const char *(*session_password)(void *cls, const raop_session_info_t *info, uint64_t *challenge_id);
+    bool (*session_password_result)(void *cls, bool digest_authenticated);
   
 };
 typedef struct raop_callbacks_s raop_callbacks_t;

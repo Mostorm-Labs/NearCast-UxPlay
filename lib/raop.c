@@ -118,6 +118,7 @@ struct raop_conn_s {
     bool nohold_disconnect_pending;
     bool pin_required_announced;
     raop_auth_t auth;
+    uint64_t session_password_challenge_id;
     unsigned short pin;
     bool media_session_active;
 };
@@ -192,7 +193,8 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
         }
         conn->owns_callbacks = true;
         if (!conn->callbacks.audio_process || !conn->callbacks.video_process ||
-            (raop->session_transport_budget && (!conn->callbacks.session_begin || !conn->callbacks.session_end))) {
+            (raop->session_transport_budget && (!conn->callbacks.session_begin || !conn->callbacks.session_end ||
+             (!!conn->callbacks.session_password != !!conn->callbacks.session_password_result)))) {
             raop->callback_factory.release(raop->callback_factory.cls, &conn->callbacks);
             pairing_session_destroy(conn->session);
             fairplay_destroy(conn->fairplay);

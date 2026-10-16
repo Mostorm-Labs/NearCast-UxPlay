@@ -397,9 +397,17 @@ raop_ntp_thread(void *arg)
         // Sleep for 3 seconds
         struct timespec wait_time;
         MUTEX_LOCK(raop_ntp->wait_mutex);
-        clock_gettime(CLOCK_REALTIME, &wait_time);
-        wait_time.tv_sec += 3;
-        pthread_cond_timedwait(&raop_ntp->wait_cond, &raop_ntp->wait_mutex, &wait_time);
+        /* Stop can signal while recvfrom is still finishing. Check its
+         * predicate with wait_mutex held so that an early signal is not lost.
+         * Stop releases run_mutex before taking wait_mutex. */
+        MUTEX_LOCK(raop_ntp->run_mutex);
+        int keep_running = raop_ntp->running;
+        MUTEX_UNLOCK(raop_ntp->run_mutex);
+        if (keep_running) {
+            clock_gettime(CLOCK_REALTIME, &wait_time);
+            wait_time.tv_sec += 3;
+            pthread_cond_timedwait(&raop_ntp->wait_cond, &raop_ntp->wait_mutex, &wait_time);
+        }
         MUTEX_UNLOCK(raop_ntp->wait_mutex);
     }
 

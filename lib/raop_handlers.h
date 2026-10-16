@@ -640,9 +640,38 @@ raop_handler_setup(raop_conn_t *conn,
         // First setup
 
         /* RFC2617 Digest authentication (md5 hash) of uxplay client-access password, if set */
-        if (!conn->authenticated && conn->callbacks.passwd) {
-            int len;
-            const char *password = conn->callbacks.passwd(conn->callbacks.cls, &len);
+        bool scoped_password = conn->raop->session_transport_budget && conn->callbacks.session_password;
+        if (!conn->authenticated && (conn->callbacks.passwd || scoped_password)) {
+            int len = 0;
+            const char *password;
+            if (scoped_password) {
+                uint64_t password_challenge_id = 0;
+                password = conn->callbacks.session_password(conn->callbacks.cls, &session_info, &password_challenge_id);
+                if (!password || !password_challenge_id) {
+                    http_response_init(response, "RTSP/1.0", 503, "Password attempt unavailable");
+                    goto setup_cleanup;
+                }
+                if (conn->session_password_challenge_id != password_challenge_id) {
+                    /* Expiry/rotation starts a new challenge even if four
+                     * random digits happen to repeat. Never reuse its nonce. */
+                    free(auth->nonce);
+                    auth->nonce = NULL;
+                    conn->session_password_challenge_id = password_challenge_id;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    if (password[i] < '0' || password[i] > '9') {
+                        http_response_init(response, "RTSP/1.0", 503, "Invalid password provider result");
+                        goto setup_cleanup;
+                    }
+                }
+                if (password[4]) {
+                    http_response_init(response, "RTSP/1.0", 503, "Invalid password provider result");
+                    goto setup_cleanup;
+                }
+                len = 4;
+            } else {
+                password = conn->callbacks.passwd(conn->callbacks.cls, &len);
+            }
             // len = -1 means use a random password for this connection
             bool rotate_pin = false;
             if (len == -1 && auth->random_pw && auth->auth_fail_count >= 5) {
@@ -697,6 +726,10 @@ raop_handler_setup(raop_conn_t *conn,
 
                     conn->authenticated = auth->nonce && pairing_digest_verify_nonce(method,
                         http_request_get_url(request), authorization, password, auth->nonce);
+                    if (scoped_password) {
+                        bool accepted = conn->callbacks.session_password_result(conn->callbacks.cls, conn->authenticated);
+                        conn->authenticated = conn->authenticated && accepted;
+                    }
 		    if (!conn->authenticated) {
                         if (auth->auth_fail_count < 255) auth->auth_fail_count++;
                         logger_log(conn->raop->logger, LOGGER_INFO, "*** authentication failure: count = %u", auth->auth_fail_count);
