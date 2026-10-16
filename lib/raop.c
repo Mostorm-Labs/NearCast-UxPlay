@@ -121,8 +121,63 @@ struct raop_conn_s {
     uint64_t session_password_challenge_id;
     unsigned short pin;
     bool media_session_active;
+    uint64_t diagnostic_request_number;
 };
 typedef struct raop_conn_s raop_conn_t;
+
+static void
+conn_control_diagnostic(raop_conn_t *conn, raop_control_stage_t stage, http_request_t *request, int status) {
+    if (!conn->callbacks.control_diagnostic) return;
+    raop_control_diagnostic_t event;
+    memset(&event, 0, sizeof(event));
+    event.stage = stage;
+    event.request_number = conn->diagnostic_request_number;
+    event.status = status;
+    event.password_authenticated = conn->authenticated;
+    event.media_active = conn->media_session_active;
+    unsigned char key[32];
+    event.peer_verified = (pairing_session_get_verified_peer(conn->session, key) == 0);
+    memset(key, 0, sizeof(key));
+    if (request) {
+        const char *method = http_request_get_method(request);
+        const char *path = http_request_get_url(request);
+        const char *protocol = http_request_get_protocol(request);
+        event.method = RAOP_METHOD_OTHER;
+        event.path = RAOP_PATH_OTHER;
+        event.protocol = RAOP_PROTOCOL_OTHER;
+        if (method) {
+            if (!strcmp(method, "GET")) event.method = RAOP_METHOD_GET;
+            else if (!strcmp(method, "POST")) event.method = RAOP_METHOD_POST;
+            else if (!strcmp(method, "OPTIONS")) event.method = RAOP_METHOD_OPTIONS;
+            else if (!strcmp(method, "SETUP")) event.method = RAOP_METHOD_SETUP;
+            else if (!strcmp(method, "RECORD")) event.method = RAOP_METHOD_RECORD;
+            else if (!strcmp(method, "TEARDOWN")) event.method = RAOP_METHOD_TEARDOWN;
+            else if (!strcmp(method, "FLUSH")) event.method = RAOP_METHOD_FLUSH;
+            else if (!strcmp(method, "GET_PARAMETER")) event.method = RAOP_METHOD_GET_PARAMETER;
+            else if (!strcmp(method, "SET_PARAMETER")) event.method = RAOP_METHOD_SET_PARAMETER;
+            else if (!strcmp(method, "PUT")) event.method = RAOP_METHOD_PUT;
+        }
+        if (path) {
+            if (!strcmp(path, "/info")) event.path = RAOP_PATH_INFO;
+            else if (!strcmp(path, "/pair-setup")) event.path = RAOP_PATH_PAIR_SETUP;
+            else if (!strcmp(path, "/pair-verify")) event.path = RAOP_PATH_PAIR_VERIFY;
+            else if (!strcmp(path, "/fp-setup")) event.path = RAOP_PATH_FP_SETUP;
+            else if (!strcmp(path, "/pair-pin-start")) event.path = RAOP_PATH_PAIR_PIN_START;
+            else if (!strcmp(path, "/pair-setup-pin")) event.path = RAOP_PATH_PAIR_SETUP_PIN;
+            else if (!strcmp(path, "/feedback")) event.path = RAOP_PATH_FEEDBACK;
+            else if (!strcmp(path, "/stream")) event.path = RAOP_PATH_STREAM;
+            else if (!strcmp(path, "/server-info")) event.path = RAOP_PATH_SERVER_INFO;
+            else if (!strcmp(path, "/fp-setup2")) event.path = RAOP_PATH_FP_SETUP2;
+        }
+        if (protocol) {
+            if (!strcmp(protocol, "RTSP/1.0")) event.protocol = RAOP_PROTOCOL_RTSP_1_0;
+            else if (!strcmp(protocol, "HTTP/1.1")) event.protocol = RAOP_PROTOCOL_HTTP_1_1;
+        }
+        event.cseq_present = (http_request_get_header(request, "CSeq") != NULL);
+        event.authorization_present = (http_request_get_header(request, "Authorization") != NULL);
+    }
+    conn->callbacks.control_diagnostic(conn->callbacks.cls, &event);
+}
 
 static void
 conn_end_media_session(raop_conn_t *conn) {
@@ -238,6 +293,8 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
         conn->callbacks.conn_init(conn->callbacks.cls);
     }
 
+    conn_control_diagnostic(conn, RAOP_CONTROL_OPENED, NULL, 0);
+
     return conn;
 }
 
@@ -272,6 +329,11 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     if (!method  || !url) {
         return;
+    }
+
+    if (conn->callbacks.control_diagnostic) {
+        ++conn->diagnostic_request_number;
+        conn_control_diagnostic(conn, RAOP_CONTROL_REQUEST, request, 0);
     }
 
     if (!strncmp(url, "/pin", 4) &&
@@ -607,6 +669,17 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     int len;
     const char *data = http_response_get_data(*response, &len);
+    if (conn->callbacks.control_diagnostic) {
+        /* Read only the three status digits from the already finished response.
+         * Do not forward the status text, headers or body to diagnostics. */
+        const char *space = memchr(data, ' ', len);
+        int status = 0;
+        if (space && data + len - space >= 4 &&
+            space[1] >= '0' && space[1] <= '9' && space[2] >= '0' && space[2] <= '9' && space[3] >= '0' && space[3] <= '9') {
+            status = 100 * (space[1] - '0') + 10 * (space[2] - '0') + space[3] - '0';
+        }
+        conn_control_diagnostic(conn, RAOP_CONTROL_RESPONSE, request, status);
+    }
     if (response_data && response_datalen > 0) {
         len -= response_datalen;
     } else {
@@ -694,6 +767,7 @@ conn_destroy(void *ptr) {
 
     free(conn->local);
     free(conn->remote);
+    conn_control_diagnostic(conn, RAOP_CONTROL_CLOSED, NULL, 0);
     pairing_session_destroy(conn->session);
     fairplay_destroy(conn->fairplay);
     if (conn->client_session_id) {

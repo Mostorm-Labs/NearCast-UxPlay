@@ -72,6 +72,32 @@ typedef struct raop_session_info_s {
     bool password_authenticated;
 } raop_session_info_t;
 
+#define RAOP_CONTROL_DIAGNOSTICS_API_VERSION 1
+/* Optional observation only: no input strings, addresses, keys or payload.
+ * UNKNOWN paths/methods stay OTHER, never copied from a client. Request means
+ * parsed ingress; response means constructed response, not confirmed delivery. */
+typedef enum { RAOP_CONTROL_OPENED = 1, RAOP_CONTROL_REQUEST, RAOP_CONTROL_RESPONSE, RAOP_CONTROL_CLOSED } raop_control_stage_t;
+typedef enum {
+    RAOP_METHOD_NONE, RAOP_METHOD_GET, RAOP_METHOD_POST, RAOP_METHOD_OPTIONS,
+    RAOP_METHOD_SETUP, RAOP_METHOD_RECORD, RAOP_METHOD_TEARDOWN, RAOP_METHOD_FLUSH,
+    RAOP_METHOD_GET_PARAMETER, RAOP_METHOD_SET_PARAMETER, RAOP_METHOD_PUT, RAOP_METHOD_OTHER
+} raop_control_method_t;
+typedef enum {
+    RAOP_PATH_NONE, RAOP_PATH_INFO, RAOP_PATH_PAIR_SETUP, RAOP_PATH_PAIR_VERIFY,
+    RAOP_PATH_FP_SETUP, RAOP_PATH_PAIR_PIN_START, RAOP_PATH_PAIR_SETUP_PIN,
+    RAOP_PATH_FEEDBACK, RAOP_PATH_STREAM, RAOP_PATH_SERVER_INFO, RAOP_PATH_FP_SETUP2, RAOP_PATH_OTHER
+} raop_control_path_t;
+typedef enum { RAOP_PROTOCOL_NONE, RAOP_PROTOCOL_RTSP_1_0, RAOP_PROTOCOL_HTTP_1_1, RAOP_PROTOCOL_OTHER } raop_control_protocol_t;
+typedef struct raop_control_diagnostic_s {
+    uint64_t request_number; /* Per transport, 0 for opened. NOT CSeq or peer identity. */
+    raop_control_stage_t stage;
+    raop_control_method_t method;
+    raop_control_path_t path;
+    raop_control_protocol_t protocol;
+    int status; /* 0 except constructed response. */
+    bool cseq_present, authorization_present, peer_verified, password_authenticated, media_active;
+} raop_control_diagnostic_t;
+
 struct raop_callbacks_s {
     void* cls;
 
@@ -134,6 +160,9 @@ struct raop_callbacks_s {
      * No secret belongs in diagnostics. Callbacks must be bounded/no-throw. */
     const char *(*session_password)(void *cls, const raop_session_info_t *info, uint64_t *challenge_id);
     bool (*session_password_result)(void *cls, bool digest_authenticated);
+    /* Opt-in bounded/no-throw metadata callback; no response mutation/re-entry.
+     * NULL means no observation overhead beyond checking this pointer. */
+    void (*control_diagnostic)(void *cls, const raop_control_diagnostic_t *event);
   
 };
 typedef struct raop_callbacks_s raop_callbacks_t;
