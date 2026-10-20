@@ -39,6 +39,11 @@ struct httpd_callbacks_s {
 };
 typedef struct httpd_callbacks_s httpd_callbacks_t;
 typedef void (*httpd_deferred_callback_t)(void *opaque);
+typedef bool (*httpd_connection_match_t)(void *user_data, void *opaque);
+/* Synchronous bounded selection under the registry lock, then shutdown only.
+ * Predicate must not re-enter httpd or destroy/wait for this service. The HTTP
+ * owner performs normal destruction/joins; return is requests, not completion. */
+int httpd_request_connection_close_matching(httpd_t *httpd, httpd_connection_match_t matches, void *opaque);
 
 bool httpd_nohold(httpd_t *httpd);
 void httpd_remove_known_connections(httpd_t *httpd);

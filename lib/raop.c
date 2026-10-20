@@ -852,6 +852,23 @@ raop_enable_session_service(raop_t *raop, unsigned int transport_budget) {
     return 0;
 }
 
+typedef struct raop_disconnect_match_s {
+    raop_callback_scope_match_t matches;
+    void *opaque;
+} raop_disconnect_match_t;
+static bool
+conn_disconnect_matches(void *ptr, void *opaque) {
+    raop_conn_t *conn = ptr;
+    raop_disconnect_match_t *selection = opaque;
+    return selection->matches(conn->callbacks.cls, selection->opaque);
+}
+int
+raop_request_session_disconnect(raop_t *raop, raop_callback_scope_match_t matches, void *opaque) {
+    if (!raop || !raop->session_transport_budget || !raop->httpd || !matches) return 0;
+    raop_disconnect_match_t selection = {matches, opaque};
+    return httpd_request_connection_close_matching(raop->httpd, conn_disconnect_matches, &selection);
+}
+
 int
 raop_set_callback_factory(raop_t *raop, const raop_callback_factory_t *factory) {
     if (!raop || raop->httpd || (!factory && raop->session_transport_budget) ||

@@ -40,11 +40,14 @@ static const char *typename[] = {
 
 struct http_connection_s {
     int connected;
+    int close_requested; /* protected by connections_mutex */
 
     int socket_fd;
     void *user_data;
     connection_type_t type;
     http_request_t *request;
+    unsigned char prefix[8];
+    unsigned int prefix_used;
 };
 typedef struct http_connection_s http_connection_t;
 
@@ -55,6 +58,7 @@ struct httpd_s {
     int max_connections;
     int open_connections;
     http_connection_t *connections;
+    mutex_handle_t connections_mutex;
     char nohold;
 
     /* These variables only edited mutex locked */
@@ -189,6 +193,7 @@ httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
     httpd->server_fd4 = -1;
     httpd->server_fd6 = -1;
     MUTEX_CREATE(httpd->run_mutex);
+    MUTEX_CREATE(httpd->connections_mutex);
 
     return httpd;
 }
@@ -200,6 +205,7 @@ httpd_destroy(httpd_t *httpd)
         httpd_stop(httpd);
 
         MUTEX_DESTROY(httpd->run_mutex);
+        MUTEX_DESTROY(httpd->connections_mutex);
         free(httpd->connections);
         free(httpd);
     }
@@ -223,25 +229,33 @@ httpd_set_connection_budget(httpd_t *httpd, unsigned int budget)
 static void
 httpd_remove_connection(httpd_t *httpd, http_connection_t *connection)
 {
+    /* Unpublish before callbacks/joins. An external targeted shutdown can
+     * never inspect a freed scope or shutdown a recycled socket descriptor. */
+    MUTEX_LOCK(httpd->connections_mutex);
+    if (!connection->connected) { MUTEX_UNLOCK(httpd->connections_mutex); return; }
+    void *user_data = connection->user_data;
+    int socket_fd = connection->socket_fd;
+    connection->connected = 0;
+    connection->close_requested = 0;
+    connection->user_data = NULL;
+    connection->socket_fd = 0;
+    MUTEX_UNLOCK(httpd->connections_mutex);
     if (connection->request) {
         http_request_destroy(connection->request);
         connection->request = NULL;
     }
     logger_log(httpd->logger, LOGGER_DEBUG, "removing connection type %s socket %d conn %p", typename[connection->type],
-               connection->socket_fd, connection->user_data);
-    if (connection->user_data) {
-        httpd->callbacks.conn_destroy(connection->user_data);
-        connection->user_data = NULL;
+               socket_fd, user_data);
+    if (user_data) {
+        httpd->callbacks.conn_destroy(user_data);
     }
-    shutdown(connection->socket_fd, SHUT_WR);
-    if (connection->socket_fd) {
-        int ret = closesocket(connection->socket_fd);
+    shutdown(socket_fd, SHUT_WR);
+    if (socket_fd) {
+        int ret = closesocket(socket_fd);
         if (ret == -1) {
             logger_log(httpd->logger, LOGGER_ERR, "httpd error in closesocket (close): %d %s", errno, strerror(errno));
         }
-        connection->socket_fd = 0;
     }
-    connection->connected = 0;
     connection->type = CONNECTION_TYPE_UNKNOWN;
     httpd->open_connections--;
 }
@@ -269,12 +283,60 @@ httpd_add_connection(httpd_t *httpd, int fd, unsigned char *local, int local_len
         return -1;
     }
 
-    httpd->open_connections++;
+    MUTEX_LOCK(httpd->connections_mutex);
     httpd->connections[i].socket_fd = fd;
     httpd->connections[i].connected = 1;
+    httpd->connections[i].close_requested = 0;
     httpd->connections[i].user_data = user_data;
     httpd->connections[i].type = CONNECTION_TYPE_UNKNOWN;   //should not be necessary ...
+    MUTEX_UNLOCK(httpd->connections_mutex);
+    httpd->open_connections++;
     return 0;
+}
+
+int
+httpd_request_connection_close_matching(httpd_t *httpd, httpd_connection_match_t matches, void *opaque)
+{
+    if (!httpd || !matches) return 0;
+    int requested = 0;
+    MUTEX_LOCK(httpd->connections_mutex);
+    for (int i = 0; i < httpd->max_connections; ++i) {
+        http_connection_t *connection = &httpd->connections[i];
+        if (connection->connected && connection->user_data && matches(connection->user_data, opaque)) {
+            connection->close_requested = 1;
+            /* Wake select, partial recv and blocked send without destroying
+             * any callback scope from the caller's thread. */
+            shutdown(connection->socket_fd, SHUT_RDWR);
+            ++requested;
+        }
+    }
+    MUTEX_UNLOCK(httpd->connections_mutex);
+    return requested;
+}
+
+static int
+httpd_close_requested_connections(httpd_t *httpd)
+{
+    int closed = 0;
+    for (int i = 0; i < httpd->max_connections; ++i) {
+        MUTEX_LOCK(httpd->connections_mutex);
+        int requested = httpd->connections[i].connected && httpd->connections[i].close_requested;
+        MUTEX_UNLOCK(httpd->connections_mutex);
+        if (requested) {
+            httpd_remove_connection(httpd, &httpd->connections[i]);
+            ++closed;
+        }
+    }
+    return closed;
+}
+
+static int
+httpd_connection_close_requested(httpd_t *httpd, http_connection_t *connection)
+{
+    MUTEX_LOCK(httpd->connections_mutex);
+    int requested = connection->connected && connection->close_requested;
+    MUTEX_UNLOCK(httpd->connections_mutex);
+    return requested;
 }
 
 static int
@@ -382,7 +444,6 @@ httpd_thread(void *arg)
         struct timeval tv;
         int nfds=0;
         int ret;
-	int new_request;
 
         MUTEX_LOCK(httpd->run_mutex);
         if (!httpd->running) {
@@ -401,6 +462,8 @@ httpd_thread(void *arg)
             deferred_callback(deferred_opaque);
             continue;
         }
+
+        httpd_close_requested_connections(httpd);
 
         /* Set timeout value to 5ms */
         tv.tv_sec = 1;
@@ -435,6 +498,9 @@ httpd_thread(void *arg)
         }
 
         ret = select(nfds, &rfds, NULL, NULL, &tv);
+        /* Locally shutdown sockets need not become readable on every platform.
+         * The explicit close intent, not socket readiness, owns retirement. */
+        if (httpd_close_requested_connections(httpd)) continue;
         if (ret == 0) {
             /* Timeout happened */
             continue;
@@ -477,15 +543,13 @@ httpd_thread(void *arg)
             if (!connection->request) {
                 connection->request = http_request_init();
                 assert(connection->request);
-                new_request = 1;
+                connection->prefix_used = 0;
                 if (connection->type == CONNECTION_TYPE_PTTH) {
                     http_request_is_reverse(connection->request);
                 }
 		logger_log(httpd->logger, LOGGER_DEBUG, "new request, connection %d, socket %d type %s",
                            i, connection->socket_fd, typename [connection->type]);
-            } else {
-                new_request = 0;
-	    }
+            }
 
             logger_log(httpd->logger, LOGGER_DEBUG, "httpd receiving on socket %d, connection %d",
                        connection->socket_fd, i);
@@ -509,40 +573,35 @@ httpd_thread(void *arg)
 	    }
             /* reverse-http responses from the client must not be sent to the llhttp parser:
              * such messages start with "HTTP/1.1" */
-            if (new_request) {
-                int readstart = 0;
-                new_request = 0;
-                while (readstart < 8) {
-                    ret = recv(connection->socket_fd, buffer + readstart, sizeof(buffer) - 1 - readstart, 0);
-                    if (ret == 0) {
-                        logger_log(httpd->logger, LOGGER_INFO, "Connection closed for socket %d",
-                                   connection->socket_fd);
-                        break;
-                    } else if (ret == -1) {
-		      if (errno == EAGAIN) {
-			continue;
-		      } else {
-                        int sock_err = SOCKET_GET_ERROR();
-                        logger_log(httpd->logger, LOGGER_ERR, "httpd: recv socket error %d:%s",
-                                   sock_err, SOCKET_ERROR_STRING(sock_err));
-                        break;
-		      }
-                    } else {
-                        readstart += ret;
-                        ret = readstart;
-                    }
-                }
-                if (!memcmp(buffer, http, 8)) {
-                    http_request_set_reverse(connection->request);  
+            if (connection->prefix_used < sizeof(connection->prefix)) {
+                /* Consume only available prefix bytes once per select turn.
+                 * A fragmented/quiet sender must not monopolize the HTTP
+                 * owner or prevent receiver-side disconnect processing. */
+                ret = recv(connection->socket_fd,
+                    (char *) connection->prefix + connection->prefix_used,
+                    (int) (sizeof(connection->prefix) - connection->prefix_used), 0);
+                if (ret > 0) {
+                    connection->prefix_used += (unsigned int) ret;
+                    if (connection->prefix_used < sizeof(connection->prefix)) continue;
+                    memcpy(buffer, connection->prefix, sizeof(connection->prefix));
+                    ret = (int) sizeof(connection->prefix);
+                    if (!memcmp(buffer, http, sizeof(connection->prefix))) http_request_set_reverse(connection->request);
                 }
             } else {
                 ret = recv(connection->socket_fd, buffer, sizeof(buffer) - 1, 0);
-                if (ret == 0) {
-                    logger_log(httpd->logger, LOGGER_INFO, "Connection closed for socket %d",
-                               connection->socket_fd);
-                    httpd_remove_connection(httpd, connection);
-                    continue;
+            }
+            if (httpd_connection_close_requested(httpd, connection)) {
+                httpd_remove_connection(httpd, connection);
+                continue;
+            }
+            if (ret <= 0) {
+                if (ret < 0) {
+                    int sock_err = SOCKET_GET_ERROR();
+                    if (sock_err == SOCKET_ERRORNAME(EAGAIN) || sock_err == SOCKET_ERRORNAME(EWOULDBLOCK)) continue;
+                    logger_log(httpd->logger, LOGGER_ERR, "httpd: recv socket error %d:%s", sock_err, SOCKET_ERROR_STRING(sock_err));
                 }
+                httpd_remove_connection(httpd, connection);
+                continue;
             }
             if (http_request_is_reverse(connection->request)) {
                 /* this is a response from the client to a

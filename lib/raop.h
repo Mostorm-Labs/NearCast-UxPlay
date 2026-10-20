@@ -201,6 +201,13 @@ RAOP_API int raop_set_callback_factory(raop_t *raop, const raop_callback_factory
  * nohold/rejection and HLS. The bounded transport budget (1..52) is NOT sender
  * capacity. Logical admission belongs to session_begin's external owner. */
 RAOP_API int raop_enable_session_service(raop_t *raop, unsigned int transport_budget);
+#define RAOP_SCOPED_DISCONNECT_API_VERSION 1
+typedef bool (*raop_callback_scope_match_t)(void *callback_cls, void *opaque);
+/* Session-service only, caller serializes against stop/destroy. Matches runs
+ * synchronously under the transport registry lock: no re-entry, waits or throw.
+ * It may atomically latch an exact current generation in its own scope. The
+ * HTTP owner joins media and releases callbacks after shutdown, never here. */
+RAOP_API int raop_request_session_disconnect(raop_t *raop, raop_callback_scope_match_t matches, void *opaque);
 RAOP_API int raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile);
 RAOP_API void raop_set_log_level(raop_t *raop, int level);
 RAOP_API void raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, void *cls);
