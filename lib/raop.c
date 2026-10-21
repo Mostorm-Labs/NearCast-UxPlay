@@ -249,7 +249,8 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
         conn->owns_callbacks = true;
         if (!conn->callbacks.audio_process || !conn->callbacks.video_process ||
             (raop->session_transport_budget && (!conn->callbacks.session_begin || !conn->callbacks.session_end ||
-             (!!conn->callbacks.session_password != !!conn->callbacks.session_password_result)))) {
+             (!!conn->callbacks.session_password != !!conn->callbacks.session_password_result) ||
+             (!!conn->callbacks.pairing_pin_valid != !!conn->callbacks.pairing_pin_result)))) {
             raop->callback_factory.release(raop->callback_factory.cls, &conn->callbacks);
             pairing_session_destroy(conn->session);
             fairplay_destroy(conn->fairplay);
@@ -363,7 +364,12 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     const char *protocol = http_request_get_protocol(request);
     /* Mirroring session mode has no global HTTP control/HLS owner. In
      * particular /stop and a new HLS transport must not clear another sender. */
-    if (conn->raop->session_transport_budget && (!cseq || strcmp(protocol, "RTSP/1.0"))) {
+    /* Pairing control is also sent as HTTP before RTSP mirroring. It cannot
+     * start HLS, mutate global controls or admit a media session. */
+    bool session_pairing = conn->raop->session_transport_budget &&
+        !strcmp(method, "POST") && (!strcmp(url, "/pair-pin-start") || !strcmp(url, "/pair-setup-pin")) &&
+        !strcmp(protocol, "HTTP/1.1");
+    if (conn->raop->session_transport_budget && !session_pairing && (!cseq || strcmp(protocol, "RTSP/1.0"))) {
         *response = http_response_create();
         http_response_init(*response, protocol, 501, "Only RAOP mirroring is supported");
         goto finish;
@@ -375,7 +381,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         http_response_init(*response, protocol, 409, "End media session before reauthentication");
         goto finish;
     }
-    if (!cseq && !conn->raop->hls_support && !is_pin_endpoint && !is_audio_endpoint &&
+    if (!cseq && !session_pairing && !conn->raop->hls_support && !is_pin_endpoint && !is_audio_endpoint &&
         !is_stop_endpoint) {
         logger_log(conn->raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
         return;
@@ -383,7 +389,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
     const char *host = http_request_get_header(request, "Host");
-    if (host && !cseq && !client_session_id) {
+    if (host && !cseq && !client_session_id && !session_pairing) {
         if (is_pin_endpoint || is_audio_endpoint || is_stop_endpoint) {
             http_ctrl_request = true;
         } else {
@@ -392,7 +398,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     }
 
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
-        if (cseq) {
+        if (cseq || session_pairing) {
             if (!conn->raop->session_transport_budget &&
                 httpd_count_connection_type(conn->raop->httpd, CONNECTION_TYPE_RAOP)) {
                 char ipaddr[40];
@@ -545,13 +551,13 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         }
     }
 
-    if (client_session_id) {
+    if (client_session_id && !session_pairing) {
         assert(!strcmp(client_session_id, conn->client_session_id));
     }
 
     logger_log(conn->raop->logger, LOGGER_DEBUG, "Handling request %s with URL %s", method, url);
     raop_handler_t handler = NULL;
-    if (!hls_request && !strcmp(protocol, "RTSP/1.0")) {
+    if (!hls_request && (!strcmp(protocol, "RTSP/1.0") || session_pairing)) {
         if (!strcmp(method, "POST")) {
             if (!strcmp(url, "/feedback")) {
                 handler = &raop_handler_feedback;

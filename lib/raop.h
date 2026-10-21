@@ -61,6 +61,7 @@ typedef enum video_codec_e {
 } video_codec_t;
 
 #define RAOP_SESSION_SERVICE_API_VERSION 2
+#define RAOP_SESSION_PAIRING_PIN_API_VERSION 1
 /* Borrowed SETUP metadata. Names/device IDs are untrusted claims; only the
  * public key below is proven by a completed pair-verify on this connection. */
 typedef struct raop_session_info_s {
@@ -160,6 +161,13 @@ struct raop_callbacks_s {
      * No secret belongs in diagnostics. Callbacks must be bounded/no-throw. */
     const char *(*session_password)(void *cls, const raop_session_info_t *info, uint64_t *challenge_id);
     bool (*session_password_result)(void *cls, bool digest_authenticated);
+    /* Optional paired lifetime checks for the existing display_pin pairing
+     * path, before a verified peer exists. Never grants media admission or
+     * replaces session_password. valid is checked on every SRP request;
+     * result retires display state on completion/failure. Legacy NULL keeps
+     * its existing PIN behavior. Callbacks must be bounded/no-throw. */
+    bool (*pairing_pin_valid)(void *cls);
+    void (*pairing_pin_result)(void *cls, bool authenticated);
     /* Opt-in bounded/no-throw metadata callback; no response mutation/re-entry.
      * NULL means no observation overhead beyond checking this pointer. */
     void (*control_diagnostic)(void *cls, const raop_control_diagnostic_t *event);

@@ -249,6 +249,9 @@ raop_handler_pairpinstart(raop_conn_t *conn,
     char pin[6];
     snprintf(pin, 5, "%04u", pin_4);
     raop_report_pin_required(conn, pin);
+    if (conn->callbacks.pairing_pin_valid && !conn->callbacks.pairing_pin_valid(conn->callbacks.cls)) {
+        http_response_init(response, "RTSP/1.0", 470, "Pairing PIN unavailable");
+    }
     *response_data = NULL;
     response_datalen = 0;
 }
@@ -258,6 +261,10 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
                            http_request_t *request, http_response_t *response,
                            char **response_data, int *response_datalen) {
 
+    if (conn->callbacks.pairing_pin_valid && !conn->callbacks.pairing_pin_valid(conn->callbacks.cls)) {
+        http_response_init(response, "RTSP/1.0", 470, "Pairing PIN expired");
+        return;
+    }
     const char *request_data = NULL;;
     int request_datalen = 0;
     bool data_is_plist = false;
@@ -399,6 +406,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             logger_log(conn->raop->logger, LOGGER_DEBUG, "pair-pin-setup success\n");
         }
         pairing_session_set_setup_status(conn->session);
+        if (conn->callbacks.pairing_pin_result) conn->callbacks.pairing_pin_result(conn->callbacks.cls, true);
         plist_t res_root_node = plist_new_dict();
         plist_t res_epk_node = plist_new_data((const char *) epk, 32);
 	plist_t res_authtag_node = plist_new_data((const char *) authtag, 16);
@@ -410,6 +418,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
 	return;
     }
  authentication_failed:;
+    if (conn->callbacks.pairing_pin_result) conn->callbacks.pairing_pin_result(conn->callbacks.cls, false);
     http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
 }
 
