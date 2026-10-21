@@ -1329,10 +1329,14 @@ raop_handler_teardown(raop_conn_t *conn,
     data = http_request_get_data(request, &data_len);
     plist_t req_root_node = NULL;
     plist_from_bin(data, data_len, &req_root_node);
-    char * plist_xml;
-    uint32_t plist_len;
-    plist_to_xml(req_root_node, &plist_xml, &plist_len);
-    logger_log(conn->raop->logger, LOGGER_DEBUG, "%s", plist_xml);
+    char * plist_xml = NULL;
+    uint32_t plist_len = 0;
+    if (req_root_node) {
+        plist_to_xml(req_root_node, &plist_xml, &plist_len);
+    }
+    if (plist_xml) {
+        logger_log(conn->raop->logger, LOGGER_DEBUG, "%s", plist_xml);
+    }
     free(plist_xml);
     plist_t req_streams_node = plist_dict_get_item(req_root_node, "streams");
     /* Process stream teardown requests */
