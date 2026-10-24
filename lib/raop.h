@@ -229,6 +229,10 @@ RAOP_API int raop_start_httpd(raop_t *raop, unsigned short *port);
 RAOP_API int raop_is_running(raop_t *raop);
 RAOP_API void raop_stop_httpd(raop_t *raop);
 RAOP_API void raop_set_dnssd(raop_t *raop, dnssd_t *dnssd);
+/* Nonblocking bounded task on the HTTP owner. Used for discovery metadata
+ * replacement so /info readers never overlap object replacement/destruction.
+ * Caller serializes lifecycle and keeps opaque alive until HTTP stop/join. */
+RAOP_API int raop_request_owner_task(raop_t *raop, void (*callback)(void *), void *opaque);
 RAOP_API void raop_destroy(raop_t *raop);
 RAOP_API void raop_remove_known_connections(raop_t * raop);
 RAOP_API void raop_destroy_airplay_video(raop_t *raop);

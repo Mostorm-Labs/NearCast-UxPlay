@@ -50,6 +50,9 @@ void httpd_remove_known_connections(httpd_t *httpd);
 void httpd_remove_known_connections_except(httpd_t *httpd, void *user_data);
 void httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type);
 void httpd_request_deferred_callback(httpd_t *httpd, httpd_deferred_callback_t callback, void *opaque);
+/* One bounded owner task, serialized with HTTP requests. Never overwrites a
+ * queued task. Context must outlive stop/join even when it is never executed. */
+int httpd_try_deferred_callback(httpd_t *httpd, httpd_deferred_callback_t callback, void *opaque);
 
 int httpd_set_connection_type (httpd_t *http, void *user_data, connection_type_t type);
 int httpd_count_connection_type (httpd_t *http, connection_type_t type);

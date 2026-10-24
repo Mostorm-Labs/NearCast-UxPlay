@@ -426,6 +426,16 @@ httpd_request_deferred_callback(httpd_t *httpd, httpd_deferred_callback_t callba
     MUTEX_UNLOCK(httpd->run_mutex);
 }
 
+int
+httpd_try_deferred_callback(httpd_t *httpd, httpd_deferred_callback_t callback, void *opaque) {
+    if (!httpd || !callback) return 0;
+    MUTEX_LOCK(httpd->run_mutex);
+    int accepted = httpd->running && !httpd->deferred_callback;
+    if (accepted) { httpd->deferred_callback = callback; httpd->deferred_opaque = opaque; }
+    MUTEX_UNLOCK(httpd->run_mutex);
+    return accepted;
+}
+
 static THREAD_RETVAL
 httpd_thread(void *arg)
 {

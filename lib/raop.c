@@ -1191,6 +1191,11 @@ raop_set_dnssd(raop_t *raop, dnssd_t *dnssd) {
     raop->dnssd = dnssd;
 }
 
+int
+raop_request_owner_task(raop_t *raop, void (*callback)(void *), void *opaque) {
+    return raop && raop->httpd ? httpd_try_deferred_callback(raop->httpd, callback, opaque) : 0;
+}
+
 
 int
 raop_start_httpd(raop_t *raop, unsigned short *port) {
