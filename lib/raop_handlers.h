@@ -236,7 +236,26 @@ raop_handler_pairpinstart(raop_conn_t *conn,
     unsigned short *stored_pin = conn->raop->session_transport_budget ? &conn->pin : &conn->raop->pin;
     int pin_4;
     bool configured_pin = (conn->raop->use_pin && conn->raop->pin > 0);
-    if (configured_pin || conn->raop->pin > 9999) {
+    if (conn->callbacks.pairing_pin) {
+        const char *provided = conn->callbacks.pairing_pin(conn->callbacks.cls);
+        pin_4 = 0;
+        if (!provided) {
+            http_response_init(response, "RTSP/1.0", 503, "PIN unavailable");
+            return;
+        }
+        for (int i = 0; i < 4; ++i) {
+            if (provided[i] < '0' || provided[i] > '9') {
+                http_response_init(response, "RTSP/1.0", 503, "Invalid PIN provider result");
+                return;
+            }
+            pin_4 = pin_4 * 10 + (provided[i] - '0');
+        }
+        if (provided[4]) {
+            http_response_init(response, "RTSP/1.0", 503, "Invalid PIN provider result");
+            return;
+        }
+        *stored_pin = (unsigned short) pin_4;
+    } else if (configured_pin || conn->raop->pin > 9999) {
         pin_4 = conn->raop->pin % 10000;
     } else {
         pin_4 = random_pin();
